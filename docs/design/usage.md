@@ -1,6 +1,6 @@
 # SSH 远端工作区使用与验收
 
-本地预览版，为 Windows 上的 ZCode 提供 SSH 远端文件工具和持久命令任务。源码与文档位于独立项目内；尚未发布到 npm、创建远端 fork 或推送上游。
+预览版，为 Windows 上的 ZCode 提供 SSH 远端文件工具和持久命令任务。源码与文档位于独立项目内，维护于 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 的 `feat/remote-agent-workspace` 分支；尚未发布到 npm 或合并至主分支。
 
 ## 运行条件
 

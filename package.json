@@ -6,12 +6,12 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/classfang/ssh-mcp-server.git"
+    "url": "git+https://github.com/ONEGAYI/ssh-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/classfang/ssh-mcp-server/issues"
+    "url": "https://github.com/ONEGAYI/ssh-mcp-server/issues"
   },
-  "homepage": "https://github.com/classfang/ssh-mcp-server#readme",
+  "homepage": "https://github.com/ONEGAYI/ssh-mcp-server#readme",
   "bin": {
     "ssh-mcp-server": "build/index.js",
     "ssh-mcp-job": "build/cli/job.js",

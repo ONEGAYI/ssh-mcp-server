@@ -2,13 +2,15 @@
 
 上游：https://github.com/classfang/ssh-mcp-server 。保留上游代码与贡献惯例，本地需求讨论使用中文。
 
+维护仓库：https://github.com/ONEGAYI/ssh-mcp-server 。`origin` 指向本 fork，`upstream` 保留上游；默认向 `origin` 推送。
+
 ## 当前工作范围
 
 - 为只能通过 SSH 使用的 CentOS 7 服务器探索接近远程原生 Agent 的操作体验。
 - 用户已确认实施计划和分批本地提交。持久任务、文件工具与 ZCode 恢复接入已实现，当前整理离线预览交付与人工验收。联网测试不改变最终离线、无 root 与旧 glibc 约束。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
-- 功能实施遵守测试先行；人类验收前不推送，不直接合并。
+- 功能实施遵守测试先行。用户已授权创建个人 fork 并推送，变更通过 fork 内的 PR 审阅；未授权直接合并或向上游提交 PR。
 - `AGENTS.md` 为通用规则入口；`CLAUDE.md` 仅导入并附加专属规则。
 
 ## 导航

@@ -4,7 +4,7 @@
 
 首版核心链路已实现：持久命令、ZCode 原生后台回传、继续原对话时恢复跟进、受保护文件工具、项目接入生成和离线目录打包。当前交付是本地预览版，实际 ZCode 桌面会话与最终内网环境仍待人工验收。
 
-工作分支：`feat/remote-agent-workspace`。用户已要求按功能分批本地提交；未授权推送，不创建远端 PR 或合并。
+工作分支：`feat/remote-agent-workspace`。四批功能提交已推送至 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server)，在 fork 内以草稿 PR 留痕，等待人工验收；不直接合并，也不向上游提交 PR。`origin` 指向 fork，`upstream` 保留 classfang 原仓库。
 
 ## 已核实环境
 
