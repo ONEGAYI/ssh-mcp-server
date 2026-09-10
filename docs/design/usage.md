@@ -50,6 +50,29 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 
 ## Agent 日常工作
 
+### 指定读取区间与截断保护
+
+`remote_read` 支持 `fromLine` / `toLine`（从 1 开始，两端包含），也支持 `offset` 字节续读。例如读取第 100–150 行：
+
+```json
+{
+  "sessionId": "{{恢复钩子提供的真实对话标识}}",
+  "path": "src/example.py",
+  "fromLine": 100,
+  "toLine": 150,
+  "maxBytes": 16384
+}
+```
+
+- `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。单文件 16 MiB 上限同样适用于区间读取。
+- `truncated` 表示本次请求区间是否因上限未返回完整；`nextOffset` 给出可继续读取的字节位置，`startOffset` / `endOffset` 标出本次实际范围。
+- `complete` 表示当前对话已累计读完该版本的整个文件。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
+- 仅实际返回的范围计入 readToken。未读完时允许编辑已读范围；整文件覆盖、上传覆盖、删除或移动须累计完整读取。同一文件版本变化后旧凭据失效。
+
+传入 `offset` 后按该位置读取至文件尾（再受单次上限限制），不再使用 fromLine/toLine 作为区间终点；它不是绑定原区间的游标。文本 offset 必须位于 UTF-8 字符边界，使用返回的 nextOffset 可避免手算。二进制使用 `encoding: "base64"` 与字节 offset。
+
+### 后台任务
+
 继续任意对话时，UserPromptSubmit 钩子给出真实 `sessionId`、工作区根和待处理任务。Agent 应先通过 `remote_workspace` / `remote_read` 读取远端规则，再使用 `remote_*` 文件工具。
 
 命令通过本机入口运行，**必须由 ZCode 原生 Shell 设置 `run_in_background: true`**。仅在命令末尾加 `&` 不提供相同的原对话完成跟进。
@@ -118,4 +141,4 @@ node scripts/package-offline.mjs --output D:/Packages/ssh-mcp-windows-preview
 4. 运行约一分钟的任务，中途关闭 ZCode；重新进入原对话输入“继续”，检查同一任务被接回且没有重跑。
 5. 查看处理完成后的待处理列表，确认仅在 Agent ack 后消失。
 
-自动化证据与尚待人工验收的范围见 [progress.md](progress.md)。交互式 stdin/PTY 延期评估见 [interactive-assessment.md](interactive-assessment.md)。
+用户已于 2026-09-11 报告上述本机 ZCode / VMware VM 人工验收通过。自动化证据、人工报告及尚待完成的真实内网离线现场验收范围见 [progress.md](progress.md)。交互式 stdin/PTY 延期评估见 [interactive-assessment.md](interactive-assessment.md)。

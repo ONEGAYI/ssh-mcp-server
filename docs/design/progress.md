@@ -2,9 +2,25 @@
 
 ## 当前状态
 
-首版核心链路已实现：持久命令、ZCode 原生后台回传、继续原对话时恢复跟进、受保护文件工具、项目接入生成和离线目录打包。当前交付是本地预览版，实际 ZCode 桌面会话与最终内网环境仍待人工验收。
+首版核心链路已实现：持久命令、ZCode 原生后台回传、继续原对话时恢复跟进、受保护文件工具、项目接入生成和离线目录打包。用户于 2026-09-11 报告：本机 ZCode 与 VMware CentOS 7 的人工验收全部通过，无遗留问题。最终内网离线环境尚未现场验收。
 
-工作分支：`feat/remote-agent-workspace`。四批功能提交已推送至 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server)，在 fork 内以草稿 PR 留痕，等待人工验收；不直接合并，也不向上游提交 PR。`origin` 指向 fork，`upstream` 保留 classfang 原仓库。
+工作分支：`feat/remote-agent-workspace`。功能及后续文档提交已推送至 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server)，以 [PR #1](https://github.com/ONEGAYI/ssh-mcp-server/pull/1) 留痕；人工验收已通过，尚未授权合并。`origin` 指向 fork，`upstream` 保留 classfang 原仓库。
+
+## 人工验收结果（2026-09-11 用户报告）
+
+证据来源为用户在真实 ZCode 桌面中按“开始验收.md”完成的两大场景，不是本机固定模型探针结果。
+
+| 场景 | 用户报告的结果 |
+|---|---|
+| 工作区与规则 | remote_workspace 与远端规则读取通过 |
+| 文件保护 | readToken 保护下的文件编辑、编码保持通过 |
+| 正常后台任务 | 原生后台 Shell → job CLI run → 完成通知 → task-result 核对 → ack → pending 清空通过 |
+| 重启存活 | ZCode 关闭终止本机等待进程后，远端任务仍 running |
+| 恢复归属 | 钩子注入真实对话标识和任务登记（编号前缀 6065f848）；wait 接回原任务，createdAt 仍为 16:10:17 |
+| 执行去重 | build-runs.log 从恢复前 1 行变为恰好 2 行，sleep 60; make build 只执行一次 |
+| 结果确认 | exitCode 0、stdout 正常；remote_ack 后 remote_pending 清空，无损坏登记 |
+
+用户已将第一轮“钩子未注入”的发现销案，判断为当时首次钩子信任尚未确认；第二轮注入正常且标识一致，不作为遗留缺陷。此结论覆盖本机 ZCode 与 VMware VM，未扩展为真实内网离线部署已验收。
 
 ## 已核实环境
 
