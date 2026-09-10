@@ -13,7 +13,7 @@ if (values.help) {
   const source = fileURLToPath(new URL('../', import.meta.url));
   const output = resolve(values.output);
   await mkdir(output); // Existing destinations are never overwritten.
-  for (const name of ['build', 'node_modules', 'docs']) {
+  for (const name of ['build', 'node_modules', 'docs', 'examples']) {
     await cp(join(source, name), join(output, name), { recursive: true, dereference: true,
       filter: entry => !entry.includes('.artifacts') });
   }

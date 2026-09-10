@@ -26,6 +26,9 @@
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。
 - `README.md` / `README_EN.md`：上游中英文使用说明。
 - `src/`：MCP 服务、工具、SSH 连接与配置实现。
+- `src/core/setup-server.ts`：通用 setup MCP，缺项询问与项目接入入口。
+- `src/services/workspace-setup.ts`：MCP 与手工 CLI 共用的项目配置合并逻辑。
+- `examples/`：标准 MCP 导入及 ZCode 原生配置的 setup 服务模板。
 - `remote/`：Python 3.6 标准库执行器、持久任务、受保护文件操作与有界搜索。
 - `test/` / `scripts/`：上游测试和构建脚本。
 - `scripts/probes/`：ZCode 后台/恢复与 Linux 存活探针；可接正式工作区验证真实任务恢复，不是产品执行器。

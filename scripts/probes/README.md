@@ -43,3 +43,11 @@ node scripts/probes/zcode-background.mjs --cli <zcode.cjs绝对路径> --recover
 `--output` 目录须位于 profile 的 localRoot 内，才能通过恢复钩子的工程归属检查。测试在真实远端执行一次门控命令，重启测试 runtime 后恢复同一对话、再次后台等待、读取结果并通过模型工具调用 ack；核对原 jobId、后台通知身份、远端副作用只执行一次及待处理列表清空。
 
 模型响应仍由本机回环测试服务控制。隔离 runtime 的用户级钩子不等同于实际桌面项目级钩子已完成首次信任；后者按使用指南人工验收。
+
+增加 `--setup-mcp` 会先以真实 MCP 调用 remote_setup 生成专用项目，再让 ZCode 从生成的项目配置加载远端 MCP 和恢复钩子，不注入用户级替代钩子。测试端仅信任自己刚生成、路径与命令均核对过的唯一项目钩子，然后运行相同的远端重启恢复流程。
+
+```powershell
+node scripts/probes/zcode-background.mjs --cli <zcode.cjs绝对路径> --recover --workspace <测试连接profile.json> --setup-mcp
+```
+
+测试中的 trustGrant 适配器按已验证的 CLI 0.16.5 canonical v1 摘要构建，仅存在于隔离探针。产品 remote_setup 不包含自动信任代码；真实用户仍通过 ZCode 确认首次信任。

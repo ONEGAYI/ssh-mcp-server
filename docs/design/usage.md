@@ -11,6 +11,45 @@
 
 ## 配置一个工作区
 
+### 推荐：只添加 setup MCP，让 Agent 完成接入
+
+离线包解压到固定目录后，只需添加一个 setup 服务。以下示例假设解压后的根目录为 `D:/Tools/ssh-mcp`，其中包含 runtime、build 和 examples。
+
+在 ZCode 设置 → MCP 服务 → 完整配置中导入 [examples/mcp-setup.json](../../examples/mcp-setup.json)，按实际解压位置修改两处路径：
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-setup": {
+      "command": "D:/Tools/ssh-mcp/runtime/node.exe",
+      "args": ["D:/Tools/ssh-mcp/build/index.js", "--setup"]
+    }
+  }
+}
+```
+
+如果直接编辑 ZCode 的 `.zcode/config.json` 或用户级 `.zcode/cli/config.json`，其原生字段是 `mcp.servers`，使用 [examples/zcode-setup.json](../../examples/zcode-setup.json) 并合并现有字段。`mcpServers` 是完整配置导入格式，不是任意配置文件都使用的字段；不是单数 mcpServer。
+
+然后对 Agent 说：
+
+> 请调用 remote_setup 帮我配置这个项目的 SSH 远端开发。先询问缺少的连接和目录信息，再生成接入配置。
+
+`remote_setup({})` 返回供 Agent 询问的缺项清单，不写文件、不连接 SSH。Agent 收齐信息后再次调用同一工具，自动完成：
+
+- 在指定本机项目创建 `.ssh-mcp-workspace.json`，你不必手写。
+- 合并项目 `.zcode/config.json` 中的远端 MCP 和 UserPromptSubmit 钩子，保留其他 MCP、钩子和已有规则。
+- 配置已随包附带的 job CLI；恢复钩子会告诉 Agent 正确的后台 run/wait 命令入口。
+- 私钥或 SSH agent 模式可直接提供主机、用户名和端口；工具生成只含连接参数/私钥路径的 `.ssh-mcp-connection.json`，不复制私钥。
+- 密码或加密私钥口令留在本机已有原版 SSH MCP JSON 中，通过 `sshConfigFile` 引用，不在对话中询问或保存密码内容。
+
+所需信息包括已有本机项目绝对路径、Linux 工程目录和持久状态目录，以及 SSH 连接。Linux Python 默认 `/usr/bin/python3`，可指定其他已有的 Python 3.6+ 路径。
+
+工具成功只表示本机配置准备完成，返回 `sshVerified=false`。重新打开指定项目（如果新工具尚未加载），完成 ZCode 的首次项目钩子信任，再让 Agent 调用生成的 `remote_workspace` 检查实际 SSH 与 Python。setup 服务本身负责接入，日常操作由它生成的项目 MCP 提供；setup 不修改用户全局配置，也不代替 ZCode 授予钩子信任。
+
+重复传入相同信息不会重复追加钩子。已有不同工作区 profile、同名不相关 MCP 或重定向的 .zcode 目录会返回冲突，避免静默改动项目指向；根据错误检查配置后再继续。
+
+### 手工入口（保留兼容）
+
 在本机为一个远端项目建立专用目录，例如 `D:\RemoteWork\example`。该目录保存接入配置和本机输出，Linux 源码不会自动同步到这里。
 
 在目录内创建 `.ssh-mcp-workspace.json`：

@@ -5,14 +5,18 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const { values } = parseArgs({ options: {
   cli: { type: 'string' }, restart: { type: 'boolean', default: false },
   recover: { type: 'boolean', default: false },
   workspace: { type: 'string' },
+  'setup-mcp': { type: 'boolean', default: false },
   output: { type: 'string', default: '.artifacts' },
 } });
 assert.ok(values.cli, 'Use --cli <absolute path to the installed zcode.cjs>');
@@ -34,6 +38,29 @@ let remoteRuntime, remoteJob, remoteSession, remoteRelease, remoteCounter, waitC
 const jobCli = fileURLToPath(new URL('../../build/cli/job.js', import.meta.url));
 const recoveryCli = fileURLToPath(new URL('../../build/cli/recovery.js', import.meta.url));
 const argvCommand = args => args.map(value => shellQuote(/^[A-Za-z]:[\\/]/.test(value) ? value.replaceAll('\\', '/') : value)).join(' ');
+let setupEvidence;
+if (values['setup-mcp']) {
+  assert.ok(values.workspace && values.recover, '--setup-mcp requires --workspace and --recover');
+  const original = JSON.parse(readFileSync(resolve(values.workspace), 'utf8'));
+  const { loadWorkspaceConfig } = await import('../../build/config/workspace.js');
+  const source = await loadWorkspaceConfig(resolve(values.workspace));
+  const setupClient = new Client({ name: 'setup-e2e', version: '1' });
+  try {
+    await setupClient.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe' }));
+    const questions = await setupClient.callTool({ name: 'remote_setup', arguments: {} });
+    assert.equal(JSON.parse(questions.content[0].text).status, 'needs_input');
+    const configured = await setupClient.callTool({ name: 'remote_setup', arguments: {
+      localRoot: root, remoteRoot: source.remoteRoot, remoteStateDir: original.remoteStateDir,
+      sshConfigFile: source.sshConfigFile, connectionName: source.connectionName, pythonPath: source.pythonPath,
+      localStateDir: resolve(root, 'task-state'),
+    } });
+    assert.equal(configured.isError, undefined, JSON.stringify(configured));
+    setupEvidence = JSON.parse(configured.content[0].text);
+    assert.equal(setupEvidence.status, 'configured');
+    values.workspace = setupEvidence.profilePath;
+  } finally { await setupClient.close(); }
+}
 if (values.workspace) {
   assert.ok(values.recover, 'Production remote integration currently requires --recover');
   const { createWorkspaceRuntime } = await import('../../build/services/workspace-runtime.js');
@@ -44,6 +71,7 @@ if (values.workspace) {
 const result = { mode: values.recover ? 'recover' : values.restart ? 'restart' : 'normal', root,
   scope: values.workspace ? 'Real ZCode native background Shell + production recovery hook + persistent remote SSH task, with loopback fake model' : 'Native background waiter and recovery-hook integration; remote task deduplication is tested separately',
   requests: [], events: [] };
+if (setupEvidence) result.setup = { configuredViaMcp: true, profilePath: setupEvidence.profilePath, serverName: setupEvidence.serverName };
 let requestCount = 0;
 const model = createServer(async (req, res) => {
   try {
@@ -65,6 +93,7 @@ const model = createServer(async (req, res) => {
       outputFile: tag('output-file'), summary: tag('summary'),
     } : undefined;
     result.requests.push({ number: requestCount,
+      hasSessionContext: Boolean(remoteSession && JSON.stringify(body.messages).includes(`当前真实对话标识：${remoteSession}`)),
       hasCompletionNotification: JSON.stringify(body.messages).includes('task-notification'),
       hasRecoveryContext: values.workspace ? JSON.stringify(body.messages).includes(remoteJob ?? 'NO_JOB_REGISTERED') : JSON.stringify(body.messages).includes('SSH_MCP_PENDING_JOB_RESTORE'),
       receiptId, notification,
@@ -123,10 +152,10 @@ const event=JSON.parse(input);if(fs.existsSync(${JSON.stringify(recoveryFlag)}))
 process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'UserPromptSubmit',
 additionalContext:'SSH_MCP_PENDING_JOB_RESTORE: Reattach the persisted task with the background Shell waiter; do not restart its command.'}}));}});\n`);
 writeFileSync(resolve(root, '.zcode/cli/config.json'), JSON.stringify({
-  storage: { dir: resolve(root, 'state') }, hooks: { enabled: values.recover,
+  storage: { dir: resolve(root, 'state') }, ...(values['setup-mcp'] ? {} : { hooks: { enabled: values.recover,
     events: { UserPromptSubmit: [{ hooks: [{ type: 'process', command: process.execPath,
       args: values.workspace ? [recoveryCli, '--workspace', resolve(values.workspace)] : [hookScript] }] }] },
-  }, mcp: { servers: {} },
+  } }), mcp: { servers: {} },
 }));
 const env = {};
 for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP']) {
@@ -208,10 +237,34 @@ let runtime;
 try {
   runtime = startRuntime();
   const workspace = { workspacePath: root, workspaceKey: 'ssh-mcp-background-probe' };
+  const toolOptions = values['setup-mcp'] ? {} : { toolAllowlist: ['Bash'], mcpServers: [] };
   const created = await runtime.rpc('session/create', {
-    workspace, runtimeModel, mode: 'yolo', titleGenerationEnabled: false, toolAllowlist: ['Bash'], mcpServers: [],
+    workspace, runtimeModel, mode: 'yolo', titleGenerationEnabled: false, ...toolOptions,
   });
   const sessionId = created.session.sessionId;
+  if (values['setup-mcp']) {
+    // Test-host acceptance of exactly the hook generated inside this isolated
+    // project. The product setup tool never grants or bypasses ZCode hook trust.
+    const config = JSON.parse(readFileSync(resolve(root, '.zcode/config.json'), 'utf8'));
+    assert.deepEqual(Object.keys(config.hooks.events), ['UserPromptSubmit']);
+    assert.equal(config.hooks.events.UserPromptSubmit.length, 1);
+    assert.equal(config.hooks.events.UserPromptSubmit[0].hooks.length, 1);
+    const hook = config.hooks.events.UserPromptSubmit[0].hooks[0];
+    assert.equal(hook.command, process.execPath);
+    assert.deepEqual(hook.args, [recoveryCli, '--workspace', values.workspace]);
+    // Canonical v1 trust payload from the installed CLI 0.16.5 snapshot builder.
+    // Keep this compatibility adapter confined to the isolated test host.
+    const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    const hookDeclarationDigest = hash(['workspace-hook-declaration', 1, '.zcode/config.json', 0,
+      'UserPromptSubmit', null, 0, 0, ['process', hook.command, hook.args], 60000, 32768]);
+    const bundleDigest = hash(['workspace-hook-bundle', 1,
+      [['.zcode/config.json', 0, '.zcode/config.json', false, ['set', true], ['unset'], ['unset']]],
+      [[hookDeclarationDigest, true, true, true, true]]]);
+    const accepted = await runtime.rpc('workspace/hooks/trustGrant', { workspace,
+      bundleDigest, hookDeclarationDigest });
+    assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+    result.setup.projectHookTrustedByTestHost = true;
+  }
   remoteSession = sessionId;
   if (remoteRuntime) {
     remoteRelease = posix.join(remoteRuntime.config.remoteRoot, `probe-${sessionId}.release`);
@@ -251,7 +304,7 @@ try {
   if (values.restart || values.recover) {
     await runtime.stop(true);
     runtime = startRuntime();
-    const resumed = await runtime.rpc('session/resume', { sessionId, workspace, runtimeModel, toolAllowlist: ['Bash'], mcpServers: [] });
+    const resumed = await runtime.rpc('session/resume', { sessionId, workspace, runtimeModel, ...toolOptions });
     result.resumedSessionId = resumed.session?.sessionId;
     assert.equal(result.resumedSessionId, sessionId, 'The original session was not restored');
     result.resumedBackgroundJobs = resumed.projection?.backgroundTasks ?? resumed.state?.backgroundJobs;
@@ -287,6 +340,12 @@ try {
       assert.deepEqual(await remoteRuntime.tasks.pending(sessionId), [], 'Model acknowledgement did not clear the original pending result');
       result.remoteExecutedOnce = true;
       result.resultAcknowledged = true;
+      if (values['setup-mcp']) {
+        assert.equal(result.requests[0].hasSessionContext, true, 'The generated project hook was not active before the first model request');
+        assert.ok(result.requests[0].tools.some(name => name.endsWith('__remote_workspace')), 'The generated project MCP was not loaded');
+        result.setup.projectMcpLoaded = true;
+        result.setup.firstPromptHookVerified = true;
+      }
     }
   }
   if (!result.followupObserved || !result.completionNotificationObserved) {
