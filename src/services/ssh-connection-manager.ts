@@ -450,6 +450,91 @@ export class SSHConnectionManager {
     return this.runCommandInternal(cmdString, directory, name, options);
   }
 
+  public assertCommandAllowed(command: string, name?: string): void {
+    const result = this.validateCommand(command, name);
+    if (!result.isAllowed) throw new ToolError("COMMAND_VALIDATION_FAILED", result.reason || "Command denied", false);
+  }
+
+  /** Run a helper protocol exchange without putting its payload in a shell command. */
+  public async executeInputCommand(
+    command: string,
+    input: Buffer,
+    name?: string,
+    options: { timeout?: number } = {},
+  ): Promise<{ stdout: string; stderr: string; exitCode: number; signal?: string }> {
+    const config = this.getConfig(name);
+    if (this.getTransportMode(config) !== "exec") {
+      throw new ToolError("UNSUPPORTED_IN_SHELL_MODE", "Helper stdin exchanges require SSH exec transport", false);
+    }
+    const validation = this.validateCommand(command, name);
+    if (!validation.isAllowed) {
+      throw new ToolError("COMMAND_VALIDATION_FAILED", validation.reason || "Command denied", false);
+    }
+    const timeout = options.timeout ?? this.getCommandTimeoutMs(config);
+    if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+      throw new ToolError("INVALID_TIMEOUT", "Command timeout must be a positive integer", false);
+    }
+    const client = await this.ensureConnected(name);
+    const finalCommand = config.commandTemplate ? applyCommandTemplate(config.commandTemplate, command) : command;
+    return new Promise((resolve, reject) => {
+      let channel: ClientChannel | undefined;
+      let settled = false;
+      let bytes = 0;
+      let code: number | undefined;
+      let signal: string | undefined;
+      let stdout = "";
+      let stderr = "";
+      const outDecoder = new StringDecoder("utf8");
+      const errDecoder = new StringDecoder("utf8");
+      const limit = this.getMaxOutputBytes(config);
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error instanceof ToolError ? error : new ToolError("COMMAND_EXECUTION_ERROR", error.message, true));
+        try { channel?.close(); } catch { /* The transport is already unavailable. */ }
+      };
+      const timer = setTimeout(() => fail(new ToolError(
+        "COMMAND_TIMEOUT", "Helper exchange timed out; its remote outcome may be unknown", true,
+      )), timeout);
+      try {
+        client.exec(finalCommand, { pty: false }, (error, stream) => {
+          if (error) { fail(new ToolError("COMMAND_EXECUTION_ERROR", error.message, true)); return; }
+          if (settled) { stream.close(); return; }
+          channel = stream;
+          const append = (data: Buffer, isError: boolean) => {
+            if (settled) return;
+            bytes += data.length;
+            if (limit > 0 && bytes > limit) {
+              fail(new ToolError("OUTPUT_LIMIT_EXCEEDED", "Helper exchange exceeded its output limit", false));
+              return;
+            }
+            if (isError) stderr += errDecoder.write(data);
+            else stdout += outDecoder.write(data);
+          };
+          stream.on("data", (data: Buffer) => append(data, false));
+          stream.stderr.on("data", (data: Buffer) => append(data, true));
+          stream.on("error", fail);
+          stream.stderr.on("error", fail);
+          stream.on("exit", (exitCode?: number, exitSignal?: string) => { code = exitCode; signal = exitSignal; });
+          stream.on("close", (exitCode?: number, exitSignal?: string) => {
+            if (settled) return;
+            code = exitCode ?? code;
+            signal = exitSignal ?? signal;
+            if (code === undefined) {
+              fail(new ToolError("COMMAND_STATE_UNKNOWN", "SSH channel closed without an exit status", true));
+              return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            resolve({ stdout: stdout + outDecoder.end(), stderr: stderr + errDecoder.end(), exitCode: code, signal });
+          });
+          try { stream.end(input); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+        });
+      } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+    });
+  }
+
   /**
    * Upload file
    */

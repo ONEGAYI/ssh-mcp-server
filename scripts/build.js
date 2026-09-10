@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execSync } from "node:child_process";
-import { chmodSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -14,6 +14,10 @@ const buildFile = join(rootDir, "build", "index.js");
 // Run TypeScript compiler
 console.log("Building TypeScript...");
 execSync("tsc", { stdio: "inherit", cwd: rootDir });
+mkdirSync(join(rootDir, "build", "remote"), { recursive: true });
+for (const name of readdirSync(join(rootDir, "remote")).filter(name => name.endsWith(".py"))) {
+  copyFileSync(join(rootDir, "remote", name), join(rootDir, "build", "remote", name));
+}
 
 // Make executable on Unix-like systems (Linux, macOS, etc.)
 if (process.platform !== "win32") {

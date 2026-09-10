@@ -84,9 +84,9 @@ export class CommandLineParser {
   /**
    * Parse command line arguments
    */
-  public static parseArgs(): ParsedArgs {
+  public static parseArgs(args: string[] = process.argv.slice(2)): ParsedArgs {
     const { values, positionals } = parseArgs({
-      args: process.argv.slice(2),
+      args,
       options: {
         "config-file": { type: "string" },
         "ssh-config-file": { type: "string" },
