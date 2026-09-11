@@ -1,624 +1,194 @@
-<div align="center">
+# SSH MCP 工作区
 
-<img src="images/ssh-mcp-server-logo-v2.png" alt="ssh-mcp-server logo" width="220">
+在 Windows 上运行 ZCode，通过 SSH 操作 Linux 工程。支持受保护文件编辑、后台任务完成回传，以及客户端重启后继续跟进原任务。
 
-# ssh-mcp-server
+这是 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 维护的 fork，基于 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server)。本文介绍本 fork 的离线预览包与 MCP 引导接入；上游 npm 发行版不代表包含这些新增能力。
 
-![NPM Version](https://img.shields.io/npm/v/%40fangjunjie%2Fssh-mcp-server?label=%40fangjunjie%2Fssh-mcp-server)
-![GitHub forks](https://img.shields.io/github/forks/classfang/ssh-mcp-server)
-![GitHub Repo stars](https://img.shields.io/github/stars/classfang/ssh-mcp-server)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/classfang/ssh-mcp-server)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/classfang/ssh-mcp-server)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/classfang/ssh-mcp-server)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr-closed/classfang/ssh-mcp-server)
+## 1. 使用前准备
 
-基于 SSH 的 MCP (Model Context Protocol) 服务器，允许通过 MCP 协议远程执行 SSH 命令。
+| 位置 | 需要什么 |
+|---|---|
+| Windows | 已配置可用模型的 ZCode，以及本项目离线包；包内自带 Node.js 和运行依赖 |
+| Linux | 可通过 SSH exec 连接，已有 Bash 和 Python 3.6+，工程目录及状态目录可写 |
+| 网络 | Windows 能通过 SSH 访问 Linux；Linux 不需要访问外网 |
 
-[English Document](README_EN.md) | 中文文档
+Linux 不需要安装 ZCode、Node.js 或手工部署本项目。首次远端操作时，Windows 会通过 SSH 自动上传 Python 辅助脚本、创建状态目录，无需 root。
 
-</div>
+**离线包不包含 ZCode、模型或 Linux Python。** 若 Linux 只有 Python 2.7，需要先准备兼容该机器的 Python 3.6+，再提供其绝对路径。
 
-## 📝 项目介绍
+## 2. 解压到固定位置
 
-ssh-mcp-server 是一个桥接工具，可以让 AI 助手等支持 MCP 协议的应用通过标准化接口执行远程 SSH 命令。这使得 AI 助手能够安全地操作远程服务器，执行命令并获取结果，而无需直接暴露 SSH 凭据给 AI 模型。
+例如将包内文件放到 `D:/Tools/ssh-mcp`。这个目录下应直接包含：
 
-💬 如有任何问题，欢迎加入微信群交流：
+| 路径 | 用途 |
+|---|---|
+| `README.md` | 本使用说明 |
+| `runtime/node.exe` | Windows Node.js |
+| `build/index.js` | MCP 入口 |
+| `examples/` | 可复制的 MCP 配置模板 |
+| `docs/` | 详细使用说明和验证记录 |
+| `MANIFEST.json` | 包内文件的 SHA-256 校验清单 |
 
-<img src="images/wechat.jpg" alt="wechat" width="220">
+另外选一个**已经存在的本机项目目录**，例如 `D:/RemoteWork/my-project`，用 ZCode 打开它。这个目录保存接入配置；真正的源码仍在 Linux，不会自动同步到 Windows。
 
-## ✨ 功能亮点
+## 3. 添加一份 setup MCP 配置
 
-- **🔒 安全连接**：支持多种安全的 SSH 连接方式，包括密码认证和私钥认证（支持带密码的私钥）
-- **🛡️ 命令安全控制**：通过灵活的黑白名单机制，精确控制允许执行的命令范围，防止危险操作
-- **🔄 标准化接口**：符合 MCP 协议规范，与支持该协议的 AI 助手无缝集成
-- **🚇 双传输模式**：同时支持 `exec` 和 `shell` 两种 transport，兼容直连主机与堡垒机或跳板机场景
-- **📂 文件传输**：支持双向文件传输功能，可上传本地文件到服务器或从服务器下载文件
-- **🔑 凭据隔离**：SSH 凭据完全在本地管理，不会暴露给 AI 模型，增强安全性
-- **🚀 即用即走**：使用 NPX 可直接运行，无需全局安装，方便快捷
-
-## 📦 开源仓库
-
-GitHub：[https://github.com/classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server)
-
-NPM: [https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server](https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server)
-
-## 🛠️ 工具列表
-
-| 工具 | 名称 | 描述 |
-|---------|-----------|----------|
-| execute-command | 命令执行工具 | 在远程服务器上执行 SSH 命令并获取执行结果 |
-| upload | 文件上传工具 | 将本地文件上传到远程服务器指定位置 |
-| download | 文件下载工具 | 从远程服务器下载文件到本地指定位置 |
-| list-servers | 服务器列表工具 | 列出所有可用SSH服务器配置 |
-
-## 📚 使用方法
-
-### 0. 🤖 通过 AI Skill 快速配置（推荐）
-
-如果你使用支持 skill 的 AI 编程助手（如 Claude Code），可以直接使用内置的 **ssh-mcp-helper** skill 通过交互式问答完成安装和配置，无需手动编辑 JSON 文件。
-
-**使用方式：**
-
-1. 从本仓库 `skills/` 目录安装该 skill
-2. 告诉你的 AI 助手："帮我配置 ssh-mcp-server" 或 "给 Cursor 加一个 SSH MCP 连接"
-3. skill 会逐步引导你：检查 Node.js 环境 → 选择 MCP 客户端 → 选择认证方式 → 收集连接参数 → 生成并写入配置
-
-该 skill 支持下文所有场景（账号密码、私钥、SSH config 复用、SOCKS 代理、堡垒机、多连接、2FA、命令限制等），并自动生成格式正确的配置。
-
----
-
-下面的章节按从简单到复杂的顺序排列，最简单的入门方式就是用账号密码连接服务器。直接复制对应场景下的 `mcp.json` 配置到你的 MCP 客户端即可使用。
-
-> **⚠️ 重要提示**：在 MCP 配置文件中，每个命令行参数和其值必须是 `args` 数组中的独立元素。不要用空格将它们连接在一起。例如，使用 `"--host", "192.168.1.1"` 而不是 `"--host 192.168.1.1"`。
-
-### 1. 🔑 账号密码（最简单）
+在 **ZCode → 设置 → MCP 服务 → 完整配置** 中添加下面的内容，按实际安装位置修改两处路径：
 
 ```json
 {
   "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "pwd123456"
-      ]
+    "ssh-mcp-setup": {
+      "command": "D:/Tools/ssh-mcp/runtime/node.exe",
+      "args": ["D:/Tools/ssh-mcp/build/index.js", "--setup"]
     }
   }
 }
 ```
 
-### 2. 🔐 账号 + 私钥
+也可直接复制 [examples/mcp-setup.json](examples/mcp-setup.json)。
+
+**如果直接编辑 ZCode 原生配置文件**（项目 `.zcode/config.json` 或用户 `.zcode/cli/config.json`），使用 `mcp.servers` 结构，而不是上面的导入结构：
 
 ```json
 {
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--privateKey", "~/.ssh/id_rsa"
-      ]
+  "mcp": {
+    "servers": {
+      "ssh-mcp-setup": {
+        "command": "D:/Tools/ssh-mcp/runtime/node.exe",
+        "args": ["D:/Tools/ssh-mcp/build/index.js", "--setup"]
+      }
     }
   }
 }
 ```
 
-### 3. 🔏 带密码的私钥
+模板见 [examples/zcode-setup.json](examples/zcode-setup.json)。合并到已有配置中，保留其他服务和设置。
+
+## 4. 让 Agent 完成首次 setup
+
+在 ZCode 对话中发送：
+
+> 请调用 remote_setup，询问缺少的 SSH 和目录信息，帮我初始化这个项目的远端开发工作区。
+
+Agent 会先调用工具获取缺项，再向你询问：
+
+| 信息 | 示例或说明 |
+|---|---|
+| 本机工作区 | `D:/RemoteWork/my-project`，需已存在 |
+| SSH 连接 | 地址、端口（默认 22）、用户名 |
+| 认证 | 本机私钥文件路径或 SSH agent；也可引用已有原版 SSH MCP JSON 配置 |
+| Linux 工程目录 | `/home/user/project`，需已存在 |
+| Linux 持久状态目录 | `/home/user/.local/state/ssh-mcp-agent`，需有写入权限 |
+| Python 路径 | 默认 `/usr/bin/python3`，可指定其他 Python 3.6+ |
+
+使用密码或加密私钥口令时，在 Windows 本机的 SSH JSON 配置中填写，再告诉 Agent 配置文件路径和连接名。**不要把密码、口令或私钥内容发进对话。** 密码认证的最小配置示例：
 
 ```json
 {
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--privateKey", "~/.ssh/id_rsa",
-        "--passphrase", "pwd123456"
-      ]
-    }
-  }
-}
-```
-
-### 4. 📋 复用 `~/.ssh/config`
-
-如果你已经在 `~/.ssh/config` 配置了主机别名，服务器会自动从中读取连接参数，`mcp.json` 里就不用再写一遍。
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "myserver"
-      ]
-    }
-  }
-}
-```
-
-假设你的 `~/.ssh/config` 包含：
-
-```
-Host myserver
-    HostName 192.168.1.1
-    Port 22
-    User root
-    IdentityFile ~/.ssh/id_rsa
-```
-
-你也可以指定自定义的 SSH 配置文件路径：
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "myserver",
-        "--ssh-config-file", "/path/to/custom/ssh_config"
-      ]
-    }
-  }
-}
-```
-
-**注意**：命令行参数优先级高于 SSH 配置值。例如，如果你指定了 `--port 2222`，它会覆盖 SSH 配置中的端口。
-
-### 5. 🌐 通过代理连接
-
-当目标主机只能通过代理访问时，可使用 `--proxy` 配置 SOCKS5、HTTP 或 HTTPS 代理。
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "pwd123456",
-        "--proxy", "http://username:password@proxy-host:proxy-port"
-      ]
-    }
-  }
-}
-```
-
-支持的 URL 格式：
-
-```text
-socks://username:password@proxy-host:1080
-socks5://username:password@proxy-host:1080
-http://username:password@proxy-host:8080
-https://username:password@proxy-host:8443
-```
-
-HTTP 和 HTTPS 代理通过 `CONNECT` 方法建立到 SSH 服务的隧道，用户名和密码使用 Basic 代理认证。HTTP、HTTPS 未填写端口时分别默认使用 `80`、`443`；SOCKS5 必须填写端口。HTTPS 代理证书使用 Node.js 默认信任链进行验证。
-
-原有 `socksProxy` 配置和 `--socksProxy` 参数继续兼容，但只接受 `socks://` 和 `socks5://`。不要同时配置 `proxy` 和 `socksProxy`。
-
-### 6. 📝 使用命令白名单 / 黑名单
-
-通过 `--whitelist` 和 `--blacklist` 限制服务器允许执行的命令范围。多个模式之间用逗号分隔，每个模式都是一个正则表达式。**生产环境强烈建议配置**。白名单按完整命令匹配；启用白名单时，包含 `;`、`&`、`|`、反引号、`$()`、`>`、`<` 或换行符的命令会被直接拒绝，不能使用命令连接、管道、重定向或命令替换绕过校验。
-
-白名单示例（仅允许只读型查看命令）：
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "pwd123456",
-        "--whitelist", "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$,^df(?: -[A-Za-z]+)*(?: [A-Za-z0-9_./-]+)?$"
-      ]
-    }
-  }
-}
-```
-
-黑名单示例（屏蔽危险命令）：
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "pwd123456",
-        "--blacklist", "^rm .*,^shutdown.*,^reboot.*"
-      ]
-    }
-  }
-}
-```
-
-> 注意：如果同时指定了白名单和黑名单，系统会先检查命令是否完整匹配白名单，再检查是否命中黑名单，命令必须同时通过两项检查才能被执行。建议在白名单正则中始终显式使用 `^` 和 `$`，便于阅读和审计。需要组合执行多个操作时，请将逻辑放入经过单独审查的脚本，并只允许固定的脚本调用；不要依赖字符串切割来解析 Shell 语法。
-
-### 7. 🧩 使用命令模板包裹命令
-
-`commandTemplate` 会把每条执行的命令套进一个模板里，适合切换用户（`su`）、放进容器、或经过跳板机的场景。当命令会作为 shell 参数传入时使用 `<quotedCommand>`，需要原样插入时使用 `<command>`；模板会**在目录 `cd` 拼接之后**应用，因此整个 `cd ... && <实际命令>` 都会被包裹起来。
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "10.0.0.1",
-        "--port", "22",
-        "--username", "deploy",
-        "--password", "xxx",
-        "--command-template", "su root -c <quotedCommand>"
-      ]
-    }
-  }
-}
-```
-
-当指定目录为 `/data` 执行 `ls /app` 时，实际发送的命令是：
-
-```
-su root -c 'cd -- '\''/data'\'' && ls /app'
-```
-
-其他常见模板：
-
-```text
-sudo bash -c <quotedCommand>
-docker exec -i mycontainer sh -c <quotedCommand>
-ssh jumphost <quotedCommand>
-```
-
-### 8. 🚇 堡垒机 / 跳板机（`transportMode: shell`）
-
-`transportMode` 默认是 `exec`。出现下面这些情况时，应该切换到 `shell`：
-
-- SSH 登录成功，但 `exec` 执行命令失败
-- 远端必须等登录 banner、profile、环境初始化完成后才能正常执行命令
-- 连接目标本质上是堡垒机或只暴露交互式 shell 的设备
-
-两者差异：
-
-- `exec`：支持 `execute-command`、`upload`、`download`
-- `shell`：命令通过持久 shell 会话串行执行，内部带命令队列；但**不支持** `upload` / `download`，因为该模式下禁用了 SFTP
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "bastion.example.com",
-        "--port", "22",
-        "--username", "ops",
-        "--password", "pwd123456",
-        "--transport-mode", "shell",
-        "--shell-ready-timeout", "15000"
-      ]
-    }
-  }
-}
-```
-
-JSON 配置文件中还可以通过 `shellCommandTimeoutMs` 覆盖 shell 模式下单条命令的默认超时。
-
-### 9. 🔐 多因素认证（2FA / MFA）
-
-当 SSH 服务器要求多因素认证（密码 + 私钥 + 2FA 验证码）时启用 `tryKeyboard`。密码和私钥会自动提供；对于非密码提示，请在连接前通过服务端环境变量 `SSH_MCP_2FA_CODE` 提供验证码。
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "example.com",
-        "--port", "22",
-        "--username", "user",
-        "--password", "your_password",
-        "--privateKey", "/path/to/key",
-        "--try-keyboard"
-      ]
-    }
-  }
-}
-```
-
-**认证流程：**
-1. 私钥认证（如果提供）
-2. 密码认证（如果提供）
-3. 键盘交互式认证通过 `SSH_MCP_2FA_CODE` 提供 2FA 验证码
-
-### 10. 🧩 多 SSH 连接配置
-
-需要在同一个 MCP server 里同时管理多个 SSH 目标时，给每个连接命名，调用时通过 `connectionName` 选择。共有三种配置方式：
-
-#### 📄 方式一：使用配置文件（推荐）
-
-创建 JSON 配置文件（例如 `ssh-config.json`）：
-
-**数组格式：**
-
-```json
-[
-  {
-    "name": "dev",
-    "host": "1.2.3.4",
+  "my-linux": {
+    "host": "10.0.0.10",
     "port": 22,
-    "username": "alice",
-    "password": "{abc=P100s0}",
-    "socksProxy": "socks://127.0.0.1:10808",
-    "commandTimeoutMs": 120000,
-    "maxOutputBytes": 10485760
-  },
-  {
-    "name": "bastion",
-    "host": "9.9.9.9",
-    "port": 22,
-    "username": "ops",
-    "password": "pwd123456",
-    "transportMode": "shell",
-    "shellReadyTimeoutMs": 15000,
-    "shellCommandTimeoutMs": 45000,
-    "connectionTimeoutMs": 30000,
-    "keepaliveIntervalMs": 10000,
-    "keepaliveCountMax": 3
-  },
-  {
-    "name": "prod",
-    "host": "5.6.7.8",
-    "port": 22,
-    "username": "bob",
-    "password": "yyy",
-    "socksProxy": "socks://127.0.0.1:10808"
-  },
-  {
-    "name": "secure-server",
-    "host": "secure.example.com",
-    "port": 22,
-    "username": "admin",
-    "password": "your_password",
-    "privateKey": "/path/to/private/key",
-    "tryKeyboard": true
-  }
-]
-```
-
-**对象格式：**
-
-```json
-{
-  "dev": {
-    "host": "1.2.3.4",
-    "port": 22,
-    "username": "alice",
-    "password": "{abc=P100s0}",
-    "socksProxy": "socks://127.0.0.1:10808",
-    "commandTimeoutMs": 120000,
-    "maxOutputBytes": 10485760
-  },
-  "bastion": {
-    "host": "9.9.9.9",
-    "port": 22,
-    "username": "ops",
-    "password": "pwd123456",
-    "transportMode": "shell",
-    "shellReadyTimeoutMs": 15000,
-    "shellCommandTimeoutMs": 45000
-  },
-  "prod": {
-    "host": "5.6.7.8",
-    "port": 22,
-    "username": "bob",
-    "password": "yyy",
-    "socksProxy": "socks://127.0.0.1:10808"
+    "username": "user",
+    "password": "{{在本机填写密码}}"
   }
 }
 ```
 
-然后使用 `--config-file` 参数：
+例如保存到 `D:/Private/ssh-config.json`，告诉 Agent 文件路径及连接名 `my-linux`。这是原版 SSH MCP 的 JSON 格式，不是 OpenSSH 的 `~/.ssh/config` 文本格式。
 
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--config-file", "ssh-config.json"
-      ]
-    }
-  }
-}
+信息齐全后，Agent 再次调用 `remote_setup`，工具会自动：
+
+- 生成本机工作区的 `.ssh-mcp-workspace.json`。
+- 合并项目 MCP 和恢复钩子到 `.zcode/config.json`，保留已有服务与规则。
+- 准备已随包附带的后台命令入口及 Agent 操作指引。
+- 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`；只记录连接参数，不复制私钥。
+
+不需要手工运行 setup 脚本。成功返回中的 `sshVerified=false` 表示**配置已准备好，但还没有验证远端连接**。
+
+重新打开指定的本机项目（如果新工具尚未出现），并确认 ZCode 提示的**首次项目钩子信任**。随后让 Agent 调用 `remote_workspace` 验证 SSH、Python 和远端目录，再读取远端规则。
+
+setup 服务负责首次接入；日常文件和任务操作使用它生成的项目 MCP。
+
+## 5. 日常怎么用
+
+### 文件读取与连续编辑
+
+可以直接告诉 Agent：
+
+> 读取远端 src/example.py 的第 100–150 行，用 remote_edit 修改目标代码。后续编辑使用上次返回的新 readToken。
+
+`remote_read` 支持指定行区间、字节续读和截断标记。**成功的 remote_edit 会返回新凭据，下一次编辑无需重复 read。**
+
+保护仍然有效：未读部分不能直接编辑，整文件覆盖需要完整已知范围；外部修改会使凭据失效。若返回 `written=true` 且 `rereadRequired=true`，说明编辑已经提交但凭据更新未确认，应重新读取当前内容，不能盲目重复编辑。
+
+### 后台构建与完成回传
+
+> 请通过原生后台 Shell 在远端运行 make build，主回合先返回；收到完成通知后检查退出结果和日志，再确认处理。
+
+Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `run_in_background: true`。仅在命令后加 `&` 不等同于这条完成回传链路。
+
+任务完成后，Agent 核对 `task-result`，必要时读取日志，再调用 `remote_ack`。只有处理确认后，任务才从 `remote_pending` 列表移除。
+
+### 重启后继续原任务
+
+关闭 ZCode 后，远端任务继续运行。重新进入**原对话**，发送：
+
+> 继续。请检查恢复钩子中的任务，用原任务编号 wait 接回等待，不要重新 run 原命令。
+
+恢复钩子会提供真实对话标识和未处理任务。只启动 ZCode、尚未继续原对话时，不保证自动唤醒。
+
+### 停止任务
+
+> 请取消这个远端任务，并核实它已结束。
+
+取消需调用 `remote_cancel` 或 job CLI 的 cancel。关闭本机等待程序、SSH 断开和等待超时都不等于取消远端任务。
+
+## 6. 常见问题
+
+| 现象 | 处理方式 |
+|---|---|
+| 只有 remote_setup，没有文件工具 | 完成 setup，打开它返回的本机项目；必要时重新打开项目，检查生成的项目 MCP 是否启用 |
+| 首条消息没有恢复信息 | 先检查首次钩子信任是否确认，再继续原对话；不要让 Agent 猜 sessionId |
+| 返回 SETUP_CONFLICT | 检查已有工作区配置是否指向另一个目标或存在同名服务；不要直接覆盖旧配置 |
+| 返回 FILE_CONFLICT | 文件发生变化，重新读取；连续 edit 应使用最新返回的 readToken |
+| 返回 READ_REQUIRED | 当前凭据没有覆盖要修改的内容；补读相应区间或整个文件 |
+| 返回 unknown | 无法确认远端执行状态；检查状态与日志，不自动重跑可能有副作用的命令 |
+| Python 不可用 | 核对远端 pythonPath；本项目要求 Python 3.6+，不会自动安装 Python |
+
+## 7. 升级
+
+1. 关闭相关 MCP 进程；通常可先关闭 ZCode。
+2. 将新包中的程序文件更新到**原安装目录**。
+3. 保留本机工作区配置、SSH 配置，以及本机和远端任务状态目录。
+4. 重启 ZCode/MCP，在原对话中继续跟进任务。
+
+安装目录不变时，现有入口路径可继续使用。若更换安装目录，需要同步更新 setup MCP、已生成的项目 MCP 和恢复钩子的程序路径。旧 ZIP 和已经解压的旧程序不会自动升级。
+
+远端辅助程序会按内容摘要部署新版本；升级 Windows 包不要求手工覆盖 Linux 脚本。
+
+## 8. 当前范围
+
+- 首版是非交互式 Shell：不提供 stdin 交互或 PTY。
+- 专用文件操作上限 16 MiB；文件读取有独立的输出截断保护。
+- 内置搜索是 Python 字面量匹配，不模拟 rg 的正则与 .gitignore；远端 rg 需要目标机自行具备。
+- 普通 Shell 仍可产生文件副作用；专用工具的写保护不是全系统写入沙箱。
+- 已有本机 ZCode + CentOS 7 VM 的人工验收，以及新 setup、连续编辑的自动验证；最终内网离线现场尚未验收。
+
+进一步说明：[详细使用指南](docs/design/usage.md) · [接口契约](docs/design/contracts.md) · [验证进度](docs/design/progress.md)。
+
+## 开发与打包
+
+在与目标 Windows 架构一致的联网 Windows 开发机安装依赖后：
+
+```powershell
+npm install
+npm test
+node scripts/package-offline.mjs --output D:/Packages/ssh-mcp-preview
 ```
 
-#### 🔧 方式二：使用 JSON 格式的 --ssh 参数
+`npm test` 会先构建。打包脚本使用现有 build 和 node_modules，**生成新的目录包，不自动生成 ZIP**；随后可以压缩整个输出目录。已有目标目录会被拒绝，避免覆盖旧包。
 
-可以直接传递 JSON 格式的配置字符串：
+以后每次离线打包都会把本 README 放在包根目录，连同 docs、examples 和运行程序一起写入校验清单。包中不复制工作区 profile、SSH 凭据或测试产物。
 
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-server": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--ssh", "{\"name\":\"dev\",\"host\":\"1.2.3.4\",\"port\":22,\"username\":\"alice\",\"password\":\"{abc=P100s0}\",\"socksProxy\":\"socks://127.0.0.1:10808\"}",
-        "--ssh", "{\"name\":\"bastion\",\"host\":\"9.9.9.9\",\"port\":22,\"username\":\"ops\",\"password\":\"pwd123456\",\"transportMode\":\"shell\",\"shellReadyTimeoutMs\":15000}",
-        "--ssh", "{\"name\":\"prod\",\"host\":\"5.6.7.8\",\"port\":22,\"username\":\"bob\",\"password\":\"yyy\",\"socksProxy\":\"socks://127.0.0.1:10808\"}"
-      ]
-    }
-  }
-}
-```
-
-#### 📝 方式三：旧格式逗号分隔（向后兼容）
-
-对于密码中不包含特殊字符的简单情况，仍可使用旧格式：
-
-```bash
-npx @fangjunjie/ssh-mcp-server \
-  --ssh "name=dev,host=1.2.3.4,port=22,user=alice,password=xxx" \
-  --ssh "name=prod,host=5.6.7.8,port=22,user=bob,password=yyy"
-```
-
-> **⚠️ 注意**：旧格式在处理包含特殊字符（如 `=`、`,`、`{`、`}`）的密码时可能会有问题。如果密码包含特殊字符，请使用方式一或方式二。
-
-在MCP工具调用时，通过 `connectionName` 参数指定目标连接名称，未指定时使用默认连接。
-
-示例（在prod连接上执行命令）：
-
-```json
-{
-  "tool": "execute-command",
-  "params": {
-    "cmdString": "ls -al",
-    "connectionName": "prod"
-  }
-}
-```
-
-示例（带超时选项的命令执行）：
-
-```json
-{
-  "tool": "execute-command",
-  "params": {
-    "cmdString": "ping -c 10 127.0.0.1",
-    "connectionName": "prod",
-    "timeout": 5000
-  }
-}
-```
-
-### ⏱️ 命令执行超时
-
-`execute-command` 工具支持超时选项，防止命令无限期挂起：
-
-- **timeout**: 单次调用的命令执行超时时间（毫秒，可选）；传入时会覆盖连接配置，未传入时使用对应连接配置或其 30000ms 默认值
-- 在 JSON 配置文件里为单个连接设置 `commandTimeoutMs`，可以改掉这个默认值，避免每次调用都手动传 `timeout`（`exec` 模式）
-- `shell` 模式对应的配置项是 `shellCommandTimeoutMs`
-- 调用参数里的 `timeout` 始终优先于上面两个配置项
-- 连接默认启用 SSH keepalive（`keepaliveIntervalMs`: 10000，`keepaliveCountMax`: 3），并使用 `connectionTimeoutMs` 限制连接建立时间
-- SFTP 打开和传输操作使用 `sftpTimeoutMs` 控制超时（默认 300000ms）
-- 错误响应现在包含稳定的 `code`、`message`、`retriable` 字段，便于上层 Agent 处理
-
-这对于像 `ping`、`tail -f` 或其他可能阻塞执行的长时间运行进程特别有用。
-
-### 📦 命令输出限制
-
-会限制单条命令捕获的 `stdout` 和 `stderr` 总量，避免大文件或无限输出耗尽 MCP server 内存：
-
-- 在 JSON 连接配置中使用 `maxOutputBytes` 设置上限，默认值为 `10485760`（10 MiB）
-- `maxOutputBytes` 必须是非负整数；设置为 `0` 可禁用限制，但不建议对不受信任的命令禁用
-- 输出超过限制时，远端命令会被中止，工具返回 `OUTPUT_LIMIT_EXCEEDED` 错误和已经捕获的截断输出，不会把中止的命令误报为成功
-- 当 `pty` 为 `false` 时，成功命令写入 `stderr` 的警告或进度信息会保留在 `[stderr]` 区段中
-- `exec` 与 `shell` 两种模式都会应用该限制。区别在于 `exec` 模式只关闭该命令的通道，而 `shell` 模式的通道由该连接上的所有命令共用、远端在中止后仍会继续写入，因此会断开连接（与 shell 模式命令超时的处理一致）
-
-### 🗂️ 列出所有SSH服务器
-
-可以通过MCP工具 `list-servers` 获取所有可用的SSH服务器配置：
-
-调用示例：
-
-```json
-{
-  "tool": "list-servers",
-  "params": {}
-}
-```
-
-返回示例：
-
-```json
-[
-  { "name": "dev", "host": "1.2.3.4", "port": 22, "username": "alice" },
-  { "name": "prod", "host": "5.6.7.8", "port": 22, "username": "bob" }
-]
-```
-
-### ⚙️ 命令行选项参考
-
-```text
-选项:
-  --config-file       JSON 配置文件路径（推荐用于多服务器配置）
-  --ssh-config-file   SSH 配置文件路径（默认: ~/.ssh/config）
-  --ssh               SSH 连接配置（可以是 JSON 字符串或旧格式）
-  -h, --host          SSH 服务器主机地址或 SSH 配置中的别名
-  -p, --port          SSH 服务器端口
-  -u, --username      SSH 用户名
-  -w, --password      SSH 密码
-  -k, --privateKey    SSH 私钥文件路径
-  -P, --passphrase    私钥密码（如果有的话）
-  -a, --agent         SSH agent socket 路径
-  --try-keyboard      启用键盘交互式认证以支持 2FA/MFA（默认: false）
-  -W, --whitelist     命令白名单，以逗号分隔的正则表达式
-  -B, --blacklist     命令黑名单，以逗号分隔的正则表达式
-  --proxy             代理地址，支持 SOCKS5、HTTP 和 HTTPS
-  -s, --socksProxy    旧版 SOCKS5 代理地址（兼容参数）
-  --allowed-local-paths   upload/download 允许访问的额外本地路径，逗号分隔
-  --allowed-remote-paths  SFTP upload/download 允许访问的远端路径（POSIX 绝对路径），逗号分隔
-  --transport-mode    SSH transport 模式: exec 或 shell（默认: exec）
-  --shell-ready-timeout   shell 就绪探测超时，单位毫秒（默认: 10000）
-  --command-template  命令模板；shell 参数用 <quotedCommand>，原样插入用 <command>
-  --pty <true|false>  为命令执行分配伪终端（默认: true）
-  --pre-connect       启动时预连接所有配置的 SSH 服务器
-  --version, -v       打印包版本
-  --help              打印帮助信息
-```
-
-## 🛡️ 安全注意事项
-
-该服务器提供了在远程服务器上执行命令和传输文件的强大功能。为确保安全使用，请注意以下几点：
-
-- **命令白名单**：*强烈建议* 使用 `--whitelist` 选项来限制可执行的命令集合。如果没有白名单，任何命令都可以在远程服务器上执行，这可能带来重大的安全风险。
-- **私钥安全**：服务器会将 SSH 私钥读入内存。请确保运行 `ssh-mcp-server` 的机器是安全的。不要将服务器暴露给不受信任的网络。
-- **拒绝服务攻击 (DoS)**：服务器没有内置的速率限制。攻击者可能通过向服务器发送大量连接请求或大文件传输来发起 DoS 攻击。建议在具有速率限制功能的防火墙或反向代理后面运行服务器。
-- **路径遍历**：服务器内置了对本地文件系统路径遍历攻击的保护。但是，仍然需要注意在 `upload` 和 `download` 命令中使用的路径。
-- **本地传输范围**：默认仅允许访问当前工作目录。只有在明确可信时，才建议通过 `--allowed-local-paths` 或配置文件中的 `allowedLocalPaths` 放宽范围。
-- **远端传输范围**：SFTP upload/download 仅接受绝对 POSIX 路径。未配置 `allowedRemotePaths`（或 `--allowed-remote-paths`）时，任意远端路径都允许，但启动时会打印警告。强烈建议显式配置 `allowedRemotePaths` 白名单，避免模型被 prompt 注入后读写 `~/.ssh/authorized_keys`、`/etc/sshd_config` 之类敏感文件。
-
-## 🌟 Star 历史
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/chart?repos=classfang/ssh-mcp-server&type=date&legend=top-left&sealed_token=ndORao73xOZgyX7IvlIIOynMoeEP5Ds9YAG-zOfMMBlNepLdP3e7T7k9K94X8TdvuxplN5DXLolbF9jFFsYDD-1V0V8HO6B3swaPOvJaonKeiFNdAuWsXg)](https://www.star-history.com/?type=date&legend=top-left&repos=classfang%2Fssh-mcp-server)
+保留原版同步模式，可通过 `build/index.js --help` 查看入口；它不承担本工作区模式的持久任务保证。

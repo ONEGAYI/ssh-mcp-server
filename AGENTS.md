@@ -24,7 +24,8 @@
 - `docs/design/discovery.md`：上游代码核实、候选方案与尚待回答的需求问题。
 - `docs/design/interactive-assessment.md`：交互式功能复杂度、延期影响及首版扩展边界评估。
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。
-- `README.md` / `README_EN.md`：上游中英文使用说明。
+- `README.md`：本 fork 的中文入门、setup、日常使用与升级说明；每次离线打包放入包根目录。
+- `README_EN.md`：保留的上游英文旧模式说明。
 - `src/`：MCP 服务、工具、SSH 连接与配置实现。
 - `src/core/setup-server.ts`：通用 setup MCP，缺项询问与项目接入入口。
 - `src/services/workspace-setup.ts`：MCP 与手工 CLI 共用的项目配置合并逻辑。

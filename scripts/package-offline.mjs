@@ -17,7 +17,7 @@ if (values.help) {
     await cp(join(source, name), join(output, name), { recursive: true, dereference: true,
       filter: entry => !entry.includes('.artifacts') });
   }
-  for (const name of ['package.json', 'package-lock.json', 'LICENSE']) {
+  for (const name of ['package.json', 'package-lock.json', 'LICENSE', 'README.md']) {
     await copyFile(join(source, name), join(output, name));
   }
   await mkdir(join(output, 'scripts'));

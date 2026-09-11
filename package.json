@@ -44,6 +44,8 @@
   },
   "files": [
     "build/**/*",
-    "examples/*.json"
+    "examples/*.json",
+    "docs/design/*.md",
+    "docs/adr/*.md"
   ]
 }
