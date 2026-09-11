@@ -105,12 +105,21 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 
 - `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。单文件 16 MiB 上限同样适用于区间读取。
 - `truncated` 表示本次请求区间是否因上限未返回完整；`nextOffset` 给出可继续读取的字节位置，`startOffset` / `endOffset` 标出本次实际范围。
-- `complete` 表示当前对话已累计读完该版本的整个文件。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
-- 仅实际返回的范围计入 readToken。未读完时允许编辑已读范围；整文件覆盖、上传覆盖、删除或移动须累计完整读取。同一文件版本变化后旧凭据失效。
+- `complete` 表示当前凭据的已知范围覆盖整个文件（来自实际读取及自身编辑后的继承）。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
+- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖、上传覆盖、删除或移动须具有完整已知范围。同一文件版本变化后旧凭据失效。
 
 传入 `offset` 后按该位置读取至文件尾（再受单次上限限制），不再使用 fromLine/toLine 作为区间终点；它不是绑定原区间的游标。文本 offset 必须位于 UTF-8 字符边界，使用返回的 nextOffset 可避免手算。二进制使用 `encoding: "base64"` 与字节 offset。
 
+### 连续编辑无需反复读取
+
+成功的 `remote_edit` 返回新 `readToken`。下一次编辑使用这个新凭据即可，无需 read；不能继续使用旧凭据。原已读范围随编辑长度变化而调整，自己提交的替换文本成为已知内容，未读区间仍保持保护。
+
+例如 `read → token A → edit → token B → edit → token C`。若初始只读了一部分文件，后续依然不能凭此覆盖整个文件；外部修改仍会使新凭据失效。
+
+如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload/delete/move 不自动续期。
+
 ### 后台任务
+
 
 继续任意对话时，UserPromptSubmit 钩子给出真实 `sessionId`、工作区根和待处理任务。Agent 应先通过 `remote_workspace` / `remote_read` 读取远端规则，再使用 `remote_*` 文件工具。
 
@@ -139,14 +148,14 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 | 项目 | 首版行为 |
 |---|---|
 | 文件大小 | 专用读写、上传、下载单文件最多 16 MiB；更大文件明确报错 |
-| 读后写 | 服务签发凭据；分段读取按同一版本累计。局部编辑只准修改已返回范围；覆盖、删除、移动需要完整读取 |
-| 冲突 | 内容、身份或元数据变化后拒绝旧凭据；成功写入不会自动签发新读取资格 |
+| 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖、删除、移动需要完整已知范围 |
+| 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期 |
 | 编码 | 文本 UTF-8/BOM，保留原 CRLF 约定、权限与组；混合换行不整体重排。其他编码按 base64 传输 |
 | 链接 | 经过符号链接的修改、多硬链接和非自有文件的替换明确不支持 |
 | 查找 | 目录分页；递归 glob 查找最多 50,000 个条目 |
 | 搜索 | Python 字面量搜索，跳过 .git、二进制和大于 16 MiB 的文件；单次最多扫描 64 MiB。不会模拟 rg 的正则或 .gitignore 语义 |
 | rg | VM 未安装；Shell 直接执行 rg 会按真实退出结果返回。可由用户另行提供兼容的离线 rg，不自动安装 |
-| 工具返回 | 默认有界；读取凭据只覆盖实际返回片段。文件文本输出按 JSON 序列化预算限制 |
+| 工具返回 | 默认有界；read 只授权实际返回片段，edit 续期不扩大到未读间隔。文件文本输出按 JSON 序列化预算限制 |
 | 命令日志 | stdout/stderr 分开持久保存。默认每任务合计 256 MiB，超限终止受管理命令并明确 OUTPUT_LIMIT |
 | 日志展示 | 本机最多展示 64 KiB 前缀，其余可用 remote_output 的字节游标或 tail=true 读取；不会为丢弃内容下载完整巨量日志 |
 

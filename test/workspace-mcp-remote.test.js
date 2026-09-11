@@ -36,7 +36,17 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     const blocked = await call('remote_upload', { path, localPath });
     assert.equal(blocked.data.code, 'READ_REQUIRED');
     const full = await call('remote_read', { path });
-    const upload = await call('remote_upload', { path, localPath, readToken: full.data.readToken });
+    const edited = await call('remote_edit', { path, readToken: full.data.readToken,
+      edits: [{ oldText: 'hello', newText: 'hello 中文' }] });
+    assert.equal(edited.error, undefined, JSON.stringify(edited));
+    assert.equal(edited.data.rereadRequired, false);
+    assert.equal(edited.data.complete, true);
+    assert.notEqual(edited.data.readToken, full.data.readToken);
+    const repeated = await call('remote_edit', { path, readToken: edited.data.readToken,
+      edits: [{ oldText: 'hello 中文', newText: 'second edit without read' }] });
+    assert.equal(repeated.error, undefined, JSON.stringify(repeated));
+    assert.equal(repeated.data.rereadRequired, false);
+    const upload = await call('remote_upload', { path, localPath, readToken: repeated.data.readToken });
     assert.equal(upload.error, undefined, JSON.stringify(upload));
     const binaryRead = await call('remote_read', { path, encoding: 'base64' });
     assert.deepEqual(Buffer.from(binaryRead.data.data, 'base64'), binary);

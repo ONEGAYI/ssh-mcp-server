@@ -22,8 +22,8 @@ class RemoteFilesTest(unittest.TestCase):
     def tearDown(self):
         self.fixture.cleanup()
 
-    def call(self, action, request):
-        data = dict(request, workspaceRoot=str(self.work), sessionId='session-one')
+    def call(self, action, request, session='session-one'):
+        data = dict(request, workspaceRoot=str(self.work), sessionId=session)
         run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.root / 'state'), action],
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=10)
@@ -46,6 +46,13 @@ class RemoteFilesTest(unittest.TestCase):
                                        'edits': [{'oldText': 'gamma', 'newText': 'lost'}]})
         self.assertFalse(stale['ok'])
         self.assertEqual(stale['error']['code'], 'FILE_CONFLICT')
+        renewed = edited['result']
+        self.assertNotEqual(renewed['readToken'], read['result']['readToken'])
+        self.assertTrue(renewed['complete'])
+        again = self.call('file_edit', {'path': 'source.txt', 'readToken': renewed['readToken'],
+                                       'edits': [{'oldText': 'gamma', 'newText': 'delta'}]})
+        self.assertTrue(again['ok'], again)
+        self.assertEqual(path.read_bytes(), b'\xef\xbb\xbfalpha\r\ndelta\r\n')
 
     def test_partial_read_only_authorizes_edits_inside_the_delivered_range(self):
         path = self.work / 'partial.txt'
@@ -154,6 +161,100 @@ class RemoteFilesTest(unittest.TestCase):
             results = list(pool.map(lambda text: self.call('file_write', {'path': 'race', 'text': text, 'readToken': token}), ['first', 'second']))
         self.assertEqual(sum(result['ok'] for result in results), 1)
         self.assertEqual([result['error']['code'] for result in results if not result['ok']], ['FILE_CONFLICT'])
+
+    def test_edit_renews_disjoint_read_ranges_without_granting_unread_gaps(self):
+        path = self.work / 'ranges.txt'
+        original = '\ufeffunread header\r\n前 编辑甲 后\r\nsecret gap\r\n尾读乙\r\nunread tail\r\n'
+        path.write_bytes(original.encode('utf8'))
+        self.call('file_read', {'path': 'ranges.txt', 'fromLine': 2, 'toLine': 2})
+        partial = self.call('file_read', {'path': 'ranges.txt', 'fromLine': 4, 'toLine': 4})['result']
+        other = self.call('file_read', {'path': 'ranges.txt'}, session='session-two')['result']
+        changed = self.call('file_edit', {'path': 'ranges.txt', 'readToken': partial['readToken'], 'edits': [
+            {'oldText': '尾读乙', 'newText': '乙'},
+            {'oldText': '编辑甲', 'newText': '扩大\n第二行'},
+        ]})
+        self.assertTrue(changed['ok'], changed)
+        renewed = changed['result']
+        self.assertFalse(renewed['complete'])
+        for action, request in [
+            ('file_edit', {'edits': [{'oldText': 'secret gap', 'newText': 'lost'}]}),
+            ('file_write', {'text': 'lost'}),
+        ]:
+            denied = self.call(action, dict(request, path='ranges.txt', readToken=renewed['readToken']))
+            self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        foreign = self.call('file_edit', {'path': 'ranges.txt', 'readToken': renewed['readToken'],
+                                         'edits': [{'oldText': '乙', 'newText': 'lost'}]}, session='session-two')
+        self.assertEqual(foreign['error']['code'], 'READ_SCOPE_MISMATCH')
+        stale = self.call('file_edit', {'path': 'ranges.txt', 'readToken': other['readToken'],
+                                       'edits': [{'oldText': '乙', 'newText': 'lost'}]}, session='session-two')
+        self.assertEqual(stale['error']['code'], 'FILE_CONFLICT')
+        again = self.call('file_edit', {'path': 'ranges.txt', 'readToken': renewed['readToken'], 'edits': [
+            {'oldText': '扩大\r\n第二行', 'newText': '短'},
+            {'oldText': '乙', 'newText': '后续编辑'},
+        ]})
+        self.assertTrue(again['ok'], again)
+        self.assertFalse(again['result']['complete'])
+        self.assertEqual(path.read_bytes(), '\ufeffunread header\r\n前 短 后\r\nsecret gap\r\n后续编辑\r\nunread tail\r\n'.encode('utf8'))
+        # Re-reading another range must extend the renewed record, not reset it.
+        page = self.call('file_read', {'path': 'ranges.txt', 'fromLine': 1, 'toLine': 1})['result']
+        self.assertEqual(page['readToken'], again['result']['readToken'])
+        self.assertFalse(page['complete'])
+        path.write_bytes(path.read_bytes().replace(b'secret gap', b'external gap'))
+        conflict = self.call('file_edit', {'path': 'ranges.txt', 'readToken': page['readToken'],
+                                          'edits': [{'oldText': '短', 'newText': 'lost'}]})
+        self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
+
+    def test_edit_deletion_retains_full_coverage_and_supports_empty_file(self):
+        (self.work / 'emptying').write_text('remove me')
+        token = self.call('file_read', {'path': 'emptying'})['result']['readToken']
+        deleted_text = self.call('file_edit', {'path': 'emptying', 'readToken': token,
+                                              'edits': [{'oldText': 'remove me', 'newText': ''}]})
+        self.assertTrue(deleted_text['ok'], deleted_text)
+        self.assertTrue(deleted_text['result']['complete'])
+        self.assertEqual(deleted_text['result']['size'], 0)
+        # Full coverage remains full; a complete read is not required again.
+        rewritten = self.call('file_write', {'path': 'emptying', 'readToken': deleted_text['result']['readToken'], 'text': 'replacement'})
+        self.assertTrue(rewritten['ok'], rewritten)
+
+    def test_external_replacement_after_commit_does_not_receive_a_renewed_token(self):
+        sys.path.insert(0, str(HELPER.parent))
+        from files import FileService
+        path = self.work / 'post-image'
+        path.write_text('before')
+        token = self.call('file_read', {'path': 'post-image'})['result']['readToken']
+
+        class ExternalReplacement(FileService):
+            def commit(inner, target, data, info=None, version=None):
+                written = super(ExternalReplacement, inner).commit(target, data, info, version)
+                other = target.with_name('external-temp')
+                other.write_bytes(data)  # Same content, but a different file identity.
+                other.replace(target)
+                return written
+
+        result = ExternalReplacement(self.root / 'state', str(self.work), 'session-one').edit({
+            'path': 'post-image', 'readToken': token, 'edits': [{'oldText': 'before', 'newText': 'after'}]})
+        self.assertTrue(result['written'])
+        self.assertTrue(result['rereadRequired'])
+        self.assertIsNone(result['readToken'])
+        self.assertEqual(result['readTokenError'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_text(), 'after')
+
+    def test_read_record_failure_does_not_report_a_committed_edit_as_failed(self):
+        sys.path.insert(0, str(HELPER.parent))
+        from files import FileService
+        (self.work / 'record-failure').write_text('before')
+        token = self.call('file_read', {'path': 'record-failure'})['result']['readToken']
+
+        class RecordFailure(FileService):
+            def save_read(inner, *args, **kwargs):
+                raise OSError('injected storage failure')
+
+        result = RecordFailure(self.root / 'state', str(self.work), 'session-one').edit({
+            'path': 'record-failure', 'readToken': token, 'edits': [{'oldText': 'before', 'newText': 'after'}]})
+        self.assertTrue(result['written'])
+        self.assertTrue(result['rereadRequired'])
+        self.assertIsNone(result['readToken'])
+        self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
 
 if __name__ == '__main__':

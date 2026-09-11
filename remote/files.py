@@ -52,6 +52,18 @@ def covers(ranges, start, end):
     return any(left <= start and right >= end for left, right in ranges)
 
 
+def remap_read_ranges(ranges, edits):
+    """Shift known byte intervals across replacements fully contained in them.
+
+    Each edit is (old_start, old_end, new_byte_count), in original coordinates.
+    Replacement bytes are known because the caller supplied them. Unread gaps
+    keep their byte lengths and never become authorized as a side effect.
+    """
+    def shifted(position):
+        return position + sum(new_size - (end - start) for start, end, new_size in edits if end <= position)
+    return merge_ranges([[shifted(start), shifted(end)] for start, end in ranges])
+
+
 def newline_kind(data):
     crlf = data.count(b'\r\n')
     lf = data.count(b'\n') - crlf
@@ -117,6 +129,17 @@ class FileService:
             raise AgentError('FILE_CONFLICT', 'File changed since it was read; read it again')
         return token
 
+    def read_index(self, path):
+        key = hashlib.sha256((self.session + '\0' + str(path)).encode('utf8')).hexdigest()
+        return self.reads / ('index-' + key + '.json')
+
+    def save_read(self, path, version, size, ranges, key=None):
+        key = key or uuid.uuid4().hex
+        record = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': size}
+        atomic_json(self.reads / (key + '.json'), record)
+        atomic_json(self.read_index(path), {'readToken': key})
+        return {'readToken': key, 'version': version, 'size': size, 'complete': covers(ranges, 0, size)}
+
     def read(self, request):
         path = self.path(request.get('path'))
         with self.lock(path):
@@ -175,19 +198,15 @@ class FileService:
                       'nextOffset': delivered_end if delivered_end < end else None, 'truncated': delivered_end < end}
             if request.get('grantRead', True) is False:
                 return result
-            index_path = self.reads / ('index-' + hashlib.sha256((self.session + '\0' + str(path)).encode('utf8')).hexdigest() + '.json')
+            index_path = self.read_index(path)
             key, previous = None, []
             if index_path.exists():
                 candidate = read_json(index_path)['readToken']
                 old = read_json(self.reads / (candidate + '.json'))
                 if old['session'] == self.session and old['path'] == str(path) and old['version'] == version:
                     key, previous = candidate, old['ranges']
-            key = key or uuid.uuid4().hex
             ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
-            token = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': len(data)}
-            atomic_json(self.reads / (key + '.json'), token)
-            atomic_json(index_path, {'readToken': key})
-            return dict(result, readToken=key, complete=covers(ranges, 0, len(data)))
+            return dict(result, **self.save_read(path, version, len(data), ranges, key))
 
     def edit(self, request):
         path = self.path(request.get('path'), writing=True)
@@ -203,6 +222,7 @@ class FileService:
             if not isinstance(edits, list) or not edits or len(edits) > 100:
                 raise AgentError('INVALID_EDIT', 'Provide between 1 and 100 exact replacements')
             replacements = []
+            byte_edits = []
             for edit in edits:
                 if not isinstance(edit, dict):
                     raise AgentError('INVALID_EDIT', 'Each edit must be an object')
@@ -215,15 +235,33 @@ class FileService:
                 byte_start = (len(BOM) if data.startswith(BOM) else 0) + len(text[:start].encode('utf8'))
                 if not covers(token['ranges'], byte_start, byte_start + len(old.encode('utf8'))):
                     raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
-                replacements.append((start, start + len(old), preserve_newlines(new, data)))
+                normalized_new = preserve_newlines(new, data)
+                replacements.append((start, start + len(old), normalized_new))
+                byte_edits.append((byte_start, byte_start + len(old.encode('utf8')), len(normalized_new.encode('utf8'))))
             replacements.sort()
             if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
                 raise AgentError('INVALID_EDIT', 'Replacement ranges must not overlap')
             for start, end, new in reversed(replacements):
                 text = text[:start] + new + text[end:]
             updated = (BOM if data.startswith(BOM) else b'') + text.encode('utf8')
-            self.commit(path, updated, info, version)
-            return {'path': str(path), 'written': True, 'bytesWritten': len(updated), 'editsApplied': len(replacements)}
+            written_info = self.commit(path, updated, info, version)
+            result = {'path': str(path), 'written': True, 'bytesWritten': len(updated), 'editsApplied': len(replacements)}
+            try:
+                observed, observed_info, new_version = snapshot(path)
+                # Confirm our exact post-image, not arbitrary bytes seen after an
+                # external replacement. ctime may legitimately change on rename.
+                fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink', 'st_uid', 'st_gid')
+                if observed != updated or any(getattr(observed_info, field) != getattr(written_info, field) for field in fields):
+                    raise AgentError('FILE_CONFLICT', 'File changed after the edit was committed')
+                ranges = remap_read_ranges(token['ranges'], byte_edits)
+                result.update(self.save_read(path, new_version, len(updated), ranges))
+                result['rereadRequired'] = False
+            except (OSError, AgentError) as error:
+                # The write already happened. Do not report it as a failed edit
+                # or give a credential authorizing unverified external content.
+                result.update(readToken=None, rereadRequired=True, readTokenError=getattr(error, 'code', 'READ_RECORD_UNAVAILABLE'),
+                              message='Edit committed, but read-token renewal could not be confirmed. Read the current file before further editing.')
+            return result
 
     def commit(self, path, data, info=None, version=None):
         if len(data) > MAX_FILE_BYTES:
@@ -237,6 +275,7 @@ class FileService:
                     os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
                 stream.flush()
                 os.fsync(stream.fileno())
+                written_info = os.fstat(stream.fileno())
             self.path(str(path), writing=True)
             if version is not None:
                 if snapshot(path)[2] != version:
@@ -250,6 +289,7 @@ class FileService:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+        return written_info
 
     def full_read(self, request, path, version, size, field='readToken'):
         token = self.token(request.get(field), path, version)
