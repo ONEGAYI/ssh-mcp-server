@@ -302,7 +302,7 @@ def main():
     elif args.action.startswith('file_'):
         from files import FileService
         result = FileService(root, request.get('workspaceRoot'), request.get('sessionId'),
-                             request.get('allowedRemotePaths'), request.get('directoryScope')).call(args.action, request)
+                             request.get('allowedRemotePaths'), request.get('directoryScope') or 'restricted').call(args.action, request)
     else:
         raise AgentError('UNSUPPORTED_ACTION', 'Unknown helper action')
     emit({'ok': True, 'result': result})
