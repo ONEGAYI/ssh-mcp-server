@@ -65,6 +65,7 @@ it('recovery context states the binding directory scope', async () => {
     assert.equal(run.status, 0, run.stdout + '\n' + run.stderr);
     const context = JSON.parse(run.stdout).hookSpecificOutput.additionalContext;
     assert.ok(context.includes('unrestricted'), context);
+    assert.ok(context.includes('连接：vm'), 'Recovery identifies the preset connection of this binding');
   } finally {
     const child = relative(tmpdir(), root);
     assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));

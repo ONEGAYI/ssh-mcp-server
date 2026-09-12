@@ -30,7 +30,7 @@
 
 如果直接编辑 ZCode 的 `.zcode/config.json` 或用户级 `.zcode/cli/config.json`，其原生字段是 `mcp.servers`，使用 [examples/zcode-setup.json](../../examples/zcode-setup.json) 并合并现有字段。`mcpServers` 是完整配置导入格式，不是任意配置文件都使用的字段；不是单数 mcpServer。
 
-setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用中显式提供的 SSH 信息优先于预存库。
+setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用只要出现任一显式 SSH 字段（host/用户名/端口/私钥/agent），本次就整体改用显式信息，不与预存库做字段级合并。
 
 然后对 Agent 说：
 
@@ -54,7 +54,7 @@ setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，�
 
 - 再次调用 `remote_setup` 并提供 `bindingName`（小写字母/数字/连字符，1–64 字符）即可接入第二个远端目标；同服务器多目录或跨服务器均可。命名绑定使用独立 profile 文件 `.ssh-mcp-workspace.<名称>.json`，自动 workspaceId 按本机项目与绑定名联合派生，与首个无名绑定不会冲突。
 - 每个绑定各自选择连接、默认执行目录与状态目录，合并为独立的 `ssh-workspace-*` MCP 服务和恢复钩子。重复 setup 同一绑定幂等；同名改目标返回 SETUP_CONFLICT。任务登记按绑定 identity 隔离，恢复钩子只列出属于当前对话、当前绑定的任务。
-- 恢复上下文标明绑定名、MCP 服务名、远端工程根与目录边界模式，避免 Agent 混用目标。
+- 恢复上下文标明绑定名、连接名、MCP 服务名、远端工程根与目录边界模式，避免 Agent 混用目标。
 - 文件工具的目录边界默认 `restricted`：受保护读写/查找/搜索只能访问 remoteRoot 内路径。仅当用户明确表示不限制目录时，Agent 才以 `directoryScope: "unrestricted"` 记录；该选择只解除目录边界，readToken、已读区间、外部变更检查与截断保护不变，SSH 配置中显式的 `allowedRemotePaths` 继续作为交集限制生效。未填写一律视为 restricted，不隐式放开。
 - 无边界绑定仍需 remoteRoot 作为默认执行目录与相对路径基点，建议填远端 home（如 `/home/user`）；不使用 `~` 记号。
 - 显式同名 workspaceId 的两个绑定会在 MCP 服务名上冲突并被拒绝；旧无名绑定的 workspaceId 算法不变，已有任务归属不受影响。

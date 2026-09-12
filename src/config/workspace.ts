@@ -8,9 +8,11 @@ import { SshConnectionConfigMap } from "../models/types.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 
 const remotePath = z.string().min(1).refine(value => posix.isAbsolute(value) && !value.includes("\0"), "Expected an absolute POSIX path");
+/** Shared so setup accepts exactly the names profile loading will later accept. */
+export const bindingNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const profileSchema = z.object({
   workspaceId: z.string().min(1).max(128),
-  bindingName: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/).optional(),
+  bindingName: z.string().regex(bindingNamePattern).optional(),
   connectionName: z.string().min(1),
   sshConfigFile: z.string().min(1),
   remoteRoot: remotePath,

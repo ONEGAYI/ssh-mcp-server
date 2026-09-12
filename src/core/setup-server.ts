@@ -7,10 +7,10 @@ import { isAbsolute, join, posix, resolve } from "node:path";
 import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { setupWorkspaceIntegration, writeAtomic } from "../services/workspace-setup.js";
+import { bindingNamePattern } from "../config/workspace.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
-const bindingNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const inputSchema = {
   bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for the legacy single binding"),
   localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
@@ -31,9 +31,13 @@ const inputSchema = {
 const setupSchema = z.object(inputSchema);
 type SetupInput = z.infer<typeof setupSchema>;
 
+// Any explicit SSH field switches the whole call to explicit settings; the
+// preset library is never field-merged with per-call credentials.
+const hasExplicitSsh = (input: SetupInput) => Boolean(input.host || input.username || input.privateKey || input.sshAgent || input.port);
+
 export async function configureFromTool(input: SetupInput, defaultSshConfigFile?: string) {
   // Explicit per-call SSH settings override the setup service's preset library.
-  if (!input.sshConfigFile && !input.host && !input.username && !input.privateKey && !input.sshAgent && !input.port && defaultSshConfigFile) {
+  if (!input.sshConfigFile && !hasExplicitSsh(input) && defaultSshConfigFile) {
     input = { ...input, sshConfigFile: defaultSshConfigFile };
   }
   const questions: Array<{ fields: string[]; question: string }> = [];
@@ -44,8 +48,10 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     throw new RemoteAgentError("SETUP_INVALID_SCOPE", "directoryScope must be 'restricted' or 'unrestricted'; an unrestricted scope requires the user's explicit decision, never a default");
   }
   if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
-  if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
-  if (input.sshConfigFile && (input.host || input.username || input.privateKey || input.sshAgent || input.port)) {
+  if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: input.directoryScope === "unrestricted"
+    ? "无边界绑定的远端默认执行目录（建议远端 home，如 /home/user）和可写的持久状态目录分别是什么？均需绝对路径。"
+    : "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
+  if (input.sshConfigFile && hasExplicitSsh(input)) {
     throw new RemoteAgentError("SETUP_CONFLICT", "Choose either an existing SSH config or host/auth fields, not both");
   }
   if (!input.sshConfigFile) {
