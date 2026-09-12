@@ -19,7 +19,9 @@ it('unrestricted scope flows to helper calls while legacy profiles stay restrict
     const legacy = await configureFromTool({ ...common, remoteRoot: '/work' });
     assert.equal('directoryScope' in JSON.parse(await readFile(legacy.profilePath, 'utf8')), false,
       're-running legacy setups must keep producing byte-identical profiles');
+    assert.equal(legacy.directoryScope, 'restricted', 'the configured response echoes the effective scope');
     const open = await configureFromTool({ ...common, bindingName: 'open', remoteRoot: '/home/eda', directoryScope: 'unrestricted' });
+    assert.equal(open.directoryScope, 'unrestricted');
     assert.equal(JSON.parse(await readFile(open.profilePath, 'utf8')).directoryScope, 'unrestricted');
     await assert.rejects(configureFromTool({ ...common, bindingName: 'bad', remoteRoot: '/x', directoryScope: 'sometimes' }), { code: 'SETUP_INVALID_SCOPE' });
 

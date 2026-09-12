@@ -12,7 +12,7 @@ import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
 const inputSchema = {
-  bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for the legacy single binding"),
+  bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for this project's original unnamed binding"),
   localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
   remoteRoot: optionalPath.describe("Existing absolute Linux source directory"),
   remoteStateDir: optionalPath.describe("Writable persistent absolute Linux directory for helper scripts and task state"),
@@ -114,14 +114,15 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   await writeAtomic(profilePath, content, old);
   const integration = await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, true);
   return { status: "configured", localRoot, profilePath, serverName: integration.serverName, mcpServer: integration.mcpServer,
-    hooksInstalled: true, sshVerified: false, instructions: integration.note + " After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook." };
+    directoryScope: input.directoryScope === "unrestricted" ? "unrestricted" : "restricted",
+    hooksInstalled: true, sshVerified: false, instructions: integration.note + " After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook. Call remote_setup again with a new bindingName whenever the user wants another remote target in this project." };
 }
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
+    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
   });
-  server.registerTool("remote_setup", { description: "First-time setup for a ZCode SSH workspace. With missing fields, returns questions for you to ask the user. With complete fields, creates a local workspace profile, merges project MCP and recovery hooks, and prepares background CLI guidance. No manual setup command needed; no SSH connection during setup.",
+  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project. With missing fields, returns questions for you to ask the user. With complete fields, creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. No manual setup command needed; no SSH connection during setup.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => {
     try { return { content: [{ type: "text" as const, text: JSON.stringify(await configureFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {
