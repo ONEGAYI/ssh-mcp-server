@@ -14,6 +14,7 @@ export class FileService {
   call(action: string, sessionId: string, request: Record<string, unknown> = {}) {
     if (!sessionId || sessionId.length > 256 || sessionId.includes("\0")) throw new RemoteAgentError("INVALID_SESSION", "Use the actual session identifier supplied by the recovery hook");
     return this.remote.call(action, { ...request, workspaceRoot: this.config.remoteRoot, sessionId,
+      directoryScope: this.config.directoryScope,
       allowedRemotePaths: this.config.sshConfigs[this.config.connectionName].allowedRemotePaths ?? [] });
   }
 

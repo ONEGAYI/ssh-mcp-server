@@ -15,6 +15,9 @@ const profileSchema = z.object({
   sshConfigFile: z.string().min(1),
   remoteRoot: remotePath,
   remoteStateDir: remotePath.refine(value => posix.normalize(value) !== "/", "State must not be stored at filesystem root"),
+  // Absent means restricted; setup only writes the field for an explicit unrestricted choice.
+  // The scope deliberately stays out of identity so flipping it never rekeys task ownership.
+  directoryScope: z.enum(["restricted", "unrestricted"]).optional(),
   localStateDir: z.string().min(1).optional(),
   localRoot: z.string().min(1).optional(),
   pythonPath: remotePath.default("/usr/bin/python3"),
@@ -35,6 +38,7 @@ export interface WorkspaceConfig {
   sshConfigs: SshConnectionConfigMap;
   remoteRoot: string;
   remoteStateDir: string;
+  directoryScope: "restricted" | "unrestricted";
   localStateDir: string;
   localRoot: string;
   pythonPath: string;
@@ -54,6 +58,7 @@ export async function loadWorkspaceConfig(profilePath: string): Promise<Workspac
   })).digest("hex");
   return { ...profile, identity, profilePath: absolute, sshConfigFile, sshConfigs: configs,
     remoteRoot: root, remoteStateDir: posix.join(profile.remoteStateDir, "workspaces", identity.slice(0, 24)),
+    directoryScope: profile.directoryScope ?? "restricted",
     localStateDir: profile.localStateDir ? resolve(dirname(absolute), profile.localStateDir) : join(homedir(), ".ssh-mcp-agent"),
     localRoot: profile.localRoot ? resolve(dirname(absolute), profile.localRoot) : dirname(absolute),
   };

@@ -30,6 +30,69 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
+    def scoped_call(self, action, request, scope, allowed=None, session='session-one'):
+        data = dict(request, workspaceRoot=str(self.work), sessionId=session)
+        if scope is not None:
+            data['directoryScope'] = scope
+        if allowed is not None:
+            data['allowedRemotePaths'] = allowed
+        run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.root / 'state'), action],
+                             input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
+
+    def test_directory_scope_keeps_restrictions_by_default_and_only_opens_with_explicit_unrestricted(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'note.txt').write_text('outside-content\n')
+
+        blocked = self.call('file_read', {'path': str(outside / 'note.txt')})
+        self.assertFalse(blocked['ok'])
+        self.assertEqual(blocked['error']['code'], 'PATH_NOT_ALLOWED')
+        still_blocked = self.scoped_call('file_read', {'path': str(outside / 'note.txt')}, 'restricted')
+        self.assertEqual(still_blocked['error']['code'], 'PATH_NOT_ALLOWED')
+
+        opened = self.scoped_call('file_read', {'path': str(outside / 'note.txt')}, 'unrestricted')
+        self.assertTrue(opened['ok'], opened)
+        self.assertEqual(opened['result']['text'], 'outside-content\n')
+        self.assertTrue(opened['result']['complete'])
+
+        guarded = self.scoped_call('file_read', {'path': str(outside / 'note.txt')}, 'unrestricted',
+                                   allowed=[str(self.work)])
+        self.assertFalse(guarded['ok'])
+        self.assertEqual(guarded['error']['code'], 'PATH_NOT_ALLOWED')
+
+        invalid = self.scoped_call('file_read', {'path': 'any.txt'}, 'sometimes')
+        self.assertFalse(invalid['ok'])
+        self.assertEqual(invalid['error']['code'], 'INVALID_REQUEST')
+
+        self.assertEqual(self.call('file_workspace', {})['result']['directoryScope'], 'restricted')
+        self.assertEqual(self.scoped_call('file_workspace', {}, 'unrestricted')['result']['directoryScope'], 'unrestricted')
+
+    def test_discovery_outside_workspace_reports_absolute_paths_only_when_unrestricted(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'needle.txt').write_text('find-this-needle\n')
+        (self.work / 'inside.txt').write_text('find-this-needle\n')
+
+        blocked = self.call('file_find', {'path': str(outside), 'pattern': '*.txt'})
+        self.assertFalse(blocked['ok'])
+        self.assertEqual(blocked['error']['code'], 'PATH_NOT_ALLOWED')
+
+        found = self.scoped_call('file_find', {'path': str(outside), 'pattern': '*.txt'}, 'unrestricted')
+        self.assertTrue(found['ok'], found)
+        self.assertEqual(found['result']['entries'][0]['path'], str(outside / 'needle.txt'))
+
+        search = self.scoped_call('file_search', {'path': str(outside), 'pattern': 'needle'}, 'unrestricted')
+        self.assertTrue(search['ok'], search)
+        self.assertEqual(search['result']['matches'][0]['path'], str(outside / 'needle.txt'))
+        self.assertEqual(search['result']['matches'][0]['line'], 1)
+
+        listed = self.call('file_list', {'path': '.'})
+        self.assertTrue(listed['ok'])
+        self.assertEqual([entry['path'] for entry in listed['result']['entries']], ['inside.txt'])
+
     def test_read_then_edit_preserves_encoding_permissions_and_invalidates_old_version(self):
         path = self.work / 'source.txt'
         path.write_bytes(b'\xef\xbb\xbfalpha\r\nbeta\r\n')

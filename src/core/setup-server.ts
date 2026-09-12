@@ -24,6 +24,7 @@ const inputSchema = {
   privateKey: optionalPath.describe("Absolute local path to an existing private key; never the key content. Encrypted keys should use an SSH agent or existing config"),
   sshAgent: z.string().min(1).optional().describe("SSH agent socket/named pipe, or pageant on Windows"),
   workspaceId: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/).optional(),
+  directoryScope: z.enum(["restricted", "unrestricted"]).optional().describe("File-tool directory boundary. Ask the user first: default restricted keeps guarded file operations inside remoteRoot; unrestricted only when the user explicitly declines any directory limit. Unrestricted keeps read tokens, edit-range, and external-change checks; allowedRemotePaths in the SSH config still applies. remoteRoot remains the default execution directory either way (the remote home is a common unrestricted choice)"),
   pythonPath: optionalPath.describe("Absolute Linux Python >=3.6 executable, default /usr/bin/python3"),
   localStateDir: optionalPath.describe("Optional absolute local task-state directory; default is user-private state directory"),
 };
@@ -38,6 +39,9 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   const questions: Array<{ fields: string[]; question: string }> = [];
   if (input.bindingName !== undefined && !bindingNamePattern.test(input.bindingName)) {
     throw new RemoteAgentError("SETUP_INVALID_BINDING", "bindingName must be 1-64 lowercase letters, digits, or hyphens and start with a letter or digit; this keeps binding files unambiguous on case-insensitive systems");
+  }
+  if (input.directoryScope !== undefined && input.directoryScope !== "restricted" && input.directoryScope !== "unrestricted") {
+    throw new RemoteAgentError("SETUP_INVALID_SCOPE", "directoryScope must be 'restricted' or 'unrestricted'; an unrestricted scope requires the user's explicit decision, never a default");
   }
   if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
   if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
@@ -83,6 +87,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   connectionName = connectionName ?? "remote";
   const profile = { workspaceId, ...(binding ? { bindingName: binding } : {}), connectionName, sshConfigFile, localRoot,
     remoteRoot: input.remoteRoot, remoteStateDir: input.remoteStateDir, pythonPath: input.pythonPath ?? "/usr/bin/python3",
+    ...(input.directoryScope === "unrestricted" ? { directoryScope: "unrestricted" as const } : {}),
     ...(input.localStateDir ? { localStateDir: input.localStateDir } : {}) };
   const content = JSON.stringify(profile, null, 2) + "\n";
   // Dry-run integration first: a rejected binding must not leave a profile file behind.
