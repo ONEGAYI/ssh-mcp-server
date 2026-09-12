@@ -61,6 +61,8 @@ setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，�
 - 无边界绑定仍需 remoteRoot 作为默认执行目录与相对路径基点，建议填远端 home（如 `/home/user`）；不使用 `~` 记号。
 - 显式同名 workspaceId 的两个绑定会在 MCP 服务名上冲突并被拒绝；旧无名绑定的 workspaceId 算法不变，已有任务归属不受影响。
 
+已知边界：无边界绑定的搜索从 `/` 等挂载点根开始时，`/proc`、`/sys` 下的伪文件（如 environ、cmdline）同样会被扫描命中——这与文件工具可直读任意路径的 unrestricted 语义一致；如不希望搜索噪声，把搜索路径收窄到具体目录。手工运行 `build/cli/recovery.js` 不带 `--workspace` 时只向上寻找旧无名 profile，命名绑定依赖 setup 登记的显式钩子参数。新版生成的 profile 含 `bindingName`/`directoryScope` 字段，旧版本程序回退后不识别（解析报错）；回退需删除对应 profile 并重新 setup。
+
 ### 手工入口（保留兼容）
 
 在本机为一个远端项目建立专用目录，例如 `D:\RemoteWork\example`。该目录保存接入配置和本机输出，Linux 源码不会自动同步到这里。

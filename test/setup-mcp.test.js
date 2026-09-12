@@ -67,6 +67,8 @@ it('rejects unsafe binding names and explicit workspaceId collisions between bin
     }
     await configureFromTool({ ...common, bindingName: 'eda-main', remoteRoot: '/main', workspaceId: 'shared-id' });
     await assert.rejects(configureFromTool({ ...common, bindingName: 'eda-tests', remoteRoot: '/tests', workspaceId: 'shared-id' }), { code: 'SETUP_CONFLICT' });
+    await assert.rejects(readFile(join(root, '.ssh-mcp-workspace.eda-tests.json')), { code: 'ENOENT' },
+      'a rejected binding must not leave a profile file behind');
     const distinct = await configureFromTool({ ...common, bindingName: 'eda-tests', remoteRoot: '/tests' });
     assert.notEqual(distinct.serverName, 'ssh-workspace-shared-id');
     assert.match(distinct.profilePath, /\.ssh-mcp-workspace\.eda-tests\.json$/);
@@ -124,6 +126,17 @@ it('setup MCP accepts bindingName and directoryScope through the protocol surfac
   } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+it('setup rejects an empty connection library instead of asking an unanswerable question', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-empty-library-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({}));
+    await assert.rejects(configureFromTool({ localRoot: root, sshConfigFile: auth, remoteRoot: '/work', remoteStateDir: '/state' }),
+      (error) => error.code === 'SETUP_INVALID_SSH_CONFIG' && /contains no connections/.test(error.message),
+      'the error names the empty library itself, not missing host parameters');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it('setup MCP asks for missing inputs and prepares project integration without manual setup commands', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-setup-api-'));
   const client = new Client({ name: 'setup-contract', version: '1' });
@@ -140,6 +153,7 @@ it('setup MCP asks for missing inputs and prepares project integration without m
     assert.equal(missing.status, 'needs_input');
     assert.ok(missing.questions.some(item => item.fields.includes('remoteRoot')));
     assert.ok(missing.questions.some(item => item.fields.includes('sshConfigFile')));
+    assert.match(missing.instructions, /local SSH configs/, 'missing-input guidance must steer agents to ask the user instead of probing');
     await mkdir(join(root, '.zcode'));
     await writeFile(join(root, '.zcode', 'config.json'), JSON.stringify({ mcp: { servers: { existing: { command: 'keep-me' } } }, hooks: { events: { Stop: [] } } }));
     await writeFile(join(root, 'AGENTS.md'), 'existing project rules');

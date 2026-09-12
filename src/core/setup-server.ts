@@ -63,15 +63,25 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   if (input.sshConfigFile) {
     if (!isAbsolute(input.sshConfigFile)) throw new RemoteAgentError("SETUP_INVALID_PATH", "sshConfigFile must be an absolute local path");
     let names: string[];
-    try { names = Object.keys(CommandLineParser.parseArgs(["--config-file", input.sshConfigFile]).configs); }
-    catch { throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not load the SSH config; check the file path and config format without sharing its credentials"); }
+    try {
+      // An empty library fails deep inside the parser with a misleading "missing parameters" message; name the real cause.
+      const parsed = JSON.parse(await readFile(input.sshConfigFile, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length === 0) {
+        throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "The SSH config file contains no connections; fix the file or provide host/username fields instead of a config path");
+      }
+      names = Object.keys(CommandLineParser.parseArgs(["--config-file", input.sshConfigFile]).configs);
+    }
+    catch (error) {
+      if (error instanceof RemoteAgentError) throw error;
+      throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not load the SSH config; check the file path and config format without sharing its credentials");
+    }
     if (!connectionName && names.length === 1) connectionName = names[0];
     connections = names;
     if (!connectionName) questions.push({ fields: ["connectionName"], question: `选择连接名：${names.slice(0, 20).join("、")}` });
     else if (!names.includes(connectionName)) throw new RemoteAgentError("SETUP_INVALID_CONNECTION", "The selected connection does not exist in the SSH config");
   }
   if (questions.length) return { status: "needs_input", questions, connections,
-    instructions: "Ask the user for these missing values, reuse already confirmed information, then call remote_setup again with the complete fields. Never ask for passwords or private-key contents in chat. Nothing was written and no SSH connection was made." };
+    instructions: "Ask the user for these missing values, reuse already confirmed information, then call remote_setup again with the complete fields. Remote directories and connection choices come only from the user — not from local SSH configs, not from guessing, and no address probing: setup never connects, so a probe proves nothing. Never ask for passwords or private-key contents in chat. Nothing was written and no SSH connection was made." };
   if (!isAbsolute(input.localRoot!) || (input.localStateDir && !isAbsolute(input.localStateDir))) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
   for (const value of [input.remoteRoot!, input.remoteStateDir!, input.pythonPath ?? "/usr/bin/python3"]) {
     if (!posix.isAbsolute(value) || value.includes("\0")) throw new RemoteAgentError("SETUP_INVALID_PATH", "Linux paths must be absolute POSIX paths without NUL");

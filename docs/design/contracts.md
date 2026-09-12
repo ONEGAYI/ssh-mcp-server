@@ -14,7 +14,7 @@
 
 - 一个本机项目可承载多个命名绑定。每个绑定独立 profile（无名绑定保持 `.ssh-mcp-workspace.json`，命名绑定 `.ssh-mcp-workspace.<bindingName>.json`）、独立 workspaceId、独立 MCP 服务与恢复钩子；绑定名限小写字母/数字/连字符。
 - 自动 workspaceId 由本机项目路径与绑定名联合派生；旧无名绑定算法不变，任何变更不得改变既有任务的 identity 归属。显式 workspaceId 冲突（同名 MCP 服务指向不同 profile）必须拒绝。
-- setup 集成冲突检测先于 profile 落盘：被拒绝的绑定不得在项目里残留半配置 profile 文件。
+- setup 集成冲突检测先于 profile 落盘：被拒绝的绑定不得在项目里残留半配置 profile 文件。已知边界：检测通过到集成写入之间存在毫秒级窗口，并发改写项目配置可能留下"已写 profile、未集成"状态；重跑同一 setup 幂等收敛。
 - 恢复钩子输出必须标明绑定名、连接名、对应 MCP serverName、远端工程根与目录边界模式；只列出属于当前真实会话且属于本绑定的任务。
 - 文件工具目录边界默认 `restricted`（remoteRoot 内）。仅用户显式选择后记为 `unrestricted`：只解除目录边界，readToken、已读区间、外部变更检查、截断保护与 16 MiB 上限不变；SSH 配置显式 `allowedRemotePaths` 继续作为交集限制。缺省与未确认一律 restricted，不得隐式扩大访问。
 - `directoryScope` 不参与 identity 计算；切换模式不得使旧任务或已签发凭据的归属键失效。unrestricted 绑定仍需存在的 remoteRoot 作为默认执行目录，不引入 `~` 记号。
