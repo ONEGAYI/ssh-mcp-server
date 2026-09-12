@@ -4,7 +4,23 @@
 
 首版核心链路已实现：持久命令、ZCode 原生后台回传、继续原对话时恢复跟进、受保护文件工具、项目接入生成和离线目录打包。用户于 2026-09-11 报告：本机 ZCode 与 VMware CentOS 7 的人工验收全部通过，无遗留问题。最终内网离线环境尚未现场验收。
 
-工作分支：`feat/remote-agent-workspace`。功能及后续文档提交已推送至 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server)，以 [PR #1](https://github.com/ONEGAYI/ssh-mcp-server/pull/1) 留痕；人工验收已通过，尚未授权合并。`origin` 指向 fork，`upstream` 保留 classfang 原仓库。
+工作分支：`feat/remote-agent-workspace` 已通过 [PR #1](https://github.com/ONEGAYI/ssh-mcp-server/pull/1) 合并进 main。2026-09-12 起的三项扩展（预存 SSH 连接、多命名绑定、可选目录边界）在 `feat/named-bindings` 分支开发，以新 PR 留痕。`origin` 指向 fork，`upstream` 保留 classfang 原仓库。
+
+## 2026-09-12 扩展：预存连接、多绑定、目录边界
+
+用户批准的三项能力，均已实现并自动验证：
+
+1. **预存 SSH 连接库**：setup 服务支持 `--setup --config-file <path>` 启动参数。缺项响应返回可用连接名列表（不回传凭据）；单次调用的显式 SSH 信息优先于预存库。MCP 协议级测试验证了发现、不泄露密码、仅凭连接名完成配置。
+2. **多命名绑定**：`remote_setup` 接受 `bindingName`（小写字母/数字/连字符）。命名绑定使用独立 profile `.ssh-mcp-workspace.<名称>.json` 与连接文件 `.ssh-mcp-connection.<名称>.json`；自动 workspaceId 由本机项目与绑定名联合派生，旧无名绑定算法与任务归属不变。集成冲突检测前置到 profile 落盘之前（干跑），被拒绝的绑定不再残留半配置文件。契约测试覆盖：旧无名 + 3 个命名绑定（同服务器多目录 + 跨服务器）共存、profile/serverName 唯一、重复 setup 幂等、同名改目标拒绝、任务存储按 identity 隔离、4 个恢复钩子各自只列本绑定本会话任务、共享 AGENTS 规则不写死首个目录、非法绑定名与显式 workspaceId 撞名拒绝。
+3. **可选目录边界**：profile 新增可选 `directoryScope`（缺省 restricted，仅用户显式选择才写入 unrestricted；字段不参与 identity）。unrestricted 只解除 remoteRoot 目录边界，readToken、已读区间、外部变更检查、截断保护与 16 MiB 上限全部保留；SSH 配置显式 `allowedRemotePaths` 继续作为交集限制。恢复上下文与 `file_workspace` 报告当前模式；doctor 改走与 MCP 相同的参数注入；discovery 对工作区外路径回退绝对路径显示。
+
+验证证据：
+
+- Windows 全套 Node 套件 187 项：184 通过、3 按环境跳过、0 失败（含 `test/directory-scope.test.js` 与协议级 bindingName/directoryScope 透传测试）。
+- CentOS 7.9 / Python 3.6.8 真实 VM（2026-09-12 晚复测）：`remote-files.test.py` 14/14 通过（含缺省受限拒绝外部路径、unrestricted 可读、显式 allowlist 交集、非法 scope 拒绝、discovery 外部绝对路径显示），`remote-agent.test.py` 7/7 通过。
+- VM 首跑暴露并已修复一个兼容缺陷：helper 请求缺 `directoryScope` 字段时被误拒，现归一为 restricted（提交 `fix: helper 缺省 directoryScope 归一为 restricted`）。
+
+本轮三项扩展尚未由用户人工验收；最终内网离线现场验收状态不变。
 
 ## 人工验收结果（2026-09-11 用户报告）
 

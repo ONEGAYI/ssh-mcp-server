@@ -48,6 +48,21 @@ Linux 不需要安装 ZCode、Node.js 或手工部署本项目。首次远端操
 
 也可直接复制 [examples/mcp-setup.json](examples/mcp-setup.json)。
 
+如果希望在 setup 对话中**复用已有 SSH 配置文件**（推荐），在启动参数中追加 `--config-file` 指向原版 SSH MCP 的 JSON 配置：
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-setup": {
+      "command": "D:/Tools/ssh-mcp/runtime/node.exe",
+      "args": ["D:/Tools/ssh-mcp/build/index.js", "--setup", "--config-file", "D:/Private/ssh-config.json"]
+    }
+  }
+}
+```
+
+配置一次后，Agent 在 setup 时只向你询问连接名（工具会列出可用的名字），不再需要每次提供地址、用户名或认证方式；文件中的凭据仍只留在本机文件里。两种配置结构的预存连接模板见 [examples/mcp-setup-config.json](examples/mcp-setup-config.json) 与 [examples/zcode-setup-config.json](examples/zcode-setup-config.json)。
+
 **如果直接编辑 ZCode 原生配置文件**（项目 `.zcode/config.json` 或用户 `.zcode/cli/config.json`），使用 `mcp.servers` 结构，而不是上面的导入结构：
 
 ```json
@@ -76,11 +91,12 @@ Agent 会先调用工具获取缺项，再向你询问：
 | 信息 | 示例或说明 |
 |---|---|
 | 本机工作区 | `D:/RemoteWork/my-project`，需已存在 |
-| SSH 连接 | 地址、端口（默认 22）、用户名 |
+| SSH 连接 | 地址、端口（默认 22）、用户名；setup 配置了 `--config-file` 时只需从列出的名字中选连接名 |
 | 认证 | 本机私钥文件路径或 SSH agent；也可引用已有原版 SSH MCP JSON 配置 |
-| Linux 工程目录 | `/home/user/project`，需已存在 |
+| Linux 工程目录 | `/home/user/project`，需已存在；同时是文件工具的默认目录边界与命令默认执行目录 |
 | Linux 持久状态目录 | `/home/user/.local/state/ssh-mcp-agent`，需有写入权限 |
 | Python 路径 | 默认 `/usr/bin/python3`，可指定其他 Python 3.6+ |
+| 绑定名（可选） | 同一项目接入第二个远端目标时提供，如 `eda-tests` |
 
 使用密码或加密私钥口令时，在 Windows 本机的 SSH JSON 配置中填写，再告诉 Agent 配置文件路径和连接名。**不要把密码、口令或私钥内容发进对话。** 密码认证的最小配置示例：
 
@@ -99,10 +115,10 @@ Agent 会先调用工具获取缺项，再向你询问：
 
 信息齐全后，Agent 再次调用 `remote_setup`，工具会自动：
 
-- 生成本机工作区的 `.ssh-mcp-workspace.json`。
-- 合并项目 MCP 和恢复钩子到 `.zcode/config.json`，保留已有服务与规则。
+- 生成本机工作区的 `.ssh-mcp-workspace.json`；提供 `bindingName` 时生成独立的 `.ssh-mcp-workspace.<名称>.json`。
+- 合并项目 MCP 和恢复钩子到 `.zcode/config.json`，保留已有服务与规则；每个绑定一个 `ssh-workspace-*` MCP 服务和一个恢复钩子。
 - 准备已随包附带的后台命令入口及 Agent 操作指引。
-- 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`；只记录连接参数，不复制私钥。
+- 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`（命名绑定为 `.ssh-mcp-connection.<名称>.json`）；只记录连接参数，不复制私钥。
 
 不需要手工运行 setup 脚本。成功返回中的 `sshVerified=false` 表示**配置已准备好，但还没有验证远端连接**。
 
@@ -110,7 +126,19 @@ Agent 会先调用工具获取缺项，再向你询问：
 
 setup 服务负责首次接入；日常文件和任务操作使用它生成的项目 MCP。
 
-## 5. 日常怎么用
+## 5. 添加更多绑定与解除目录边界
+
+同一个本机项目可以同时连接多个远端目标：
+
+- 同一台服务器的不同目录（如主代码库和测试目录），或不同服务器各一个目录。
+- 再次调用 `remote_setup` 时提供 `bindingName`（小写字母、数字、连字符，如 `eda-tests`），并为该绑定单独选择连接、远端目录和状态目录。
+- 每个绑定有独立的 MCP 服务名和恢复钩子；恢复信息只会列出属于当前对话、当前绑定的任务，不会串任务。
+
+不提供 `bindingName` 的首次绑定保持原有文件名和行为，已有任务不受影响。
+
+**目录边界**默认开启：文件工具只能访问远端工程目录内的路径。如果明确希望让文件工具访问远端任意绝对路径（例如要同时改工程目录之外的配置文件），在 setup 时向 Agent 明确说明"不限制目录"，Agent 会以 `directoryScope: "unrestricted"` 记录该选择；无边界绑定的默认执行目录通常建议填远端 home（如 `/home/user`）。解除边界**不会**取消读取凭据、已读区间、外部变更检查等保护；SSH 配置中显式写明的 `allowedRemotePaths` 仍会继续生效。未说明时一律按默认受限处理，不会隐式放开。
+
+## 6. 日常怎么用
 
 ### 文件读取与连续编辑
 
@@ -144,7 +172,7 @@ Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `ru
 
 取消需调用 `remote_cancel` 或 job CLI 的 cancel。关闭本机等待程序、SSH 断开和等待超时都不等于取消远端任务。
 
-## 6. 常见问题
+## 7. 常见问题
 
 | 现象 | 处理方式 |
 |---|---|
@@ -156,7 +184,7 @@ Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `ru
 | 返回 unknown | 无法确认远端执行状态；检查状态与日志，不自动重跑可能有副作用的命令 |
 | Python 不可用 | 核对远端 pythonPath；本项目要求 Python 3.6+，不会自动安装 Python |
 
-## 7. 升级
+## 8. 升级
 
 1. 关闭相关 MCP 进程；通常可先关闭 ZCode。
 2. 将新包中的程序文件更新到**原安装目录**。
@@ -167,12 +195,13 @@ Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `ru
 
 远端辅助程序会按内容摘要部署新版本；升级 Windows 包不要求手工覆盖 Linux 脚本。
 
-## 8. 当前范围
+## 9. 当前范围
 
 - 首版是非交互式 Shell：不提供 stdin 交互或 PTY。
 - 专用文件操作上限 16 MiB；文件读取有独立的输出截断保护。
 - 内置搜索是 Python 字面量匹配，不模拟 rg 的正则与 .gitignore；远端 rg 需要目标机自行具备。
-- 普通 Shell 仍可产生文件副作用；专用工具的写保护不是全系统写入沙箱。
+- 普通 Shell 一直不做工作区目录沙箱；文件工具的目录边界默认开启，只有用户显式选择才解除，解除后其余文件保护仍然生效。
+- 多绑定共享同一对话上下文，但任务登记与恢复按绑定隔离。
 - 已有本机 ZCode + CentOS 7 VM 的人工验收，以及新 setup、连续编辑的自动验证；最终内网离线现场尚未验收。
 
 进一步说明：[详细使用指南](docs/design/usage.md) · [接口契约](docs/design/contracts.md) · [验证进度](docs/design/progress.md)。

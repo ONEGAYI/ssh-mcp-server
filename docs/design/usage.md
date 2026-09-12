@@ -1,6 +1,6 @@
 # SSH 远端工作区使用与验收
 
-预览版，为 Windows 上的 ZCode 提供 SSH 远端文件工具和持久命令任务。源码与文档位于独立项目内，维护于 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 的 `feat/remote-agent-workspace` 分支；尚未发布到 npm 或合并至主分支。
+预览版，为 Windows 上的 ZCode 提供 SSH 远端文件工具和持久命令任务。源码与文档位于独立项目内，维护于 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server)；首个工作区 PR 已合并，多绑定/目录边界/预存连接扩展在 `feat/named-bindings` 分支，尚未发布到 npm。
 
 ## 运行条件
 
@@ -30,6 +30,8 @@
 
 如果直接编辑 ZCode 的 `.zcode/config.json` 或用户级 `.zcode/cli/config.json`，其原生字段是 `mcp.servers`，使用 [examples/zcode-setup.json](../../examples/zcode-setup.json) 并合并现有字段。`mcpServers` 是完整配置导入格式，不是任意配置文件都使用的字段；不是单数 mcpServer。
 
+setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用中显式提供的 SSH 信息优先于预存库。
+
 然后对 Agent 说：
 
 > 请调用 remote_setup 帮我配置这个项目的 SSH 远端开发。先询问缺少的连接和目录信息，再生成接入配置。
@@ -47,6 +49,15 @@
 工具成功只表示本机配置准备完成，返回 `sshVerified=false`。重新打开指定项目（如果新工具尚未加载），完成 ZCode 的首次项目钩子信任，再让 Agent 调用生成的 `remote_workspace` 检查实际 SSH 与 Python。setup 服务本身负责接入，日常操作由它生成的项目 MCP 提供；setup 不修改用户全局配置，也不代替 ZCode 授予钩子信任。
 
 重复传入相同信息不会重复追加钩子。已有不同工作区 profile、同名不相关 MCP 或重定向的 .zcode 目录会返回冲突，避免静默改动项目指向；根据错误检查配置后再继续。
+
+### 多个绑定与目录边界
+
+- 再次调用 `remote_setup` 并提供 `bindingName`（小写字母/数字/连字符，1–64 字符）即可接入第二个远端目标；同服务器多目录或跨服务器均可。命名绑定使用独立 profile 文件 `.ssh-mcp-workspace.<名称>.json`，自动 workspaceId 按本机项目与绑定名联合派生，与首个无名绑定不会冲突。
+- 每个绑定各自选择连接、默认执行目录与状态目录，合并为独立的 `ssh-workspace-*` MCP 服务和恢复钩子。重复 setup 同一绑定幂等；同名改目标返回 SETUP_CONFLICT。任务登记按绑定 identity 隔离，恢复钩子只列出属于当前对话、当前绑定的任务。
+- 恢复上下文标明绑定名、MCP 服务名、远端工程根与目录边界模式，避免 Agent 混用目标。
+- 文件工具的目录边界默认 `restricted`：受保护读写/查找/搜索只能访问 remoteRoot 内路径。仅当用户明确表示不限制目录时，Agent 才以 `directoryScope: "unrestricted"` 记录；该选择只解除目录边界，readToken、已读区间、外部变更检查与截断保护不变，SSH 配置中显式的 `allowedRemotePaths` 继续作为交集限制生效。未填写一律视为 restricted，不隐式放开。
+- 无边界绑定仍需 remoteRoot 作为默认执行目录与相对路径基点，建议填远端 home（如 `/home/user`）；不使用 `~` 记号。
+- 显式同名 workspaceId 的两个绑定会在 MCP 服务名上冲突并被拒绝；旧无名绑定的 workspaceId 算法不变，已有任务归属不受影响。
 
 ### 手工入口（保留兼容）
 
@@ -66,7 +77,7 @@
 }
 ```
 
-`sshConfigFile` 指向已有原版 SSH MCP 的 JSON，不复制密码或私钥。`remoteRoot` 必须已存在；状态目录可以自动在用户权限下创建。相对本机路径以配置文件所在目录解释。默认 `localRoot` 是配置文件目录，也可显式指定。
+`sshConfigFile` 指向已有原版 SSH MCP 的 JSON，不复制密码或私钥。`remoteRoot` 必须已存在；状态目录可以自动在用户权限下创建。相对本机路径以配置文件所在目录解释。默认 `localRoot` 是配置文件目录，也可显式指定。多绑定时可加 `bindingName`；需要解除文件目录边界时显式加 `"directoryScope": "unrestricted"`，缺省为 restricted。
 
 在源码目录运行（离线包则把 `node` 换成包内 `runtime/node.exe`）：
 
@@ -147,6 +158,7 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 
 | 项目 | 首版行为 |
 |---|---|
+| 目录边界 | 默认限制在 remoteRoot 内；仅用户显式选择 unrestricted 后文件工具可按绝对路径访问远端任意位置，其余文件保护不变 |
 | 文件大小 | 专用读写、上传、下载单文件最多 16 MiB；更大文件明确报错 |
 | 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖、删除、移动需要完整已知范围 |
 | 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期 |

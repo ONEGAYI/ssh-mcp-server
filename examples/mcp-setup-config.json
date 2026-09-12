@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ssh-mcp-setup": {
+      "command": "D:/Tools/ssh-mcp/runtime/node.exe",
+      "args": ["D:/Tools/ssh-mcp/build/index.js", "--setup", "--config-file", "D:/Private/ssh-config.json"]
+    }
+  }
+}
