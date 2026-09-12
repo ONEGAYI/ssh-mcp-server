@@ -28,7 +28,11 @@ const inputSchema = {
 const setupSchema = z.object(inputSchema);
 type SetupInput = z.infer<typeof setupSchema>;
 
-export async function configureFromTool(input: SetupInput) {
+export async function configureFromTool(input: SetupInput, defaultSshConfigFile?: string) {
+  // Explicit per-call SSH settings override the setup service's preset library.
+  if (!input.sshConfigFile && !input.host && !input.username && !input.privateKey && !input.sshAgent && !input.port && defaultSshConfigFile) {
+    input = { ...input, sshConfigFile: defaultSshConfigFile };
+  }
   const questions: Array<{ fields: string[]; question: string }> = [];
   if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
   if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
@@ -40,16 +44,18 @@ export async function configureFromTool(input: SetupInput) {
     if (!input.privateKey && !input.sshAgent) questions.push({ fields: ["privateKey", "sshAgent", "sshConfigFile"], question: "使用哪个本机私钥文件或 SSH agent？若用密码/密钥口令，请在本机已有 SSH 配置中填写，再提供该配置路径；不要把密码、口令或私钥内容发到对话。" });
   }
   let connectionName = input.connectionName;
+  let connections: string[] = [];
   if (input.sshConfigFile) {
     if (!isAbsolute(input.sshConfigFile)) throw new RemoteAgentError("SETUP_INVALID_PATH", "sshConfigFile must be an absolute local path");
     let names: string[];
     try { names = Object.keys(CommandLineParser.parseArgs(["--config-file", input.sshConfigFile]).configs); }
     catch { throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not load the SSH config; check the file path and config format without sharing its credentials"); }
     if (!connectionName && names.length === 1) connectionName = names[0];
+    connections = names;
     if (!connectionName) questions.push({ fields: ["connectionName"], question: `选择连接名：${names.slice(0, 20).join("、")}` });
     else if (!names.includes(connectionName)) throw new RemoteAgentError("SETUP_INVALID_CONNECTION", "The selected connection does not exist in the SSH config");
   }
-  if (questions.length) return { status: "needs_input", questions,
+  if (questions.length) return { status: "needs_input", questions, connections,
     instructions: "Ask the user for these missing values, reuse already confirmed information, then call remote_setup again with the complete fields. Never ask for passwords or private-key contents in chat. Nothing was written and no SSH connection was made." };
   if (!isAbsolute(input.localRoot!) || (input.localStateDir && !isAbsolute(input.localStateDir))) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
   for (const value of [input.remoteRoot!, input.remoteStateDir!, input.pythonPath ?? "/usr/bin/python3"]) {
@@ -88,13 +94,13 @@ export async function configureFromTool(input: SetupInput) {
     hooksInstalled: true, sshVerified: false, instructions: integration.note + " After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook." };
 }
 
-export async function runSetupServer(): Promise<void> {
+export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
     instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
   });
   server.registerTool("remote_setup", { description: "First-time setup for a ZCode SSH workspace. With missing fields, returns questions for you to ask the user. With complete fields, creates a local workspace profile, merges project MCP and recovery hooks, and prepares background CLI guidance. No manual setup command needed; no SSH connection during setup.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => {
-    try { return { content: [{ type: "text" as const, text: JSON.stringify(await configureFromTool(input)) }] }; }
+    try { return { content: [{ type: "text" as const, text: JSON.stringify(await configureFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {
       const known = error instanceof RemoteAgentError;
       return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ code: known ? error.code : "SETUP_FAILED",

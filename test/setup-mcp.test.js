@@ -8,6 +8,30 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawnSync } from 'node:child_process';
 
+it('setup reuses a startup SSH config and reveals connection names without credentials', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-presets-'));
+  const client = new Client({ name: 'preset-contract', version: '1' });
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'never-show-secret' },
+      build: { host: '127.0.0.2', port: 22, username: 'test', password: 'never-show-secret' } }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+    const missing = await client.callTool({ name: 'remote_setup', arguments: {} });
+    assert.equal(missing.isError, undefined, JSON.stringify(missing));
+    assert.doesNotMatch(JSON.stringify(missing), /never-show-secret/);
+    const discovery = JSON.parse(missing.content[0].text);
+    assert.deepEqual(discovery.connections, ['eda', 'build']);
+    assert.ok(!discovery.questions.some(q => q.fields.includes('privateKey')));
+    const result = await client.callTool({ name: 'remote_setup', arguments: {
+      localRoot: root, connectionName: 'build', remoteRoot: '/project', remoteStateDir: '/state' } });
+    assert.equal(result.isError, undefined, JSON.stringify(result));
+    const profile = JSON.parse(await readFile(JSON.parse(result.content[0].text).profilePath, 'utf8'));
+    assert.equal(profile.sshConfigFile, auth);
+    assert.equal(profile.connectionName, 'build');
+  } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 it('setup MCP asks for missing inputs and prepares project integration without manual setup commands', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-setup-api-'));
   const client = new Client({ name: 'setup-contract', version: '1' });
