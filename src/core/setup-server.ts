@@ -10,7 +10,9 @@ import { setupWorkspaceIntegration, writeAtomic } from "../services/workspace-se
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
+const bindingNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const inputSchema = {
+  bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for the legacy single binding"),
   localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
   remoteRoot: optionalPath.describe("Existing absolute Linux source directory"),
   remoteStateDir: optionalPath.describe("Writable persistent absolute Linux directory for helper scripts and task state"),
@@ -34,6 +36,9 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     input = { ...input, sshConfigFile: defaultSshConfigFile };
   }
   const questions: Array<{ fields: string[]; question: string }> = [];
+  if (input.bindingName !== undefined && !bindingNamePattern.test(input.bindingName)) {
+    throw new RemoteAgentError("SETUP_INVALID_BINDING", "bindingName must be 1-64 lowercase letters, digits, or hyphens and start with a letter or digit; this keeps binding files unambiguous on case-insensitive systems");
+  }
   if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
   if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
   if (input.sshConfigFile && (input.host || input.username || input.privateKey || input.sshAgent || input.port)) {
@@ -67,14 +72,21 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   if (input.privateKey && (!isAbsolute(input.privateKey) || !await stat(input.privateKey).then(info => info.isFile()))) {
     throw new RemoteAgentError("SETUP_INVALID_PATH", "privateKey must be the absolute path of an existing local file");
   }
-  const workspaceId = input.workspaceId ?? "remote-" + createHash("sha256").update(process.platform === "win32" ? localRoot.toLowerCase() : localRoot).digest("hex").slice(0, 12);
-  const profilePath = join(localRoot, ".ssh-mcp-workspace.json");
-  const sshConfigFile = input.sshConfigFile ? resolve(input.sshConfigFile) : join(localRoot, ".ssh-mcp-connection.json");
+  // Legacy unnamed bindings keep their original workspaceId and file names so existing task ownership survives.
+  const localKey = process.platform === "win32" ? localRoot.toLowerCase() : localRoot;
+  const binding = input.bindingName;
+  const workspaceId = input.workspaceId ?? (binding
+    ? `remote-${binding}-` + createHash("sha256").update(localKey + "\0" + binding).digest("hex").slice(0, 12)
+    : "remote-" + createHash("sha256").update(localKey).digest("hex").slice(0, 12));
+  const profilePath = join(localRoot, binding ? `.ssh-mcp-workspace.${binding}.json` : ".ssh-mcp-workspace.json");
+  const sshConfigFile = input.sshConfigFile ? resolve(input.sshConfigFile) : join(localRoot, binding ? `.ssh-mcp-connection.${binding}.json` : ".ssh-mcp-connection.json");
   connectionName = connectionName ?? "remote";
-  const profile = { workspaceId, connectionName, sshConfigFile, localRoot,
+  const profile = { workspaceId, ...(binding ? { bindingName: binding } : {}), connectionName, sshConfigFile, localRoot,
     remoteRoot: input.remoteRoot, remoteStateDir: input.remoteStateDir, pythonPath: input.pythonPath ?? "/usr/bin/python3",
     ...(input.localStateDir ? { localStateDir: input.localStateDir } : {}) };
   const content = JSON.stringify(profile, null, 2) + "\n";
+  // Dry-run integration first: a rejected binding must not leave a profile file behind.
+  await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, false);
   let old: string | undefined;
   try { old = await readFile(profilePath, "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -89,7 +101,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     await writeAtomic(sshConfigFile, auth, previous);
   }
   await writeAtomic(profilePath, content, old);
-  const integration = await setupWorkspaceIntegration(profilePath, true);
+  const integration = await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, true);
   return { status: "configured", localRoot, profilePath, serverName: integration.serverName, mcpServer: integration.mcpServer,
     hooksInstalled: true, sshVerified: false, instructions: integration.note + " After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook." };
 }

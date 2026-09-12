@@ -7,6 +7,71 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawnSync } from 'node:child_process';
+import { loadWorkspaceConfig } from '../build/config/workspace.js';
+import { TaskService } from '../build/services/task-service.js';
+import { configureFromTool } from '../build/core/setup-server.js';
+
+it('named bindings coexist with legacy profiles and recover only their own tasks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-bindings-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'test' },
+      other: { host: '127.0.0.2', port: 22, username: 'test', password: 'test' } }));
+    const common = { localRoot: root, sshConfigFile: auth, remoteStateDir: '/state', localStateDir: join(root, 'state') };
+    const inputs = [
+      { ...common, connectionName: 'eda', remoteRoot: '/legacy' },
+      { ...common, bindingName: 'eda-main', connectionName: 'eda', remoteRoot: '/main' },
+      { ...common, bindingName: 'eda-tests', connectionName: 'eda', remoteRoot: '/tests' },
+      { ...common, bindingName: 'builder', connectionName: 'other', remoteRoot: '/main' },
+    ];
+    const results = [];
+    for (const input of inputs) results.push(await configureFromTool(input));
+    assert.equal(new Set(results.map(r => r.profilePath)).size, 4);
+    assert.equal(new Set(results.map(r => r.serverName)).size, 4);
+    const before = await readFile(join(root, '.zcode/config.json'), 'utf8');
+    for (const input of inputs) await configureFromTool(input);
+    assert.equal(await readFile(join(root, '.zcode/config.json'), 'utf8'), before);
+    await assert.rejects(configureFromTool({ ...inputs[1], remoteRoot: '/changed' }), { code: 'SETUP_CONFLICT' });
+    const jobs = [];
+    for (const result of results) {
+      const config = await loadWorkspaceConfig(result.profilePath);
+      const tasks = new TaskService({ call: async (_, r) => ({ jobId: r.jobId, state: 'running' }) }, config.localStateDir, config.identity);
+      jobs.push((await tasks.start({ sessionId: 'owner', cwd: config.remoteRoot, command: 'build-' + jobs.length })).jobId);
+      await tasks.start({ sessionId: 'someone-else', cwd: config.remoteRoot, command: 'private-other-session' });
+    }
+    const hooks = JSON.parse(before).hooks.events.UserPromptSubmit.flatMap(g => g.hooks);
+    assert.equal(hooks.length, 4);
+    for (let i = 0; i < hooks.length; i++) {
+      const run = spawnSync(hooks[i].command, hooks[i].args, { encoding: 'utf8', timeout: 10000,
+        input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', cwd: root, session_id: 'owner' }) });
+      const context = JSON.parse(run.stdout).hookSpecificOutput.additionalContext;
+      assert.ok(context.includes(jobs[i]));
+      for (const job of jobs.filter((_, j) => j !== i)) assert.ok(!context.includes(job));
+      assert.doesNotMatch(context, /private-other-session/);
+      assert.ok(context.includes(results[i].serverName), 'Recovery identifies the corresponding MCP server');
+    }
+    const guide = await readFile(join(root, 'AGENTS.md'), 'utf8');
+    assert.match(guide, /绑定/);
+    assert.ok(!guide.includes('/legacy'), 'Shared guidance must not pin future bindings to the first target');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('rejects unsafe binding names and explicit workspaceId collisions between bindings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-binding-rules-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'test' } }));
+    const common = { localRoot: root, sshConfigFile: auth, connectionName: 'eda', remoteStateDir: '/state', localStateDir: join(root, 'state') };
+    for (const bad of ['eda-main.json', '../escape', 'Eda-Main', 'eda main', '-eda', 'a'.repeat(65)]) {
+      await assert.rejects(configureFromTool({ ...common, bindingName: bad, remoteRoot: '/main' }), { code: 'SETUP_INVALID_BINDING' }, bad);
+    }
+    await configureFromTool({ ...common, bindingName: 'eda-main', remoteRoot: '/main', workspaceId: 'shared-id' });
+    await assert.rejects(configureFromTool({ ...common, bindingName: 'eda-tests', remoteRoot: '/tests', workspaceId: 'shared-id' }), { code: 'SETUP_CONFLICT' });
+    const distinct = await configureFromTool({ ...common, bindingName: 'eda-tests', remoteRoot: '/tests' });
+    assert.notEqual(distinct.serverName, 'ssh-workspace-shared-id');
+    assert.match(distinct.profilePath, /\.ssh-mcp-workspace\.eda-tests\.json$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 it('setup reuses a startup SSH config and reveals connection names without credentials', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-presets-'));

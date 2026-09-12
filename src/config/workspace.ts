@@ -10,6 +10,7 @@ import { RemoteAgentError } from "../services/remote-agent-client.js";
 const remotePath = z.string().min(1).refine(value => posix.isAbsolute(value) && !value.includes("\0"), "Expected an absolute POSIX path");
 const profileSchema = z.object({
   workspaceId: z.string().min(1).max(128),
+  bindingName: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/).optional(),
   connectionName: z.string().min(1),
   sshConfigFile: z.string().min(1),
   remoteRoot: remotePath,
@@ -19,8 +20,14 @@ const profileSchema = z.object({
   pythonPath: remotePath.default("/usr/bin/python3"),
 }).strict();
 
+/** The MCP server name shown to ZCode; setup integration and recovery must derive it identically. */
+export function serverNameForWorkspaceId(workspaceId: string): string {
+  return "ssh-workspace-" + workspaceId.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
 export interface WorkspaceConfig {
   workspaceId: string;
+  bindingName?: string;
   identity: string;
   profilePath: string;
   connectionName: string;

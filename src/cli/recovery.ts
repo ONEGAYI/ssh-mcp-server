@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { loadWorkspaceConfig } from "../config/workspace.js";
+import { loadWorkspaceConfig, serverNameForWorkspaceId } from "../config/workspace.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { TaskService } from "../services/task-service.js";
 
@@ -46,8 +46,8 @@ async function main() {
   const commandPrefix = [process.execPath, fileURLToPath(new URL("./job.js", import.meta.url))];
   const sharedArgs = ["--workspace", config.profilePath, "--session", input.session_id];
   const context = [
-    `SSH 远端工作区：${config.workspaceId}；远端工程根：${config.remoteRoot}。`,
-    `当前真实对话标识：${input.session_id}。本机路径与远端路径不要混用。`,
+    `SSH 远端工作区绑定：${config.workspaceId}${config.bindingName ? `（绑定 ${config.bindingName}）` : ""}；MCP 服务：${serverNameForWorkspaceId(config.workspaceId)}；远端工程根：${config.remoteRoot}。`,
+    `当前真实对话标识：${input.session_id}。本机路径与远端路径不要混用；存在多个绑定时，本条上下文只描述上面这一个绑定。`,
     "文件读写优先使用该工作区的 MCP 文件工具。命令用 ZCode 原生后台 Shell 执行，不要仅在命令后添加 &。",
     `启动命令的 argv 模板（按当前 Shell 正确引用每个参数）：${JSON.stringify([...commandPrefix, "run", ...sharedArgs, "--command", "{{远端命令}}"])}`,
     "本机等待退出不等于远端任务结束。收到后台通知后检查 task-result，必要时查询远端状态；读取和处理终态结果后再调用 job-ack 确认。",
