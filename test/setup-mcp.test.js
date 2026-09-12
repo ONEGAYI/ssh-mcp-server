@@ -90,6 +90,8 @@ it('setup reuses a startup SSH config and reveals connection names without crede
     const discovery = JSON.parse(missing.content[0].text);
     assert.deepEqual(discovery.connections, ['eda', 'build']);
     assert.ok(!discovery.questions.some(q => q.fields.includes('privateKey')));
+    assert.ok(discovery.questions.some(q => q.fields.includes('connectionName') && q.question.includes('无需另行查证')),
+      'connection names are presented as complete choices needing no host lookup');
     const result = await client.callTool({ name: 'remote_setup', arguments: {
       localRoot: root, connectionName: 'build', remoteRoot: '/project', remoteStateDir: '/state' } });
     assert.equal(result.isError, undefined, JSON.stringify(result));
@@ -154,6 +156,7 @@ it('setup MCP asks for missing inputs and prepares project integration without m
     assert.ok(missing.questions.some(item => item.fields.includes('remoteRoot')));
     assert.ok(missing.questions.some(item => item.fields.includes('sshConfigFile')));
     assert.match(missing.instructions, /local SSH configs/, 'missing-input guidance must steer agents to ask the user instead of probing');
+    assert.match(missing.instructions, /complete connection choice/, 'a preset connection name needs no host lookup');
     await mkdir(join(root, '.zcode'));
     await writeFile(join(root, '.zcode', 'config.json'), JSON.stringify({ mcp: { servers: { existing: { command: 'keep-me' } } }, hooks: { events: { Stop: [] } } }));
     await writeFile(join(root, 'AGENTS.md'), 'existing project rules');
