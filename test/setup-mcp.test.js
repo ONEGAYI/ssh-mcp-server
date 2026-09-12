@@ -97,6 +97,28 @@ it('setup reuses a startup SSH config and reveals connection names without crede
   } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+it('setup MCP accepts bindingName and directoryScope through the protocol surface', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-protocol-bindings-'));
+  const client = new Client({ name: 'protocol-binding', version: '1' });
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'fixture' } }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+    const rejected = await client.callTool({ name: 'remote_setup', arguments: { localRoot: root, bindingName: 'eda-main',
+      connectionName: 'eda', remoteRoot: '/main', remoteStateDir: '/state', directoryScope: 'sometimes' } });
+    assert.ok(rejected.isError, JSON.stringify(rejected));
+    const result = await client.callTool({ name: 'remote_setup', arguments: { localRoot: root, bindingName: 'eda-main',
+      connectionName: 'eda', remoteRoot: '/main', remoteStateDir: '/state', directoryScope: 'unrestricted' } });
+    assert.equal(result.isError, undefined, JSON.stringify(result));
+    const payload = JSON.parse(result.content[0].text);
+    assert.match(payload.profilePath, /\.ssh-mcp-workspace\.eda-main\.json$/);
+    const profile = JSON.parse(await readFile(payload.profilePath, 'utf8'));
+    assert.equal(profile.bindingName, 'eda-main');
+    assert.equal(profile.directoryScope, 'unrestricted');
+  } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 it('setup MCP asks for missing inputs and prepares project integration without manual setup commands', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-setup-api-'));
   const client = new Client({ name: 'setup-contract', version: '1' });
