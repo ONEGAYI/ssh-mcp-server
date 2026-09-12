@@ -32,6 +32,8 @@
 
 setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用只要出现任一显式 SSH 字段（host/用户名/端口/私钥/agent），本次就整体改用显式信息，不与预存库做字段级合并。
 
+已知客户端限制（ZCode 3.11.2 实测）：完整配置导入会把 `args` 数组中含空格的元素按空格拆分成多个参数，破坏带空格的文件路径。预存连接文件请放在无空格路径；已有带空格路径的文件可用同盘硬链接建一个无空格名称（`New-Item -ItemType HardLink`），内容改动自动同步、凭据不重复存放。
+
 然后对 Agent 说：
 
 > 请调用 remote_setup 帮我配置这个项目的 SSH 远端开发。先询问缺少的连接和目录信息，再生成接入配置。
