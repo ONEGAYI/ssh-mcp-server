@@ -23,6 +23,13 @@ memo.md
 .claude/
 .mcp.json
 docs
+!docs/
+docs/*
+!docs/design/
+!docs/adr/
 
 # codex
 .codex/
+.artifacts/
+__pycache__/
+*.pyc
