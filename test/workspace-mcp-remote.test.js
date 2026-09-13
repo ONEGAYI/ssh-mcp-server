@@ -382,3 +382,91 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     runtime.close();
   }
 });
+
+it('real workspace MCP cancels mid-flight transfers, never rolls back commits and acknowledges results (issue #15)', { skip: !profile, timeout: 180000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const config = await loadWorkspaceConfig(profile);
+  const sessionId = 'mcp15-' + randomUUID();
+  const runtime = await createWorkspaceRuntime(profile);
+  const client = new Client({ name: 'remote-contract', version: '1' });
+  const call = async (name, args = {}) => {
+    const result = await client.callTool({ name, arguments: { sessionId, ...args } });
+    return { error: result.isError, data: JSON.parse(result.content[0].text) };
+  };
+  const runTask = async command => {
+    const registration = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+    const deadline = Date.now() + 120000;
+    for (;;) {
+      const state = await runtime.remote.call('status', { jobId: registration.jobId });
+      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
+        assert.equal(state.state, 'exited', JSON.stringify(state));
+        return state;
+      }
+      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  };
+  const localPath = join(config.localRoot, sessionId + '-up.bin');
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
+    // A multi-block upload stopped mid-flight by the budget: 512 blocks at a
+    // 64 KiB chunk make one exchange per block, so a 1 s budget always stops
+    // partway on a real link (33 MiB/s sustained would be needed to finish).
+    const data = Buffer.alloc(32 * 1024 * 1024, 0x5f);
+    await writeFile(localPath, data);
+    const remoteName = sessionId + '-up.bin';
+    let partial;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const step = attempt === 0
+        ? await call('remote_upload', { localPath, path: remoteName, chunkSize: 65536, budgetMs: 1000 })
+        : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, chunkSize: 65536, budgetMs: 1000 });
+      assert.equal(step.error, undefined, JSON.stringify(step));
+      partial = step;
+      if (partial.data.state === 'transferring' && partial.data.budgetExhausted === true
+        && partial.data.confirmedOffset > 0 && partial.data.confirmedOffset < data.length) break;
+    }
+    assert.equal(partial.data.state, 'transferring', JSON.stringify(partial.data));
+    // Cancel confirms the stop and reports it; status stays read-only.
+    const cancelled = await call('remote_upload', { action: 'cancel', transferId: partial.data.transferId });
+    assert.equal(cancelled.error, undefined, JSON.stringify(cancelled));
+    assert.equal(cancelled.data.state, 'cancelled');
+    const observed = await call('remote_upload', { action: 'status', transferId: partial.data.transferId });
+    assert.equal(observed.data.state, 'cancelled');
+    // A cancelled transfer never resurrects through resume.
+    const dead = await call('remote_upload', { action: 'resume', transferId: partial.data.transferId });
+    assert.equal(dead.data.state, 'cancelled');
+    // The uncommitted remote temp is gone (runTask's cwd is the remote root,
+    // where the target and its sibling temp live).
+    await runTask(`test ! -e '.ssh-mcp-upload-${partial.data.transferId}'`);
+    const smallPath = join(config.localRoot, sessionId + '-small.bin');
+    await writeFile(smallPath, Buffer.from('committed before cancel'));
+    const done = await call('remote_upload', { localPath: smallPath, path: sessionId + '-small-remote.txt' });
+    assert.equal(done.data.state, 'completed');
+    // A late cancel never rolls back the committed target.
+    const kept = await call('remote_upload', { action: 'cancel', transferId: done.data.transferId });
+    assert.equal(kept.error, undefined, JSON.stringify(kept));
+    assert.equal(kept.data.state, 'completed');
+    const readBack = await call('remote_read', { path: sessionId + '-small-remote.txt' });
+    assert.equal(readBack.data.text, 'committed before cancel');
+    // Acknowledgements consume the terminal results, idempotently.
+    const acked = await call('remote_upload', { action: 'ack', transferId: partial.data.transferId });
+    assert.equal(acked.data.acknowledged, true);
+    assert.equal(acked.data.state, 'cancelled');
+    assert.equal((await call('remote_upload', { action: 'ack', transferId: partial.data.transferId })).data.acknowledged, true);
+    assert.equal((await call('remote_upload', { action: 'ack', transferId: done.data.transferId })).data.state, 'completed');
+    // Unknown identifiers never fall back to anything.
+    const unknown = await call('remote_upload', { action: 'cancel', transferId: 'f'.repeat(32) });
+    assert.equal(unknown.data.code, 'TRANSFER_NOT_FOUND');
+    const unknownAck = await call('remote_download', { action: 'ack', transferId: 'f'.repeat(32) });
+    assert.equal(unknownAck.data.code, 'TRANSFER_NOT_FOUND');
+  } finally {
+    await client.close().catch(() => undefined);
+    await rm(localPath, { force: true });
+    await rm(join(config.localRoot, sessionId + '-small.bin'), { force: true });
+    await runTask(`rm -f '${sessionId}-up.bin' '${sessionId}-small-remote.txt'`).catch(() => undefined);
+    runtime.close();
+  }
+});

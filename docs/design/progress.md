@@ -1,5 +1,23 @@
 # 实施进展与验证证据
 
+## 2026-09-13 票据 #15：后台传输完成回传、恢复与主动取消
+
+分支 `ticket/15-background-transfers`，按规格 6.3/7.1 实施（TDD，测试先红后绿，测试与实现分开提交）：
+
+1. **远端取消与确认**（`remote/transfer.py`）：`transfer_cancel` 在传输专属 flock 内观察状态——锁互斥即"无在途块"的操作性证据，确认停止后才释放数据；终态幂等；`committing` 窗口按 intent 身份+摘要双证据核对（发布已生效补回执认账 completed 绝不回滚 / temp 仍在则安全取消 / 证据不足 `TRANSFER_STATE_UNKNOWN` 不删不猜）；下载方向 sender 无本地数据仅置 cancelled。`transfer_ack` 仅终态可确认（unknown 不在集合内）、写 `ack.json` 幂等、与只读 status 分离。
+2. **本机驱动**（`src/services/transfer-service.ts`）：`cancel()` 上传方向以远端为权威；下载方向本地权威——`committing` 窗口按"回执 → intent 身份+摘要 → temp 存在性"三步核对，`unknown` 拒绝取消且数据不动；取消后远端确认停止再删本地 temp/manifest 并释放本机账本。`resume` 补 cancelled 处理（取消后只观察不复活，修复了此前会继续驱动的缺陷）。`acknowledge()` 终态确认（unknown 拒绝），远端+本地幂等。`pending()` 离线列举同会话未确认登记（恢复钩子输入），构造参数抽 `TransferRemote` 接口支持无网络 stub。
+3. **MCP 分派**（`workspace-server.ts`）：`remote_upload`/`remote_download` 的 `action=cancel|ack` 落地（原 `UNSUPPORTED_ACTION`），schema 不变，工具描述同步取消与确认语义。
+4. **job CLI**（`src/cli/job.ts`）：新增 `transfer <start|wait|status|resume|cancel|ack|pending>` 子命令组。`wait` 为后台等待器：循环驱动至终态、期间不投递块级进度、断线有界退避（500ms×2 封顶 8s）、`--wait-timeout` 输出 `transfer-wait-paused` 正常退出；终态输出 `transfer-result`（completed 退出码 0，其余 1）。
+5. **恢复钩子**（`src/cli/recovery.ts`）：离线列举同会话未确认传输（≤50 条+截断提示），注入 `transfer wait` 重挂模板与"只重传未确认数据、不对同一目标重新 start"指引；损坏登记计入 registryIssues。
+
+验证证据（2026-09-13，worktree ticket-15，profile wt15-largefile 与其他 worktree 隔离）：
+
+- WSL Ubuntu / Python 3.12：`remote-transfer.test.py` 50/50 通过（新增取消/确认 5 项由 UNSUPPORTED_ACTION 红转绿）。
+- Windows Node 24.15：`npm test` 250 项（243 通过、7 门控跳过、0 失败；transfer-service 31/31、job-cli 离线 2/2、recovery-hook 2/2）。
+- CentOS 7.9 VM 真实 SSH（两文件分开串行，规避同 profile 并行的 helper 部署竞争）：`workspace-mcp-remote.test.js` 5/5（#15 用例：32 MiB/64 KiB 块中途停→cancel→cancelled、status 只读、resume 不复活、远端 temp 已删、槽释放、已完成提交不回滚、ack 幂等、未知 id 拒绝）；`job-cli-remote.test.js` 4/4（#15 两用例：64 MiB 下载独立进程 wait 驱动至 completed 且摘要一致、pending→ack 清空；cancel 后本地 temp 立即释放、无半成品、槽释放、cancelled 可 ack）。
+- 已知边界：zcode-background 探针本轮未做传输模式适配（需为传输新写探针模式，成本高）；"真实后台完成回传原对话"以 CLI 级集成测试覆盖（独立进程 transfer wait 驱动真实传输至 transfer-result），ZCode 后台通知机制本身已由任务链路探针在此前验收验证。VM 实测曾暴露 64 KiB 小块每块往返约 0.25s 的开销（512 块远超等待时限），测试改用默认 1 MiB 块。
+- 本票尚未由用户人工验收；#16 到期回收将基于本票的 ack.json 起算保留期。
+
 ## 2026-09-13 票据 #9：流式读取大文件与元数据版本凭据
 
 分支 `ticket/09-streaming-read`，按规格 4.1/4.2 实施（TDD，测试先红后绿，测试与实现分开提交）：

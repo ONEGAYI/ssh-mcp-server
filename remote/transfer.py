@@ -34,8 +34,12 @@ Commit follows the issue #10 skeleton. On upload the remote publishes the
 temp (intent first, atomic replacement, receipt last; a lost response
 reconciles by object identity). On download the receiver publishes locally
 and the sender records the asserted outcome idempotently so the shared
-active-transfer slot frees. Cancel/acknowledge belong to issue #15 and stay
-unimplemented. Python 3.6 standard library only.
+active-transfer slot frees. Cancel (issue #15) only deletes uncommitted data
+after the per-transfer lock confirms nothing is in flight, never rolls back
+a publication the persisted evidence proves happened, and reports unknown
+when the commit-window evidence is inconclusive. Acknowledgement consumes a
+terminal result and is kept separate from status, which stays read-only.
+Python 3.6 standard library only.
 """
 import errno
 import hashlib
@@ -60,6 +64,9 @@ HEX64 = re.compile(r'[0-9a-f]{64}')
 ACTIVE_STATES = frozenset(('prepared', 'transferring', 'verifying', 'committing'))
 MAX_ACTIVE_TRANSFERS = 2
 STREAM_CHUNK = 256 * 1024
+# Terminal states a result acknowledgement may consume (issue #15). `unknown`
+# is deliberately absent: an unverified outcome must never be acknowledged.
+TERMINAL_STATES = frozenset(('completed', 'failed', 'cancelled', 'interrupted'))
 
 
 def _now():
@@ -884,6 +891,117 @@ def status(root, request):
     return describe(record)
 
 
+def _release_temp(root, record):
+    """Delete the uncommitted temp and release its ledger registration."""
+    if record.get('resourceId'):
+        ledger.release(root, record['resourceId'])
+        record['resourceId'] = None
+    if record.get('tempPath'):
+        try:
+            os.unlink(record['tempPath'])
+        except FileNotFoundError:
+            pass
+
+
+def _publish_evidence_matches(record, intent):
+    """Object identity plus content digest: the only accepted proof that the
+    intent's publication actually took effect (spec 6.2)."""
+    try:
+        info = os.stat(record['targetPath'])
+    except OSError:
+        return False
+    if '{}:{}'.format(info.st_dev, info.st_ino) != intent['tempIdentity']:
+        return False
+    try:
+        return _digest_window(record['targetPath'], 0, info.st_size) == intent['totalSha256']
+    except (AgentError, OSError):
+        return False
+
+
+def cancel(root, request):
+    """Stop a not-yet-committed transfer and release its uncommitted data.
+
+    Issue #15 semantics: a cancellation only takes effect once the transfer is
+    provably stopped. The per-transfer flock serializes against any in-flight
+    block exchange, so observing the record under the lock is the "no blocks
+    in flight" evidence -- no data is deleted before that confirmation.
+
+    A completed commit is never rolled back; a cancel racing the commit window
+    reconciles by the persisted evidence (intent identity plus digest against
+    the live target) instead of trusting the cancel request itself. When the
+    evidence is inconclusive the state stays untouched and unknown is reported
+    rather than guessing.
+    """
+    transfer_id = _transfer_id(request.get('transferId'))
+    with acquire_slots(root, [transfer_id]):
+        record = _load_record(root, transfer_id)
+        _require_session(record, request)
+        state = record['state']
+        if state == 'completed':
+            # Committed targets are never rolled back; observe idempotently.
+            return describe(record)
+        if state in ('failed', 'cancelled'):
+            return describe(record)
+        if state == 'committing':
+            directory = transfer_path(root, transfer_id)
+            intent = read_json(directory / 'intent.json')
+            if _publish_evidence_matches(record, intent):
+                # The rename already happened before the cancel arrived: the
+                # publication stands. Complete the receipt trail exactly like
+                # the lost-response reconciliation in commit().
+                if record['resourceId']:
+                    ledger.release(root, record['resourceId'])
+                    record['resourceId'] = None
+                receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': intent['totalBytes'],
+                           'targetIdentity': intent['tempIdentity']}
+                atomic_json(directory / 'receipt.json', receipt)
+                record.update(state='completed', completedAt=receipt['committedAt'])
+                _save_record(root, transfer_id, record)
+                return describe(record)
+            if not os.path.exists(record['tempPath']):
+                # Neither published nor holding the temp: the outcome cannot
+                # be established from evidence. Report unknown, delete nothing.
+                raise AgentError('TRANSFER_STATE_UNKNOWN',
+                                 'Cancel raced the commit window without evidence of the outcome; inspect the target manually')
+            # The intent exists but the publication never took effect, and the
+            # held lock proves it cannot start now: safe to release.
+            _release_temp(root, record)
+            record.update(state='cancelled', completedAt=_now())
+            _save_record(root, transfer_id, record)
+            return describe(record)
+        if state == 'unknown':
+            raise AgentError('TRANSFER_STATE_UNKNOWN',
+                             'The outcome is not yet verified; resolve it before cancelling')
+        # prepared / transferring / verifying / interrupted: stopped or
+        # stoppable under this lock. Uploads hold the received temp; download
+        # senders materialize nothing (the receiver cleans its own side).
+        if record['direction'] == 'upload':
+            _release_temp(root, record)
+        record.update(state='cancelled', completedAt=_now())
+        _save_record(root, transfer_id, record)
+        return describe(record)
+
+
+def acknowledge(root, request):
+    """Consume a terminal result (issue #15); idempotent, never a status query.
+
+    Only a verified terminal state may be acknowledged. `unknown` is refused:
+    acknowledging it would launder an unresolved outcome into a consumed one.
+    """
+    transfer_id = _transfer_id(request.get('transferId'))
+    with acquire_slots(root, [transfer_id]):
+        record = _load_record(root, transfer_id)
+        _require_session(record, request)
+        if record['state'] not in TERMINAL_STATES:
+            raise AgentError('TRANSFER_NOT_FINISHED',
+                             'Only a terminal transfer result can be acknowledged (state: {})'.format(record['state']))
+        ack_path = transfer_path(root, transfer_id) / 'ack.json'
+        if not ack_path.is_file():
+            atomic_json(ack_path, {'schemaVersion': 1, 'transferId': transfer_id,
+                                   'state': record['state'], 'acknowledgedAt': _now()})
+        return {'acknowledged': True, 'transferId': transfer_id, 'state': record['state']}
+
+
 def _file_service(root, request):
     from files import FileService
     return FileService(root, request.get('workspaceRoot'), request.get('sessionId'),
@@ -921,9 +1039,8 @@ def block_exchange(root, stdin):
 def transfer_action(root, action, request):
     handlers = {'transfer_register': register, 'transfer_start': start,
                 'transfer_resume': resume, 'transfer_verify': verify,
-                'transfer_commit': commit, 'transfer_status': status}
-    if action in ('transfer_cancel', 'transfer_ack'):
-        raise AgentError('UNSUPPORTED_ACTION', 'Transfer cancel and acknowledgement arrive with issue #15')
+                'transfer_commit': commit, 'transfer_status': status,
+                'transfer_cancel': cancel, 'transfer_ack': acknowledge}
     handler = handlers.get(action)
     if handler is None:
         raise AgentError('UNSUPPORTED_ACTION', 'Unknown transfer operation')

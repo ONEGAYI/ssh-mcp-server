@@ -46,7 +46,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       // rejected before entering the request pipeline; the exact 16 MiB byte
       // gate stays with the remote helper (remote/files.py) as the authority.
       text: z.string().max(64 * 1024 * 1024).optional(), data: z.string().max(64 * 1024 * 1024).optional() }, input => files.call("file_write", input.sessionId, input));
-  register("remote_upload", "Upload a local file of any size through a resumable verified transfer: 1 MiB chunks stream over a binary SSH channel with per-chunk digests and a final two-sided SHA-256, and the model never carries file bytes. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId and bounded progress; if it returns state=transferring with budgetExhausted=true, call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is resent; a changed local source is refused). action=status observes without side effects. Creating requires an absent target; replacing an existing target requires overwrite=true plus its metadataOnly expectedVersion. cancel/ack arrive with issue #15.",
+  register("remote_upload", "Upload a local file of any size through a resumable verified transfer: 1 MiB chunks stream over a binary SSH channel with per-chunk digests and a final two-sided SHA-256, and the model never carries file bytes. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId and bounded progress; if it returns state=transferring with budgetExhausted=true, call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is resent; a changed local source is refused). action=status observes without side effects. action=cancel stops the transfer after confirming nothing is in flight, releases its uncommitted data and never rolls back a committed target; action=ack acknowledges a terminal result after you inspected it (keep it separate from status). Creating requires an absent target; replacing an existing target requires overwrite=true plus its metadataOnly expectedVersion.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -58,7 +58,10 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       budgetMs: z.number().int().min(1000).max(600000).optional().describe("Driving budget for this call; on exhaustion the bounded progress returns with budgetExhausted=true"),
     }, async input => {
       if (input.action === "cancel" || input.action === "ack") {
-        throw new RemoteAgentError("UNSUPPORTED_ACTION", "Transfer cancel and acknowledgement arrive with issue #15");
+        if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
+        return input.action === "cancel"
+          ? transfers.cancel(input.sessionId, input.transferId)
+          : transfers.acknowledge(input.sessionId, input.transferId);
       }
       if (input.action === "start") {
         if (!input.localPath || !input.path) throw new RemoteAgentError("INVALID_REQUEST", "start requires localPath and path");
@@ -69,7 +72,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
     });
-  register("remote_download", "Download a remote file of any size through a resumable verified transfer, the reverse of remote_upload: the remote source is bound to its observed m1- version, each fetched 1 MiB chunk is digested locally before it is confirmed, and a final local SHA-256 must match the sender's register-time digest before the atomic commit. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId plus bounded progress; on budgetExhausted=true call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is refetched; a changed remote source is refused). action=status observes without side effects. The local target must be absent by default; replacing it requires overwrite=true plus the expectedVersion reported for the local target in the FILE_CONFLICT guidance. Downloads never issue a readToken and never grant model read coverage. cancel/ack arrive with issue #15.",
+  register("remote_download", "Download a remote file of any size through a resumable verified transfer, the reverse of remote_upload: the remote source is bound to its observed m1- version, each fetched 1 MiB chunk is digested locally before it is confirmed, and a final local SHA-256 must match the sender's register-time digest before the atomic commit. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId plus bounded progress; on budgetExhausted=true call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is refetched; a changed remote source is refused). action=status observes without side effects. action=cancel stops the transfer, releases the local uncommitted temp and never rolls back a committed target; a cancel racing the commit window reconciles by receipt/intent evidence and reports unknown rather than guessing; action=ack acknowledges a terminal result after inspection (unknown outcomes are never acknowledged). The local target must be absent by default; replacing it requires overwrite=true plus the expectedVersion reported for the local target in the FILE_CONFLICT guidance. Downloads never issue a readToken and never grant model read coverage.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -81,7 +84,10 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       budgetMs: z.number().int().min(1000).max(600000).optional().describe("Driving budget for this call; on exhaustion the bounded progress returns with budgetExhausted=true"),
     }, async input => {
       if (input.action === "cancel" || input.action === "ack") {
-        throw new RemoteAgentError("UNSUPPORTED_ACTION", "Transfer cancel and acknowledgement arrive with issue #15");
+        if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
+        return input.action === "cancel"
+          ? transfers.cancel(input.sessionId, input.transferId)
+          : transfers.acknowledge(input.sessionId, input.transferId);
       }
       if (input.action === "start") {
         if (!input.path || !input.localPath) throw new RemoteAgentError("INVALID_REQUEST", "start requires path and localPath");

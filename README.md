@@ -172,6 +172,18 @@ Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `ru
 
 取消需调用 `remote_cancel` 或 job CLI 的 cancel。关闭本机等待程序、SSH 断开和等待超时都不等于取消远端任务。
 
+### 大文件传输的后台等待与取消
+
+大文件上传/下载（`remote_upload` / `remote_download`，或 job CLI 的 `transfer start`）返回持久传输编号；单次预算内未传完时，用原生后台 Shell 运行等待器：
+
+```text
+node <安装目录>/build/cli/job.js transfer wait --transfer-id <传输编号> --workspace <配置文件> --session <会话标识>
+```
+
+等待器静默驱动至完成，只在结束时输出一行结果（不逐块报告进度）；断线自动退避重试。ZCode 重启后用同一编号继续（只补未确认数据），恢复钩子也会列出未确认的传输。
+
+取消传输用 `action=cancel` 或 `transfer cancel`：确认停止后，未提交的临时数据立即释放；已完成的提交不回滚。处理完结果后同样用 `action=ack` / `transfer ack` 确认。
+
 ## 7. 常见问题
 
 | 现象 | 处理方式 |

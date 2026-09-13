@@ -86,7 +86,40 @@ class FakeRemote {
     if (action === 'transfer_verify') return this.verify(request);
     if (action === 'transfer_commit') return this.commit(request);
     if (action === 'transfer_status') return this.describe(this.load(request.transferId));
+    if (action === 'transfer_cancel') return this.cancelAction(request);
+    if (action === 'transfer_ack') return this.ackAction(request);
     const error = new Error('Unknown action ' + action); error.code = 'UNSUPPORTED_ACTION'; throw error;
+  }
+
+  // The remote cancel semantics are exercised thoroughly against the real
+  // helper in test/remote-transfer.test.py; this simulation keeps the state
+  // machine and the upload temp release so the driver layer can be verified.
+  async cancelAction(request) {
+    const record = this.load(request.transferId);
+    if (request.sessionId !== record.sessionId) {
+      const error = new Error('scope'); error.code = 'TRANSFER_SCOPE_MISMATCH'; throw error;
+    }
+    if (['completed', 'failed', 'cancelled'].includes(record.state)) return this.describe(record);
+    if (record.state === 'committing') {
+      // Evidence reconciliation on the remote is out of scope for the fake.
+      const error = new Error('commit window'); error.code = 'TRANSFER_STATE_UNKNOWN'; throw error;
+    }
+    if (record.direction === 'upload') await rm(this.tempPath(record), { force: true });
+    record.state = 'cancelled';
+    record.completedAt = Date.now();
+    await this.persist(record);
+    return this.describe(record);
+  }
+
+  async ackAction(request) {
+    const record = this.load(request.transferId);
+    if (request.sessionId !== record.sessionId) {
+      const error = new Error('scope'); error.code = 'TRANSFER_SCOPE_MISMATCH'; throw error;
+    }
+    if (!['completed', 'failed', 'cancelled', 'interrupted'].includes(record.state)) {
+      const error = new Error('not finished'); error.code = 'TRANSFER_NOT_FINISHED'; throw error;
+    }
+    return { acknowledged: true, transferId: record.transferId, state: record.state };
   }
 
   async register(request) {
@@ -977,5 +1010,271 @@ it('download resume and status are session-scoped and unknown ids are refused', 
       error => error.code === 'TRANSFER_NOT_FOUND');
     const done = await transfers.resume('session-a', partial.transferId);
     assert.equal(done.state, 'completed');
+  } finally { await fake.cleanup(); }
+});
+
+// --- issue #15: cancellation, acknowledgement and pending discovery ---------
+
+function localTransfersDir(fake) {
+  return join(fake.stateRoot, 'local-state',
+    createHash('sha256').update('identity-13').digest('hex').slice(0, 24), 'transfers');
+}
+
+/** Drive a multi-block download to a mid-transfer budget stop, unthrottled. */
+async function downloadPartial(fake, transfers, name = 'cancel-dl.bin') {
+  const data = Buffer.alloc(CHUNK * 4, 0x15);
+  const source = 'cancel-src-' + randomUUID() + '.bin';
+  await writeSource(fake.workspace, source, data);
+  fake.fetchDelayMs = 400;
+  const partial = await transfers.download('session-a', { path: source, localPath: name, chunkSize: CHUNK, budgetMs: 1000 });
+  fake.fetchDelayMs = 0;
+  assert.equal(partial.state, 'transferring');
+  assert.equal(partial.budgetExhausted, true);
+  return { partial, data };
+}
+
+it('cancelling a mid-flight upload stops at the remote evidence and never resurrects', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.alloc(CHUNK * 3, 0x25);
+    const source = await writeSource(fake.workspace, 'cancel-up-' + randomUUID() + '.bin', data);
+    fake.failAt = { index: 1, mode: 'after' };
+    let transferId;
+    await assert.rejects(transfers.upload('session-a', {
+      localPath: source.target, path: 'cancel-up-dest.bin', chunkSize: CHUNK,
+    }), error => (transferId = error.transferId, true));
+    fake.failAt = null;
+    // The remote temp still holds the confirmed prefix.
+    assert.ok(await stat(join(fake.workspace, '.ssh-mcp-upload-' + transferId)).then(() => true, () => false));
+    const cancelled = await transfers.cancel('session-a', transferId);
+    assert.equal(cancelled.state, 'cancelled');
+    assert.ok(cancelled.message !== undefined);
+    // The uncommitted remote temp is gone and the transfer never resumes.
+    await assert.rejects(stat(join(fake.workspace, '.ssh-mcp-upload-' + transferId)),
+      error => error.code === 'ENOENT');
+    const again = await transfers.cancel('session-a', transferId);
+    assert.equal(again.state, 'cancelled');
+    const dead = await transfers.resume('session-a', transferId);
+    assert.equal(dead.state, 'cancelled'); // resume observes the stop, sends nothing
+    const blocksAfterCancel = fake.exchanges.filter(exchange => exchange.action === 'transfer_block').length;
+    await transfers.resume('session-a', transferId).catch(() => undefined);
+    assert.equal(fake.exchanges.filter(exchange => exchange.action === 'transfer_block').length, blocksAfterCancel,
+      'no blocks may move after the cancel');
+    // A committed upload is never rolled back by a late cancel.
+    const done = await transfers.upload('session-a', {
+      localPath: source.target, path: 'cancel-up-dest2.bin', chunkSize: CHUNK });
+    assert.equal(done.state, 'completed');
+    const kept = await transfers.cancel('session-a', done.transferId);
+    assert.equal(kept.state, 'completed');
+    assert.ok((await readFile(join(fake.workspace, 'cancel-up-dest2.bin'))).equals(data));
+  } finally { await fake.cleanup(); }
+});
+
+it('cancelling a mid-flight download releases the local temp, manifest and ledger', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers);
+    const temp = join(fake.workspace, '.ssh-mcp-download-' + partial.transferId);
+    assert.ok(await stat(temp).then(() => true, () => false));
+    const cancelled = await transfers.cancel('session-a', partial.transferId);
+    assert.equal(cancelled.state, 'cancelled');
+    // The uncommitted receiver data is released immediately.
+    await assert.rejects(stat(temp), error => error.code === 'ENOENT');
+    assert.deepEqual(await localTemps(fake.workspace), []);
+    await assert.rejects(stat(join(localTransfersDir(fake), partial.transferId, 'chunks.jsonl')),
+      error => error.code === 'ENOENT');
+    const { SpaceLedger } = await import('../build/services/space-ledger.js');
+    assert.equal((await new SpaceLedger(localLedgerPath(fake), 10 * 1024 ** 3).usage()).resourceCount, 0);
+    // Repeated cancels and resumes stay idempotent and dead.
+    assert.equal((await transfers.cancel('session-a', partial.transferId)).state, 'cancelled');
+    const fetchesAfterCancel = fake.exchanges.filter(exchange => exchange.action === 'transfer_fetch').length;
+    const resumed = await transfers.resume('session-a', partial.transferId);
+    assert.equal(resumed.state, 'cancelled');
+    assert.equal(fake.exchanges.filter(exchange => exchange.action === 'transfer_fetch').length, fetchesAfterCancel,
+      'no fetch may move after the cancel');
+    // The formal target never appeared.
+    await assert.rejects(stat(join(fake.workspace, 'cancel-dl.bin')), error => error.code === 'ENOENT');
+  } finally { await fake.cleanup(); }
+});
+
+it('cancelling a committed download reports completion instead of a rollback', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.alloc(500, 0x35);
+    const source = 'committed-cancel-' + randomUUID() + '.bin';
+    await writeSource(fake.workspace, source, data);
+    const done = await transfers.download('session-a', { path: source, localPath: 'committed-cancel.bin', chunkSize: CHUNK });
+    assert.equal(done.state, 'completed');
+    const observed = await transfers.cancel('session-a', done.transferId);
+    assert.equal(observed.state, 'completed');
+    assert.ok((await readFile(join(fake.workspace, 'committed-cancel.bin'))).equals(data));
+  } finally { await fake.cleanup(); }
+});
+
+it('cancelling a download in the commit window reconciles by evidence', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial, data } = await downloadPartial(fake, transfers, 'window.bin');
+    const directory = join(localTransfersDir(fake), partial.transferId);
+    const temp = join(fake.workspace, '.ssh-mcp-download-' + partial.transferId);
+    const info = await stat(temp);
+    const intent = { schemaVersion: 1, targetPath: join(fake.workspace, 'window.bin'),
+      expectedVersion: null, overwrite: false, create: false,
+      tempIdentity: `${info.dev}:${info.ino}`,
+      totalSha256: createHash('sha256').update(data).digest('hex'), totalBytes: data.length, plannedAt: Date.now() };
+    const markCommitting = async () => {
+      const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+      record.state = 'committing';
+      await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+      await writeFile(join(directory, 'intent.json'), JSON.stringify(intent));
+    };
+    // Window A: the intent exists but the publish never happened (temp still
+    // there) -- the cancel is safe and releases the data.
+    await markCommitting();
+    const stopped = await transfers.cancel('session-a', partial.transferId);
+    assert.equal(stopped.state, 'cancelled');
+    await assert.rejects(stat(temp), error => error.code === 'ENOENT');
+    await assert.rejects(stat(join(fake.workspace, 'window.bin')), error => error.code === 'ENOENT');
+  } finally { await fake.cleanup(); }
+});
+
+it('a committed-but-unreceipted download completes through cancel and is never rolled back', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.alloc(CHUNK + 700, 0x45);
+    const source = 'window2-' + randomUUID() + '.bin';
+    await writeSource(fake.workspace, source, data);
+    const done = await transfers.download('session-a', { path: source, localPath: 'window2.bin', chunkSize: CHUNK });
+    assert.equal(done.state, 'completed');
+    const directory = join(localTransfersDir(fake), done.transferId);
+    const target = join(fake.workspace, 'window2.bin');
+    // Simulate the crash window after the rename: drop the receipt, rewind the
+    // record into committing, and keep only the intent as evidence.
+    const { unlink } = await import('node:fs/promises');
+    await unlink(join(directory, 'receipt.json'));
+    const info = await stat(target);
+    const intent = { schemaVersion: 1, targetPath: target, expectedVersion: null, overwrite: false, create: false,
+      tempIdentity: `${info.dev}:${info.ino}`, totalSha256: createHash('sha256').update(data).digest('hex'),
+      totalBytes: data.length, plannedAt: Date.now() };
+    await writeFile(join(directory, 'intent.json'), JSON.stringify(intent));
+    const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    record.state = 'committing';
+    await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+    const reconciled = await transfers.cancel('session-a', done.transferId);
+    assert.equal(reconciled.state, 'completed');
+    assert.ok((await readFile(target)).equals(data));
+    assert.ok(await stat(join(directory, 'receipt.json')).then(() => true, () => false));
+  } finally { await fake.cleanup(); }
+});
+
+it('cancel refuses an unverifiable commit window without deleting data', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'window3.bin');
+    const directory = join(localTransfersDir(fake), partial.transferId);
+    const temp = join(fake.workspace, '.ssh-mcp-download-' + partial.transferId);
+    const info = await stat(temp);
+    // The temp vanished and the target is somebody else's object: no evidence.
+    await rm(temp);
+    const intent = { schemaVersion: 1, targetPath: join(fake.workspace, 'window3.bin'),
+      expectedVersion: null, overwrite: false, create: false,
+      tempIdentity: `${info.dev}:${info.ino}`, totalSha256: 'f'.repeat(64), totalBytes: 12345, plannedAt: Date.now() };
+    const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    record.state = 'committing';
+    await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+    await writeFile(join(directory, 'intent.json'), JSON.stringify(intent));
+    await assert.rejects(transfers.cancel('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_STATE_UNKNOWN');
+    // Nothing was deleted or rewritten while the outcome stayed unknown.
+    assert.equal(JSON.parse(await readFile(join(directory, 'record.json'), 'utf8')).state, 'committing');
+  } finally { await fake.cleanup(); }
+});
+
+it('cancel refuses an unknown local outcome and leaves the data for inspection', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'unknown.bin');
+    const directory = join(localTransfersDir(fake), partial.transferId);
+    const temp = join(fake.workspace, '.ssh-mcp-download-' + partial.transferId);
+    const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    record.state = 'unknown';
+    await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+    await assert.rejects(transfers.cancel('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_STATE_UNKNOWN');
+    assert.ok(await stat(temp).then(() => true, () => false), 'unverified data must survive the refusal');
+  } finally { await fake.cleanup(); }
+});
+
+it('acknowledgement consumes terminal results only and stays idempotent', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'ack-dl.bin');
+    // An in-flight transfer cannot be acknowledged.
+    await assert.rejects(transfers.acknowledge('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_NOT_FINISHED');
+    await assert.rejects(stat(join(localTransfersDir(fake), partial.transferId, 'ack.json')),
+      error => error.code === 'ENOENT');
+    const done = await transfers.resume('session-a', partial.transferId);
+    assert.equal(done.state, 'completed');
+    const acked = await transfers.acknowledge('session-a', partial.transferId);
+    assert.equal(acked.acknowledged, true);
+    assert.equal(acked.state, 'completed');
+    const stored = JSON.parse(await readFile(join(localTransfersDir(fake), partial.transferId, 'ack.json'), 'utf8'));
+    assert.equal(stored.transferId, partial.transferId);
+    assert.equal(stored.state, 'completed');
+    assert.equal((await transfers.acknowledge('session-a', partial.transferId)).acknowledged, true);
+    // A cancelled transfer result is equally consumable.
+    const { partial: second } = await downloadPartial(fake, transfers, 'ack-cancel.bin');
+    await transfers.cancel('session-a', second.transferId);
+    const cancelledAck = await transfers.acknowledge('session-a', second.transferId);
+    assert.equal(cancelledAck.state, 'cancelled');
+    // Session ownership applies to acknowledgements.
+    await assert.rejects(transfers.acknowledge('session-b', partial.transferId),
+      error => error.code === 'TRANSFER_SCOPE_MISMATCH');
+  } finally { await fake.cleanup(); }
+});
+
+it('pending lists this session unacknowledged transfers only', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    fake.activeLimit = 3; // this scenario tracks three concurrent registrations
+    const { partial: mine } = await downloadPartial(fake, transfers, 'pending-a.bin');
+    const uploadSource = await writeSource(fake.workspace, 'pending-up-' + randomUUID() + '.bin', Buffer.alloc(CHUNK * 2, 3));
+    fake.fetchDelayMs = 400; fake.blockDelayMs = 400;
+    const upload = await transfers.upload('session-a', {
+      localPath: uploadSource.target, path: 'pending-up-dest.bin', chunkSize: CHUNK, budgetMs: 1000 });
+    fake.fetchDelayMs = 0; fake.blockDelayMs = 0;
+    const otherData = Buffer.alloc(CHUNK * 4, 4);
+    const otherSource = 'pending-other-' + randomUUID() + '.bin';
+    await writeSource(fake.workspace, otherSource, otherData);
+    fake.fetchDelayMs = 400;
+    await transfers.download('session-b', { path: otherSource, localPath: 'pending-b.bin', chunkSize: CHUNK, budgetMs: 1000 });
+    fake.fetchDelayMs = 0;
+    let pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId).sort(), [upload.transferId, mine.transferId].sort());
+    const mineEntry = pending.find(entry => entry.transferId === mine.transferId);
+    assert.equal(mineEntry.direction, 'download');
+    assert.equal(mineEntry.state, 'transferring');
+    assert.ok(mineEntry.localPath.endsWith('pending-a.bin'));
+    assert.ok(mineEntry.createdAt);
+    // Acknowledging removes the entry; the other session's transfer never shows.
+    const finished = await transfers.resume('session-a', upload.transferId);
+    assert.equal(finished.state, 'completed');
+    await transfers.acknowledge('session-a', upload.transferId);
+    pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId), [mine.transferId]);
+  } finally { await fake.cleanup(); }
+});
+
+it('pending tolerates broken registrations through registry issues', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'pending-broken.bin');
+    // A well-formed identifier directory without its registration file.
+    await mkdir(join(localTransfersDir(fake), 'f'.repeat(32)));
+    const pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId), [partial.transferId]);
+    assert.equal(transfers.transferRegistryIssues.length, 1);
+    assert.equal(transfers.transferRegistryIssues[0].code, 'TRANSFER_NOT_FOUND');
   } finally { await fake.cleanup(); }
 });

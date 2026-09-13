@@ -169,7 +169,8 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 - 传输中出错（断线、超时）时错误响应携带 `transferId`，同样以 resume 接回；本机源文件在传输期间变化则拒绝续传，需重新 start。
 - `action=status` 只读查询进度，无副作用。
 - 覆盖已有远端目标须先 `remote_read metadataOnly` 拿版本，再带 `overwrite=true` 与 `expectedVersion`；默认目标必须不存在。
-- 主动取消与完成确认（cancel/ack）尚未提供（#15）。
+- `action=cancel` 主动取消（#15）：远端确认停止后才删除未提交的临时数据；已完成的提交不回滚（返回 `completed` 而非 `cancelled`）；结果未知时返回 `TRANSFER_STATE_UNKNOWN` 不猜。取消后 resume 只观察不复活。
+- `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
 
 ### 下载大文件（可续传传输事务）
 
@@ -182,7 +183,25 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 - 本机目标默认必须不存在；覆盖须带 `overwrite=true` 与本机目标观察版本 `l1-<size>:<mtimeMs>`（首次拒绝的 `FILE_CONFLICT` 消息会给出该值），提交前复核，目标变化拒绝覆盖。
 - 本机磁盘写满（`STORAGE_FULL`）时清理接收临时文件后可重试，续传从零开始。
 - `action=status` 只读查询进度，无副作用。
-- 主动取消与完成确认（cancel/ack）尚未提供（#15）。
+- `action=cancel` 主动取消（#15）：先停远端发送方，再删除本机未提交的接收临时数据与块清单、释放空间登记；已完成的提交不回滚；取消撞上提交窗口时按回执/意图证据核对，证据不足返回 `TRANSFER_STATE_UNKNOWN` 且不动数据。取消后 resume 只观察不复活。
+- `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
+
+### 传输的后台等待与恢复（#15）
+
+大文件传输的后台体验与任务同模式：durable `transferId` 跨进程有效，等待器由 ZCode 原生后台 Shell 执行，完成通知回到原对话。
+
+```text
+node <安装目录>/build/cli/job.js transfer start --direction download --remote <远端源> --local <本机目标> --workspace <配置文件> --session <会话标识> [--budget <毫秒>]
+node <安装目录>/build/cli/job.js transfer wait --transfer-id <持久传输编号> --workspace <配置文件> --session <会话标识>
+node <安装目录>/build/cli/job.js transfer status|resume|cancel|ack --transfer-id <持久传输编号> ...
+node <安装目录>/build/cli/job.js transfer pending --workspace <配置文件> --session <会话标识>
+```
+
+- `transfer start` 单次预算内驱动；预算内完成输出 `transfer-result`，否则输出 `transfer-started` 与 durable 编号。也可继续用 MCP `remote_upload`/`remote_download` 的 start/resume 驱动，两种入口操作同一事务。
+- `transfer wait` 是后台等待器：循环驱动至终态，**期间不输出块级进度**，只在完成/失败/取消时输出一行 `transfer-result`（含 `acknowledgementRequired`）；断线按有界退避重试；`--wait-timeout` 到点输出 `transfer-wait-paused` 退出（durable 进度保留，重新 wait 即续）。
+- 等待器被结束不取消传输；MCP 服务与本机重启后，用同一 `transferId` 重挂即可继续（只重传未确认数据）。
+- 继续原对话时，恢复钩子除任务外还会列出同会话未确认的传输（离线读取本机登记），并给出 `transfer wait` 重挂模板；不要对同一目标重新 start 创建新传输。
+- 传输结果同样保持 pending 直到显式 `transfer ack`（或 MCP `action=ack`）；cancelled 结果也需要确认消费。
 
 ### 后台任务
 
