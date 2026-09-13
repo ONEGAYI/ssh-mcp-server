@@ -874,6 +874,20 @@ class FileService:
             raise AgentError('INVALID_REQUEST',
                              'Whole-file writes no longer take readToken; observe the target with a metadataOnly read '
                              'and pass overwrite=true with that expectedVersion to replace it')
+        # Inline content stays bounded by the 16 MiB request budget (spec
+        # 4.3, large-file extension); larger payloads go through uploads.
+        # base64 is estimated by length formula without decoding -- malformed
+        # input stays with compose_content's own validation.
+        if 'text' in request and isinstance(request['text'], str):
+            inline_bytes = len(request['text'].encode('utf8'))
+        elif 'data' in request and isinstance(request['data'], str):
+            payload = request['data']
+            inline_bytes = len(payload) // 4 * 3 - (len(payload) - len(payload.rstrip('=')))
+        else:
+            inline_bytes = None
+        if inline_bytes is not None and inline_bytes > MAX_FILE_BYTES:
+            raise AgentError('FILE_TOO_LARGE',
+                             'Inline writes are bounded by the 16 MiB request budget; use remote_upload for larger content')
         creating = request.get('create', False)
         overwriting = request.get('overwrite', False)
         if not isinstance(creating, bool) or not isinstance(overwriting, bool):

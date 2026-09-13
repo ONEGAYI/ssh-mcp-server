@@ -371,15 +371,42 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(streamed['result']['endOffset'], 100)
         self.assertFalse(streamed['result']['complete'])
         # Since issue #10 the mutation paths stream too: editing a >16 MiB
-        # file works, and inline writes no longer stop at the old 16 MiB gate.
+        # file works. Inline writes stay bounded by the 16 MiB request
+        # budget (spec 4.3): exactly 16 MiB passes, one byte over is refused
+        # with FILE_TOO_LARGE pointing at remote_upload.
         edit = self.call('file_edit', {'path': 'oversized.bin', 'readToken': streamed['result']['readToken'],
                                        'edits': [{'oldText': 'UNIQUE-MARKER-12345678', 'newText': 'zero-block'}]})
-        self.assertTrue(edit['ok'], edit)
+        self.assertTrue(edit['ok'])
         self.assertEqual(edit['result']['bytesWritten'], 16 * 1024 * 1024 + 1 - len('UNIQUE-MARKER-12345678') + len('zero-block'))
         service = self.service()
+        files = self.helper_module()
         service.write({'path': 'created.bin', 'create': True,
-                       'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')})
-        self.assertEqual((self.work / 'created.bin').stat().st_size, 16 * 1024 * 1024 + 1)
+                       'data': base64.b64encode(b'0' * (16 * 1024 * 1024)).decode('ascii')})
+        self.assertEqual((self.work / 'created.bin').stat().st_size, 16 * 1024 * 1024)
+        with self.assertRaises(files.AgentError) as refused:
+            service.write({'path': 'too-big.bin', 'create': True,
+                           'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')})
+        self.assertEqual(refused.exception.code, 'FILE_TOO_LARGE')
+        self.assertIn('remote_upload', str(refused.exception))
+        self.assertFalse((self.work / 'too-big.bin').exists())
+
+    def test_inline_write_request_budget_bounds_text_and_base64_paths(self):
+        # 规格大文件扩展 4.3：inline text/base64 仍受 16 MiB 请求预算限制，
+        # 大内容走上传。门按请求内容长度估算（base64 用长度公式，不解码），
+        # 恰好 16 MiB 允许，超出即 FILE_TOO_LARGE；file_edit 不受此门。
+        files = self.helper_module()
+        service = self.service()
+        exact = service.write({'path': 'exact-text.bin', 'create': True, 'text': 'x' * (16 * 1024 * 1024)})
+        self.assertTrue(exact['written'])
+        self.assertEqual((self.work / 'exact-text.bin').stat().st_size, 16 * 1024 * 1024)
+        for request in ({'path': 'over-text.txt', 'create': True, 'text': 'x' * (16 * 1024 * 1024 + 1)},
+                        {'path': 'over-data.bin', 'create': True,
+                         'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')}):
+            with self.assertRaises(files.AgentError) as refused:
+                service.write(request)
+            self.assertEqual(refused.exception.code, 'FILE_TOO_LARGE', request['path'])
+            self.assertIn('remote_upload', str(refused.exception))
+            self.assertFalse((self.work / request['path']).exists())
 
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
