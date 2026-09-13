@@ -63,6 +63,33 @@ setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，�
 
 已知边界：无边界绑定的搜索从 `/` 等挂载点根开始时，`/proc`、`/sys` 下的伪文件（如 environ、cmdline）同样会被扫描命中——这与文件工具可直读任意路径的 unrestricted 语义一致；如不希望搜索噪声，把搜索路径收窄到具体目录。手工运行 `build/cli/recovery.js` 不带 `--workspace` 时只向上寻找旧无名 profile，命名绑定依赖 setup 登记的显式钩子参数。新版生成的 profile 含 `bindingName`/`directoryScope` 字段，旧版本程序回退后不识别（解析报错）；回退需删除对应 profile 并重新 setup。
 
+### 调整已有绑定（inspect / update）
+
+已有绑定无需重新填写 SSH 信息即可调整策略参数。对 Agent 说明：
+
+> 请用 remote_setup 的 action=inspect 查看这个项目的绑定配置和 revision，然后按我要调整的字段执行 action=update。
+
+- `action: "inspect"`（提供 `localRoot`，多绑定时加 `bindingName`）返回脱敏配置、生效策略（含默认值）、凭据来源说明和 `revision`。凭据永不回显，inspect 不连接 SSH。
+- `action: "update"` 必须带上 inspect 返回的 `revision`：只改显式提供的字段，其余原样保留；revision 过期或配置已被并发修改会返回 SETUP_CONFLICT，重新 inspect 后再试。
+- 可更新字段：`policy`（组内深合并，见下表）、`directoryScope`、`pythonPath`。首次配置时也可以直接随调用提供 `policy`。
+- 服务器连接、认证、remoteRoot、remoteStateDir、localStateDir、workspaceId 属身份字段，update 显式修改即拒绝（SETUP_IDENTITY_LOCKED）：换目标请用新 `bindingName` 新建绑定，旧绑定保留到任务和状态清理完成。
+
+policy 组与默认值（未写的字段按默认生效）：
+
+| 组 | 字段 | 默认值 |
+|---|---|---|
+| limits | localWorkspaceBytes / remoteWorkspaceBytes | 各 10737418240（10 GiB，两端每工作区） |
+| retention | confirmedTaskLogMs | 259200000（3 天，自 ack 起） |
+| retention | confirmedResultMs / unconfirmedResultMs / unknownRecordMs | 各 2592000000（30 天） |
+| retention | interruptedTransferDataMs / readTokenMs | 各 259200000（3 天） |
+| search | respectGitignore / includeHidden | false / true（.git 内部始终排除） |
+| search | scanBudgetBytes / timeBudgetMs / pageSizeBytes | 536870912 / 10000 / 65536 |
+| maintenance | intervalMs / maxItemsPerRun / timeBudgetMs | 3600000 / 100 / 2000 |
+
+生效时点：策略保存后由消费方在下一次操作或维护周期读取新值，无需重启；运行中的操作沿用启动时快照。保留期限变更只影响新生成记录，已有记录的到期时间不变。`directoryScope` 与 `pythonPath` 在工作区 MCP 服务下次启动时生效。额度预留（本机 SpaceLedger 自 #16 起每次额度检查经 loadPolicy 重读 `limits.localWorkspaceBytes`）与到期清理（见「到期回收与在线维护」）已接入强制执行；搜索预算的强制执行仍属后续票据，当前仅完成存储、校验与按次重读。
+
+手工编辑 profile 中的 policy 节同样受 schema 校验：未知字段、非正整数或布尔类型错误会让配置加载失败并明确报出字段位置。
+
 ### 手工入口（保留兼容）
 
 在本机为一个远端项目建立专用目录，例如 `D:\RemoteWork\example`。该目录保存接入配置和本机输出，Linux 源码不会自动同步到这里。
@@ -118,10 +145,20 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 }
 ```
 
-- `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。单文件 16 MiB 上限同样适用于区间读取。
+- `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。文件本身无体积上限（#9 起流式交付）。
 - `truncated` 表示本次请求区间是否因上限未返回完整；`nextOffset` 给出可继续读取的字节位置，`startOffset` / `endOffset` 标出本次实际范围。
 - `complete` 表示当前凭据的已知范围覆盖整个文件（来自实际读取及自身编辑后的继承）。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
-- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖、上传覆盖、删除或移动须具有完整已知范围。同一文件版本变化后旧凭据失效。
+- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖与上传覆盖绑定 metadataOnly 观察版本（#10/#13），无需完整已读；下载覆盖绑定本机目标观察版本（#14，见下）。同一文件版本变化后旧凭据失效。
+
+### 移动、删除与目录管理（远端 Shell）
+
+`remote_move` / `remote_delete` / `remote_mkdir` / `remote_rmdir` 已移除（ADR 0007 / #20）。这些操作通过远端 Shell 完成，即用后台任务执行 `mv`、`rm`、`mkdir`、`rmdir` 等命令：
+
+```text
+node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <会话标识> --command "mv old/name new/name"
+```
+
+**Shell 移动删除不再拥有 readToken 保护**：远端 Shell 不检查读取凭据、已读范围或文件版本，防误操作依靠操作规范与所在客户端的命令审查。这不代表任何未来删除请求自动获授权——实际操作仍需遵循当前任务范围和用户指令。文件工具的读取凭据、精确编辑与版本覆盖保护不受影响。
 
 传入 `offset` 后按该位置读取至文件尾（再受单次上限限制），不再使用 fromLine/toLine 作为区间终点；它不是绑定原区间的游标。文本 offset 必须位于 UTF-8 字符边界，使用返回的 nextOffset 可避免手算。二进制使用 `encoding: "base64"` 与字节 offset。
 
@@ -131,7 +168,50 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 
 例如 `read → token A → edit → token B → edit → token C`。若初始只读了一部分文件，后续依然不能凭此覆盖整个文件；外部修改仍会使新凭据失效。
 
-如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload/delete/move 不自动续期。
+如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload 不自动续期。
+
+### 上传大文件（可续传传输事务）
+
+`remote_upload` 任意大小可用（默认 1 MiB 分块、两端流式 SHA-256 校验，文件字节不经模型）。默认 `action=start` 在单次调用预算（`budgetMs`，默认 55 秒）内驱动传输：
+
+- 正常完成返回 `state=completed` 与 `transferId`、`sha256`、`bytesWritten`。
+- 预算耗尽未传完时返回 `state=transferring`、`confirmedOffset` 与 `budgetExhausted=true`；用 `action=resume` 加同一 `transferId` 继续，只补未确认数据。预算也可调大（上限 600 秒）。
+- 传输中出错（断线、超时）时错误响应携带 `transferId`，同样以 resume 接回；本机源文件在传输期间变化则拒绝续传，需重新 start。
+- `action=status` 只读查询进度，无副作用。
+- 覆盖已有远端目标须先 `remote_read metadataOnly` 拿版本，再带 `overwrite=true` 与 `expectedVersion`；默认目标必须不存在。
+- `action=cancel` 主动取消（#15）：远端确认停止后才删除未提交的临时数据；已完成的提交不回滚（返回 `completed` 而非 `cancelled`）；结果未知时返回 `TRANSFER_STATE_UNKNOWN` 不猜。取消后 resume 只观察不复活。
+- `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
+
+### 下载大文件（可续传传输事务）
+
+`remote_download` 自 #14 起与上传对称：远端源绑定其 `m1-` 观察版本，默认 1 MiB 分块、每块摘要校验后确认，两端各自流式 SHA-256；文件字节不经模型，**不签发 readToken**（下载不授予已读范围）。默认 `action=start` 在单次调用预算（`budgetMs`，默认 55 秒）内驱动：
+
+- 正常完成返回 `state=completed` 与 `transferId`、`sha256`、`bytesWritten`、`blocksFetched`。
+- 预算耗尽未传完时返回 `state=transferring`、`confirmedOffset` 与 `budgetExhausted=true`；用 `action=resume` 加同一 `transferId` 继续，只补未确认数据（接收临时文件与块清单持久化在本机状态目录，恢复时先重校验再续传）。
+- 断线或本机进程退出后，同样以 resume 接回；错误响应携带 `transferId`。
+- 远端源文件在传输期间变化（`m1-` 版本不符）则拒绝原传输并置 `failed`（`TRANSFER_SOURCE_CHANGED`），需重新 start。
+- 本机目标默认必须不存在；覆盖须带 `overwrite=true` 与本机目标观察版本 `l1-<size>:<mtimeMs>`（首次拒绝的 `FILE_CONFLICT` 消息会给出该值），提交前复核，目标变化拒绝覆盖。
+- 本机磁盘写满（`STORAGE_FULL`）时清理接收临时文件后可重试，续传从零开始。
+- `action=status` 只读查询进度，无副作用。
+- `action=cancel` 主动取消（#15）：先停远端发送方，再删除本机未提交的接收临时数据与块清单、释放空间登记；已完成的提交不回滚；取消撞上提交窗口时按回执/意图证据核对，证据不足返回 `TRANSFER_STATE_UNKNOWN` 且不动数据。取消后 resume 只观察不复活。
+- `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
+
+### 传输的后台等待与恢复（#15）
+
+大文件传输的后台体验与任务同模式：durable `transferId` 跨进程有效，等待器由 ZCode 原生后台 Shell 执行，完成通知回到原对话。
+
+```text
+node <安装目录>/build/cli/job.js transfer start --direction download --remote <远端源> --local <本机目标> --workspace <配置文件> --session <会话标识> [--budget <毫秒>]
+node <安装目录>/build/cli/job.js transfer wait --transfer-id <持久传输编号> --workspace <配置文件> --session <会话标识>
+node <安装目录>/build/cli/job.js transfer status|resume|cancel|ack --transfer-id <持久传输编号> ...
+node <安装目录>/build/cli/job.js transfer pending --workspace <配置文件> --session <会话标识>
+```
+
+- `transfer start` 单次预算内驱动；预算内完成输出 `transfer-result`，否则输出 `transfer-started` 与 durable 编号。也可继续用 MCP `remote_upload`/`remote_download` 的 start/resume 驱动，两种入口操作同一事务。
+- `transfer wait` 是后台等待器：循环驱动至终态，**期间不输出块级进度**，只在完成/失败/取消时输出一行 `transfer-result`（含 `acknowledgementRequired`）；断线按有界退避重试；`--wait-timeout` 到点输出 `transfer-wait-paused` 退出（durable 进度保留，重新 wait 即续）。
+- 等待器被结束不取消传输；MCP 服务与本机重启后，用同一 `transferId` 重挂即可继续（只重传未确认数据）。
+- 继续原对话时，恢复钩子除任务外还会列出同会话未确认的传输（离线读取本机登记），并给出 `transfer wait` 重挂模板；不要对同一目标重新 start 创建新传输。
+- 传输结果同样保持 pending 直到显式 `transfer ack`（或 MCP `action=ack`）；cancelled 结果也需要确认消费。
 
 ### 后台任务
 
@@ -163,27 +243,43 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 | 项目 | 首版行为 |
 |---|---|
 | 目录边界 | 默认限制在 remoteRoot 内；仅用户显式选择 unrestricted 后文件工具可按绝对路径访问远端任意位置，其余文件保护不变 |
-| 文件大小 | 专用读写、上传、下载单文件最多 16 MiB；更大文件明确报错 |
-| 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖、删除、移动需要完整已知范围 |
-| 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期 |
+| 文件大小 | 读取与编辑无上限（流式，#9/#10）；上传与下载均无上限，走可续传传输事务（#13/#14）。inline 写入（text/base64）解码后最大 16 MiB，更大内容走上传 |
+| 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖须显式绑定观察版本。移动、删除与目录管理不属文件工具（#20 / ADR 0007），走远端 Shell，无 readToken 保护 |
+| 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期。已提交写入的簿记失败报 `COMMITTED_UNCONFIRMED`（文件已写入，须重读后再操作，不得当未写入盲重试） |
 | 编码 | 文本 UTF-8/BOM，保留原 CRLF 约定、权限与组；混合换行不整体重排。其他编码按 base64 传输 |
 | 链接 | 经过符号链接的修改、多硬链接和非自有文件的替换明确不支持 |
-| 查找 | 目录分页；递归 glob 查找最多 50,000 个条目 |
-| 搜索 | Python 字面量搜索，跳过 .git、二进制和大于 16 MiB 的文件；单次最多扫描 64 MiB。不会模拟 rg 的正则或 .gitignore 语义 |
+| 搜索 | 字面量、大小写敏感、UTF-8；Linux 按 rg → GNU grep → Python 分块搜索选择后端，三后端结果一致（#11）。默认不读 .gitignore、包含隐藏文件，.git 内部始终排除；无单文件大小排除，200 MiB 网表可搜索；每页结果 64 KiB、默认扫描预算 512 MiB / 10 秒，预算耗尽返回 partial 与可续游标 |
+| 查找 | 递归 glob 按文件名或相对路径匹配，目录分页；最多 50,000 个条目；rg 可用时用其枚举、否则 Python 遍历，结果一致（#12） |
 | rg | VM 未安装；Shell 直接执行 rg 会按真实退出结果返回。可由用户另行提供兼容的离线 rg，不自动安装 |
 | 工具返回 | 默认有界；read 只授权实际返回片段，edit 续期不扩大到未读间隔。文件文本输出按 JSON 序列化预算限制 |
-| 命令日志 | stdout/stderr 分开持久保存。默认每任务合计 256 MiB，超限终止受管理命令并明确 OUTPUT_LIMIT |
+| 命令日志 | stdout/stderr 分开持久保存。默认每任务合计 256 MiB，超限终止受管理命令并明确 OUTPUT_LIMIT；工作区额度耗尽时停止保存新日志并标注 STORAGE_LIMIT（命令继续运行） |
 | 日志展示 | 本机最多展示 64 KiB 前缀，其余可用 remote_output 的字节游标或 tail=true 读取；不会为丢弃内容下载完整巨量日志 |
 
-普通 Shell 命令仍可写文件。这套机制保护专用文件工具的开发操作，不拦截所有 Shell 写入。版本检查与原子替换之间，对不遵守协作锁的外部写入者仍有竞争窗口。无覆盖移动使用同文件系统 link/unlink；两步间崩溃可能保留两个名字，后续多硬链接检查会明确拒绝继续修改。
+普通 Shell 命令仍可写文件。这套机制保护专用文件工具的开发操作，不拦截所有 Shell 写入。版本检查与原子替换之间，对不遵守协作锁的外部写入者仍有竞争窗口。文件工具的创建/覆盖提交使用同文件系统临时文件加原子替换；移动与目录管理属 Shell 命令（#20），本服务不约束其执行方式，操作前自行核对目标。
 
-## 日志清理
+## 到期回收与在线维护
+
+任务和传输的结果、日志、读取凭据、旧 helper 与遗留临时文件按保留规则自动回收，无需定期手工清理：
+
+- **两级触发**：远端查询类动作（status/output/transfer_status 与文件查询）顺带做一次有界懒清理（60 秒节流）；工作区 MCP 每个工具调用与 job CLI 每次运行触发本机维护检查，距上一轮完成超过 `policy.maintenance.intervalMs`（默认 1 小时）才真正执行一轮——每轮先回收本机登记（任务与传输记录同规则），再驱动远端一轮，两端各自有互斥锁、持久游标与项数/时长双预算（默认 100 项/2 秒），预算中断下轮从游标续扫。
+- **离线补做**：完成时间戳持久化在本机状态目录；ZCode 退出或 SSH 断连期间到期不保证立即删除，重连后第一次操作自动补做。没有远端守护进程或 cron。
+- **期限**（policy.retention 可配，变更只影响新记录）：已确认任务日志自 ack 起 3 天；已确认任务/传输结果记录自 ack 起 30 天；已结束未确认结果自结束起 30 天；结果 unknown 的记录自首次观察起 30 天（查询不续期）；中断传输数据自最后实际进展（无进展则注册）起 3 天。
+- **读取凭据**：readToken 连续 3 天无成功相关读取或编辑即失效，失效的凭据记录与索引由维护轮物理删除；被回收后编辑按 READ_REQUIRED 拒绝，重新读取需要的片段即可继续编辑（旧已读范围不会复活）。
+- **旧 helper 镜像**：远端 helpers/ 只保留正在运行的版本和仍被运行中进程引用的版本，其余在下一轮维护删除。升级期间的旧版本客户端重启后会自动重装所需镜像；回退部署请使用对应的离线包。
+- **遗留临时文件**：编辑、写入与传输自身产生的临时文件在操作成功或明确失败时立即清理；崩溃残留（如断线时同目录下的 `.ssh-mcp-*` 临时文件）在下一次维护轮按账本登记、对象身份与持有进程三重证据核实后回收。账本查不到归属的文件不属于本服务，永远不会被自动删除；证据不全的残留保留最小管理记录并计入空间额度，继续等待核实。
+- **回收后的旧请求**：标识一旦回收即被拒绝（REQUEST_EXPIRED_OR_UNKNOWN），不会因记录不存在而重新执行命令、重复提交传输或再次覆盖文件；传输过期后需重新注册传输，不伪装可续传。
+- **显式执行**：`node build/cli/job.js maintain --workspace <配置文件> --session manual-maintenance` 立即跑一轮（同样受 1 小时节流）并输出两端摘要。
+- **按需查看用量（#19）**：`remote_workspace` 传 `includeStorage: true` 时，返回（且仅返回）两端空间汇总：各自 `usedBytes / reservedBytes / limitBytes`、分类用量（状态目录 + 已登记临时 + 预留）、资源计数与最近一轮清理的时间和计数，序列化后不超过 4 KiB。默认不传该参数时响应与之前完全一致（不含统计）。远端不可达或统计失败时该端返回 `status: "unknown"` 与原因，不给出任何数字（不写零），本机一侧仍正常报告。计量与额度检查同口径：目标同目录的传输/编辑临时文件计入，提交后的正式目标不计入。统计与清理都不调用模型。
+
+任务日志同时受工作区空间额度约束（与 256 MiB 每任务上限独立）：额度耗尽时停止保存新日志并明确标注 `STORAGE_LIMIT` 截断，命令本身继续运行不受影响。
+
+## 手动日志清理（首版入口，保留兼容）
 
 ```powershell
 node build/cli/job.js cleanup --workspace <配置文件> --session manual-maintenance
 ```
 
-默认只清理已确认至少 7 天的终态日志；`--retention-days` 可调整，0 表示立即清理已确认日志。运行中任务和未确认结果不被清理。请求、结果与去重记录继续保留，旧任务编号不会因此再次执行。清理过的日志返回 LOGS_PURGED，不伪装成空输出。
+默认只清理已确认至少 7 天的终态日志；`--retention-days` 可调整，0 表示立即清理已确认日志。运行中任务和未确认结果不被清理。请求、结果与去重记录继续保留，旧任务编号不会因此再次执行。清理过的日志返回 LOGS_PURGED，不伪装成空输出。自动维护（上一节）不使用该入口的 7 天默认值。
 
 ## 离线交付
 

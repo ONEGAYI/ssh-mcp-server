@@ -9,7 +9,9 @@ export async function createWorkspaceRuntime(profilePath: string) {
   ssh.setConfig(config.sshConfigs, config.connectionName);
   const remote = new RemoteAgentClient(ssh, config);
   const tasks = new TaskService({ call<T>(action: string, request: Record<string, unknown>) {
-    if (action === "start") ssh.assertCommandAllowed(request.command as string, config.connectionName);
+    // Both entries carry a command: task_register (v2 creation) and the legacy
+    // start replay (validation only; creation is refused remotely).
+    if (action === "task_register" || action === "start") ssh.assertCommandAllowed(request.command as string, config.connectionName);
     return remote.call<T>(action, request);
   } }, config.localStateDir, config.identity);
   return { config, ssh, remote, tasks,

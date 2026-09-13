@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { spawnSync } from 'node:child_process';
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
 import { TaskService } from '../build/services/task-service.js';
-import { configureFromTool } from '../build/core/setup-server.js';
+// Namespace import keeps the whole suite runnable while inspect/update land (ticket #18).
+import * as setupServer from '../build/core/setup-server.js';
+const { configureFromTool, setupFromTool } = setupServer;
 
 it('named bindings coexist with legacy profiles and recover only their own tasks', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-bindings-'));
@@ -35,7 +37,11 @@ it('named bindings coexist with legacy profiles and recover only their own tasks
     const jobs = [];
     for (const result of results) {
       const config = await loadWorkspaceConfig(result.profilePath);
-      const tasks = new TaskService({ call: async (_, r) => ({ jobId: r.jobId, state: 'running' }) }, config.localStateDir, config.identity);
+      let assigned = 0;
+      const tasks = new TaskService({ call: async (action, r) => {
+        if (action === 'task_register') return { jobId: config.workspaceId + '-job-' + (++assigned), state: 'prepared' };
+        return { jobId: r.jobId, state: 'running' };
+      } }, config.localStateDir, config.identity);
       jobs.push((await tasks.start({ sessionId: 'owner', cwd: config.remoteRoot, command: 'build-' + jobs.length })).jobId);
       await tasks.start({ sessionId: 'someone-else', cwd: config.remoteRoot, command: 'private-other-session' });
     }
@@ -223,5 +229,247 @@ it('setup accepts host and SSH agent details without requiring a separate SSH co
     assert.equal(auth.port, 1);
     assert.equal(auth.agent, 'pageant');
     assert.equal(auth.password, undefined);
+  } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+const dayMs = 86400000;
+const gib = 10737418240;
+
+it('inspect returns sanitized configuration with a revision and effective policy defaults', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-inspect-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'inspect-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, bindingName: 'eda-main', sshConfigFile: auth,
+      connectionName: 'eda', remoteRoot: '/main', remoteStateDir: '/state' });
+    const missing = await setupFromTool({ action: 'inspect' });
+    assert.equal(missing.status, 'needs_input', 'inspect without a project directory asks for one instead of guessing');
+    const inspected = await setupFromTool({ action: 'inspect', localRoot: root, bindingName: 'eda-main' });
+    assert.equal(inspected.status, 'inspected');
+    assert.equal(inspected.profilePath, configured.profilePath);
+    assert.match(inspected.revision, /^[0-9a-f]{64}$/, 'revision identifies the inspected profile content');
+    assert.equal(inspected.config.workspaceId, JSON.parse(await readFile(configured.profilePath, 'utf8')).workspaceId);
+    assert.equal(inspected.config.remoteRoot, '/main');
+    assert.equal(inspected.config.remoteStateDir, '/state');
+    assert.equal(inspected.config.directoryScope, 'restricted', 'absent scope resolves to restricted');
+    assert.equal(inspected.config.pythonPath, '/usr/bin/python3', 'absent pythonPath resolves to the default');
+    assert.equal(inspected.config.policy.limits.localWorkspaceBytes, gib);
+    assert.equal(inspected.config.policy.limits.remoteWorkspaceBytes, gib);
+    assert.equal(inspected.config.policy.retention.confirmedTaskLogMs, 3 * dayMs);
+    assert.equal(inspected.config.policy.retention.confirmedResultMs, 30 * dayMs);
+    assert.equal(inspected.config.policy.retention.unconfirmedResultMs, 30 * dayMs);
+    assert.equal(inspected.config.policy.retention.unknownRecordMs, 30 * dayMs);
+    assert.equal(inspected.config.policy.retention.interruptedTransferDataMs, 3 * dayMs);
+    assert.equal(inspected.config.policy.retention.readTokenMs, 3 * dayMs);
+    assert.equal(inspected.config.policy.search.respectGitignore, false);
+    assert.equal(inspected.config.policy.search.includeHidden, true);
+    assert.equal(inspected.config.policy.search.scanBudgetBytes, 536870912);
+    assert.equal(inspected.config.policy.search.timeBudgetMs, 10000);
+    assert.equal(inspected.config.policy.search.pageSizeBytes, 65536);
+    assert.equal(inspected.config.policy.maintenance.intervalMs, 3600000);
+    assert.equal(inspected.config.policy.maintenance.maxItemsPerRun, 100);
+    assert.equal(inspected.config.policy.maintenance.timeBudgetMs, 2000);
+    assert.equal(inspected.authentication.source, auth, 'inspect names where credentials live without opening them');
+    assert.ok(inspected.authentication.note.length > 0);
+    assert.doesNotMatch(JSON.stringify(inspected), /inspect-secret/, 'credentials must never be echoed');
+    assert.equal(JSON.parse(await readFile(configured.profilePath, 'utf8')).policy, undefined,
+      'defaults are effective values, not materialized into the profile');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('update changes only named fields and preserves everything else', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'update-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: auth, connectionName: 'eda',
+      remoteRoot: '/main', remoteStateDir: '/state', pythonPath: '/usr/bin/python39', localStateDir: join(root, 'state'),
+      policy: { limits: { localWorkspaceBytes: 1073741824 } } });
+    const before = await setupFromTool({ action: 'inspect', localRoot: root });
+    const updated = await setupFromTool({ action: 'update', localRoot: root, revision: before.revision,
+      policy: { search: { scanBudgetBytes: 1048576 } } });
+    assert.equal(updated.status, 'updated');
+    assert.notEqual(updated.revision, before.revision);
+    assert.deepEqual(updated.changed, ['policy.search.scanBudgetBytes']);
+    assert.equal(updated.policy.search.scanBudgetBytes, 1048576, 'response reports the effective policy after the change');
+    assert.equal(updated.policy.limits.localWorkspaceBytes, 1073741824, 'unrelated stored policy survives');
+    assert.match(updated.effective, /never recalculated/, 'the result explains that retention changes are not retroactive');
+    const profile = JSON.parse(await readFile(configured.profilePath, 'utf8'));
+    assert.equal(profile.policy.search.scanBudgetBytes, 1048576);
+    assert.equal(profile.policy.limits.localWorkspaceBytes, 1073741824, 'only named policy leaves change');
+    assert.equal(profile.pythonPath, '/usr/bin/python39');
+    assert.equal(profile.localStateDir, join(root, 'state'));
+    assert.equal(profile.remoteRoot, '/main');
+    assert.equal(profile.remoteStateDir, '/state');
+    assert.equal(profile.connectionName, 'eda');
+    assert.equal(profile.sshConfigFile, auth);
+    const after = await setupFromTool({ action: 'inspect', localRoot: root });
+    assert.equal(after.revision, updated.revision);
+    assert.equal(after.config.policy.search.scanBudgetBytes, 1048576);
+    assert.equal(after.config.policy.limits.localWorkspaceBytes, 1073741824);
+    assert.equal(after.config.policy.search.pageSizeBytes, 65536, 'defaults still fill unnamed policy leaves');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('update rejects stale revisions and concurrent changes without half-writes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-conflict-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'conflict-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: auth, connectionName: 'eda',
+      remoteRoot: '/main', remoteStateDir: '/state' });
+    const profilePath = configured.profilePath;
+    const first = await setupFromTool({ action: 'inspect', localRoot: root });
+    const request = { action: 'update', localRoot: root, revision: first.revision, policy: { retention: { readTokenMs: 3600000 } } };
+    await setupFromTool(request);
+    const afterFirst = await readFile(profilePath, 'utf8');
+    await assert.rejects(setupFromTool(request), { code: 'SETUP_CONFLICT' },
+      'a second writer reusing the inspected revision must be rejected, not merged');
+    assert.equal(await readFile(profilePath, 'utf8'), afterFirst, 'a rejected update leaves no half-written profile');
+    const applied = await setupFromTool({ action: 'inspect', localRoot: root });
+    const tampered = JSON.parse(afterFirst);
+    tampered.pythonPath = '/usr/bin/python3.11';
+    await writeFile(profilePath, JSON.stringify(tampered, null, 2) + '\n');
+    await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision: applied.revision,
+      policy: { search: { includeHidden: false } } }), { code: 'SETUP_CONFLICT' },
+      'an external edit invalidates the inspected revision');
+    assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).pythonPath, '/usr/bin/python3.11',
+      'the external edit itself stays intact');
+    const leftovers = (await readdir(root)).filter(name => name.endsWith('.tmp'));
+    assert.deepEqual(leftovers, [], 'failed updates must not leave temporary files behind');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('update refuses identity and authentication changes and points at new bindings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-identity-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'identity-secret' },
+      other: { host: '127.0.0.2', port: 22, username: 'test', password: 'identity-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, bindingName: 'eda-main', sshConfigFile: auth,
+      connectionName: 'eda', remoteRoot: '/main', remoteStateDir: '/state' });
+    const original = await readFile(configured.profilePath, 'utf8');
+    const inspected = await setupFromTool({ action: 'inspect', localRoot: root, bindingName: 'eda-main' });
+    const attempts = [
+      { remoteRoot: '/elsewhere' }, { remoteStateDir: '/other-state' }, { localStateDir: join(root, 'moved-state') },
+      { connectionName: 'other' }, { sshConfigFile: join(root, 'other.json') }, { host: '10.0.0.9' }, { port: 2222 },
+      { username: 'attacker' }, { privateKey: join(root, 'key') }, { sshAgent: 'other-agent' }, { workspaceId: 'brand-new' },
+    ];
+    for (const attempt of attempts) {
+      await assert.rejects(setupFromTool({ action: 'update', localRoot: root, bindingName: 'eda-main',
+        revision: inspected.revision, ...attempt }),
+        error => error.code === 'SETUP_IDENTITY_LOCKED' && /new binding/.test(error.message), JSON.stringify(attempt));
+    }
+    assert.equal(await readFile(configured.profilePath, 'utf8'), original, 'rejected identity changes leave the profile untouched');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('directoryScope updates in place without rekeying the binding identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-scope-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'scope-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: auth, connectionName: 'eda',
+      remoteRoot: '/home/user', remoteStateDir: '/state' });
+    const before = await loadWorkspaceConfig(configured.profilePath);
+    assert.equal(before.directoryScope, 'restricted');
+    let inspected = await setupFromTool({ action: 'inspect', localRoot: root });
+    const opened = await setupFromTool({ action: 'update', localRoot: root, revision: inspected.revision,
+      directoryScope: 'unrestricted' });
+    assert.deepEqual(opened.changed, ['directoryScope']);
+    assert.equal(JSON.parse(await readFile(configured.profilePath, 'utf8')).directoryScope, 'unrestricted');
+    const flipped = await loadWorkspaceConfig(configured.profilePath);
+    assert.equal(flipped.directoryScope, 'unrestricted');
+    assert.equal(flipped.identity, before.identity, 'scope deliberately stays out of identity so task ownership survives');
+    inspected = await setupFromTool({ action: 'inspect', localRoot: root });
+    const closed = await setupFromTool({ action: 'update', localRoot: root, revision: inspected.revision, directoryScope: 'restricted' });
+    const stored = JSON.parse(await readFile(configured.profilePath, 'utf8'));
+    assert.equal(stored.directoryScope, undefined, 'restricted is stored as the canonical absent value');
+    assert.equal(closed.policy.maintenance.intervalMs, 3600000);
+    assert.equal((await loadWorkspaceConfig(configured.profilePath)).identity, before.identity);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('update validates its inputs and reports missing bindings and revisions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-invalid-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'invalid-secret' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: auth, connectionName: 'eda',
+      remoteRoot: '/main', remoteStateDir: '/state' });
+    const profilePath = configured.profilePath;
+    const inspected = await setupFromTool({ action: 'inspect', localRoot: root });
+    const revision = inspected.revision;
+    await assert.rejects(setupFromTool({ action: 'update', localRoot: root }), { code: 'SETUP_REVISION_REQUIRED' },
+      'update without a revision is a usage error, not a silent overwrite');
+    for (const bad of [
+      { policy: { search: { scanBudgetBytes: -1 } } }, { policy: { search: { scanBudgetBytes: 'big' } } },
+      { policy: { quotas: {} } }, { policy: { limits: { localWorkspaceBytes: 0 } } },
+      { policy: { retention: { readTokenMs: 1.5 } } },
+    ]) {
+      await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision, ...bad }),
+        { code: 'SETUP_INVALID_POLICY' }, JSON.stringify(bad));
+    }
+    await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision, directoryScope: 'sometimes' }),
+      { code: 'SETUP_INVALID_SCOPE' });
+    await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision, pythonPath: 'python3' }),
+      { code: 'SETUP_INVALID_PATH' });
+    assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).policy, undefined,
+      'all rejected updates together leave no policy behind');
+    const empty = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-missing-'));
+    try {
+      await assert.rejects(setupFromTool({ action: 'inspect', localRoot: empty }), { code: 'SETUP_PROFILE_NOT_FOUND' });
+      await assert.rejects(setupFromTool({ action: 'update', localRoot: empty, revision: '0'.repeat(64) }),
+        { code: 'SETUP_PROFILE_NOT_FOUND' });
+    } finally { await rm(empty, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('update preserves authentication files byte-for-byte and never echoes them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-auth-'));
+  try {
+    // Explicit host auth makes setup generate .ssh-mcp-connection.json; updates must not touch it.
+    await writeFile(join(root, 'id_test'), 'PRIVATE KEY MATERIAL update-auth-marker');
+    const configured = await configureFromTool({ localRoot: root, remoteRoot: '/work', remoteStateDir: '/state',
+      host: '127.0.0.1', username: 'test', privateKey: join(root, 'id_test'), localStateDir: join(root, 'state') });
+    const connectionPath = join(root, '.ssh-mcp-connection.json');
+    const connectionBefore = await readFile(connectionPath, 'utf8');
+    const inspected = await setupFromTool({ action: 'inspect', localRoot: root });
+    assert.doesNotMatch(JSON.stringify(inspected), /update-auth-marker/, 'inspect never reads private key contents');
+    await setupFromTool({ action: 'update', localRoot: root, revision: inspected.revision,
+      policy: { limits: { remoteWorkspaceBytes: 2147483648 } } });
+    assert.equal(await readFile(connectionPath, 'utf8'), connectionBefore,
+      'a policy update must not rewrite generated authentication parameters');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('setup MCP exposes inspect and update through the protocol surface', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-protocol-update-'));
+  const client = new Client({ name: 'protocol-update', version: '1' });
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'protocol-secret' } }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+    const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
+    assert.ok(tool, 'remote_setup is advertised');
+    const properties = Object.keys(tool.inputSchema.properties);
+    for (const field of ['action', 'revision', 'policy']) assert.ok(properties.includes(field), `${field} is part of the schema`);
+    const created = await client.callTool({ name: 'remote_setup', arguments: { localRoot: root, bindingName: 'eda-main',
+      connectionName: 'eda', remoteRoot: '/main', remoteStateDir: '/state' } });
+    assert.equal(created.isError, undefined, JSON.stringify(created));
+    const profilePath = JSON.parse(created.content[0].text).profilePath;
+    const inspected = await client.callTool({ name: 'remote_setup', arguments: { action: 'inspect', localRoot: root, bindingName: 'eda-main' } });
+    assert.equal(inspected.isError, undefined, JSON.stringify(inspected));
+    assert.doesNotMatch(JSON.stringify(inspected), /protocol-secret/);
+    const revision = JSON.parse(inspected.content[0].text).revision;
+    const noRevision = await client.callTool({ name: 'remote_setup', arguments: { action: 'update', localRoot: root,
+      bindingName: 'eda-main', policy: { search: { timeBudgetMs: 20000 } } } });
+    assert.ok(noRevision.isError, JSON.stringify(noRevision));
+    assert.equal(JSON.parse(noRevision.content[0].text).code, 'SETUP_REVISION_REQUIRED');
+    const updated = await client.callTool({ name: 'remote_setup', arguments: { action: 'update', localRoot: root,
+      bindingName: 'eda-main', revision, policy: { search: { timeBudgetMs: 20000 } } } });
+    assert.equal(updated.isError, undefined, JSON.stringify(updated));
+    assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).policy.search.timeBudgetMs, 20000);
   } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
 });

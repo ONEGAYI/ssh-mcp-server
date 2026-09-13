@@ -148,7 +148,15 @@ setup 服务负责首次接入；日常文件和任务操作使用它生成的�
 
 `remote_read` 支持指定行区间、字节续读和截断标记。**成功的 remote_edit 会返回新凭据，下一次编辑无需重复 read。**
 
-保护仍然有效：未读部分不能直接编辑，整文件覆盖需要完整已知范围；外部修改会使凭据失效。若返回 `written=true` 且 `rereadRequired=true`，说明编辑已经提交但凭据更新未确认，应重新读取当前内容，不能盲目重复编辑。
+保护仍然有效：未读部分不能直接编辑，外部修改会使凭据失效，整文件覆盖须显式声明并绑定观察版本。若返回 `written=true` 且 `rereadRequired=true`，说明编辑已经提交但凭据更新未确认，应重新读取当前内容，不能盲目重复编辑。
+
+### 移动、删除与目录管理
+
+没有专用的移动/删除/建目录工具（remote_move 等已移除）。这些操作直接用远端 Shell 完成：
+
+> 请用后台任务在远端执行 `mv src/old.py src/new.py`，完成后核对结果。
+
+**Shell 移动删除不设 readToken 保护**，也不检查已读范围或文件版本；防误操作依靠操作规范与 ZCode 的命令审查。这不代表任何未来删除请求自动获授权——实际操作仍需遵循当前任务范围和用户指令。文件读取、精确编辑与版本覆盖的保护不受影响。
 
 ### 后台构建与完成回传
 
@@ -172,10 +180,23 @@ Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `ru
 
 取消需调用 `remote_cancel` 或 job CLI 的 cancel。关闭本机等待程序、SSH 断开和等待超时都不等于取消远端任务。
 
+### 大文件传输的后台等待与取消
+
+大文件上传/下载（`remote_upload` / `remote_download`，或 job CLI 的 `transfer start`）返回持久传输编号；单次预算内未传完时，用原生后台 Shell 运行等待器：
+
+```text
+node <安装目录>/build/cli/job.js transfer wait --transfer-id <传输编号> --workspace <配置文件> --session <会话标识>
+```
+
+等待器静默驱动至完成，只在结束时输出一行结果（不逐块报告进度）；断线自动退避重试。ZCode 重启后用同一编号继续（只补未确认数据），恢复钩子也会列出未确认的传输。
+
+取消传输用 `action=cancel` 或 `transfer cancel`：确认停止后，未提交的临时数据立即释放；已完成的提交不回滚。处理完结果后同样用 `action=ack` / `transfer ack` 确认。
+
 ## 7. 常见问题
 
 | 现象 | 处理方式 |
 |---|---|
+| 找不到 remote_move / remote_delete / remote_mkdir / remote_rmdir | 这些工具已移除，改用远端 Shell 命令（后台任务执行 mv、rm、mkdir 等）；Shell 侧不设 readToken 保护 |
 | 只有 remote_setup，没有文件工具 | 完成 setup，打开它返回的本机项目；必要时重新打开项目，检查生成的项目 MCP 是否启用 |
 | 首条消息没有恢复信息 | 先检查首次钩子信任是否确认，再继续原对话；不要让 Agent 猜 sessionId |
 | 返回 SETUP_CONFLICT | 检查已有工作区配置是否指向另一个目标或存在同名服务；不要直接覆盖旧配置 |

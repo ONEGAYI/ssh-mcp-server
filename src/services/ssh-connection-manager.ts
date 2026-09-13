@@ -462,6 +462,30 @@ export class SSHConnectionManager {
     name?: string,
     options: { timeout?: number } = {},
   ): Promise<{ stdout: string; stderr: string; exitCode: number; signal?: string }> {
+    const result = await this.runInputExchange(command, input, name, options);
+    return { ...result, stdout: result.stdout.toString("utf8") };
+  }
+
+  /** Binary twin of executeInputCommand: stdout stays an untouched Buffer.
+   *
+   * Download block fetches frame their response as raw bytes on stdout
+   * (issue #14); decoding them as UTF-8 text would corrupt the payload, so
+   * the bytes are concatenated verbatim. */
+  public async executeBinaryInputCommand(
+    command: string,
+    input: Buffer,
+    name?: string,
+    options: { timeout?: number } = {},
+  ): Promise<{ stdout: Buffer; stderr: string; exitCode: number; signal?: string }> {
+    return this.runInputExchange(command, input, name, options);
+  }
+
+  private async runInputExchange(
+    command: string,
+    input: Buffer,
+    name?: string,
+    options: { timeout?: number } = {},
+  ): Promise<{ stdout: Buffer; stderr: string; exitCode: number; signal?: string }> {
     const config = this.getConfig(name);
     if (this.getTransportMode(config) !== "exec") {
       throw new ToolError("UNSUPPORTED_IN_SHELL_MODE", "Helper stdin exchanges require SSH exec transport", false);
@@ -482,10 +506,8 @@ export class SSHConnectionManager {
       let bytes = 0;
       let code: number | undefined;
       let signal: string | undefined;
-      let stdout = "";
-      let stderr = "";
-      const outDecoder = new StringDecoder("utf8");
-      const errDecoder = new StringDecoder("utf8");
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
       const limit = this.getMaxOutputBytes(config);
       const fail = (error: Error) => {
         if (settled) return;
@@ -509,8 +531,7 @@ export class SSHConnectionManager {
               fail(new ToolError("OUTPUT_LIMIT_EXCEEDED", "Helper exchange exceeded its output limit", false));
               return;
             }
-            if (isError) stderr += errDecoder.write(data);
-            else stdout += outDecoder.write(data);
+            (isError ? stderrChunks : stdoutChunks).push(data);
           };
           stream.on("data", (data: Buffer) => append(data, false));
           stream.stderr.on("data", (data: Buffer) => append(data, true));
@@ -527,7 +548,8 @@ export class SSHConnectionManager {
             }
             settled = true;
             clearTimeout(timer);
-            resolve({ stdout: stdout + outDecoder.end(), stderr: stderr + errDecoder.end(), exitCode: code, signal });
+            resolve({ stdout: Buffer.concat(stdoutChunks), stderr: Buffer.concat(stderrChunks).toString("utf8"),
+              exitCode: code, signal });
           });
           try { stream.end(input); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
         });

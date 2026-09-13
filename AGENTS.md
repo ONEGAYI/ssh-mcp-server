@@ -21,6 +21,8 @@
 - `docs/design/progress.md`：当前实现进度、真实环境证据与未完成工作。
 - `docs/design/usage.md`：工作区配置、Agent 使用、恢复边界、离线交付与人工验收。
 - `docs/design/CONTEXT.md`：用户已提供的背景、需求目标和领域术语。
+- `docs/design/large-file-spec.md`：大文件读写、远端搜索、续传、状态清理与二次配置的扩展规格（票据 #6–#20 已实施，终验收尾见 #21）。
+- `docs/design/large-file-tickets.md`：扩展实施票据、GitHub 链接、依赖和验收条件。
 - `docs/design/discovery.md`：上游代码核实、候选方案与尚待回答的需求问题。
 - `docs/design/interactive-assessment.md`：交互式功能复杂度、延期影响及首版扩展边界评估。
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。

@@ -3,15 +3,19 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, posix, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve } from "node:path";
 import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { setupWorkspaceIntegration, writeAtomic } from "../services/workspace-setup.js";
-import { bindingNamePattern } from "../config/workspace.js";
+import { bindingNamePattern, profileSchema } from "../config/workspace.js";
+import { policySectionSchema, resolvePolicy, StoredPolicy } from "../config/policy.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
 const inputSchema = {
+  action: z.enum(["configure", "inspect", "update"]).optional().describe("Operation on a workspace binding. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision"),
+  revision: z.string().min(1).optional().describe("Revision token from a previous inspect; required for action='update' so concurrent changes are rejected instead of overwritten"),
+  policy: policySectionSchema.optional().describe("Workspace policy: per-end space limits, retention periods, search filters and budgets, maintenance cadence. Provide only the fields to set; unspecified fields keep defaults or stored values. Saved values apply from the next operation or maintenance cycle and never recalculate existing records' expiry"),
   bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for this project's original unnamed binding"),
   localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
   remoteRoot: optionalPath.describe("Existing absolute Linux source directory"),
@@ -35,18 +39,192 @@ type SetupInput = z.infer<typeof setupSchema>;
 // preset library is never field-merged with per-call credentials.
 const hasExplicitSsh = (input: SetupInput) => Boolean(input.host || input.username || input.privateKey || input.sshAgent || input.port);
 
+/** Changing any of these in place would rekey the binding identity or strand its recorded state. */
+const IDENTITY_LOCKED: Record<string, string> = {
+  sshConfigFile: "the referenced SSH config resolves the server connection",
+  connectionName: "the selected connection identifies the server",
+  host: "the server address is part of the binding identity",
+  port: "the server port is part of the binding identity",
+  username: "the login user is part of the binding identity",
+  privateKey: "authentication must stay untouched by configuration updates",
+  sshAgent: "authentication must stay untouched by configuration updates",
+  remoteRoot: "the remote source root is part of the binding identity",
+  remoteStateDir: "the remote state directory locates all remote task state",
+  localStateDir: "the local state directory locates all local task registrations",
+  workspaceId: "the workspace id is part of the binding identity",
+};
+
+function revisionOf(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function firstIssue(error: z.ZodError): string {
+  const issue = error.issues[0];
+  return issue ? `${issue.path.join(".")}: ${issue.message}` : "invalid value";
+}
+
+function parsePolicyPatch(value: StoredPolicy | undefined): StoredPolicy | undefined {
+  if (value === undefined) return undefined;
+  const candidate = policySectionSchema.safeParse(value);
+  if (!candidate.success) throw new RemoteAgentError("SETUP_INVALID_POLICY", `Invalid policy section: ${firstIssue(candidate.error)}`);
+  return candidate.data;
+}
+
+const askLocalRoot = {
+  status: "needs_input",
+  questions: [{ fields: ["localRoot"], question: "要查看或调整哪个本机项目目录中的绑定？请提供本机绝对路径。" }],
+  instructions: "Ask the user for the local project directory, then call remote_setup again with the same action and that directory. Nothing was read or written.",
+};
+
+/** Locates and validates the existing profile an inspect/update call addresses. */
+async function loadProfileForAction(input: SetupInput): Promise<{ profilePath: string; content: string; raw: Record<string, unknown> }> {
+  if (!isAbsolute(input.localRoot!)) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
+  const localRoot = await realpath(input.localRoot!);
+  if (!await stat(localRoot).then(info => info.isDirectory())) throw new RemoteAgentError("SETUP_INVALID_PATH", "localRoot must be an existing directory");
+  const profilePath = join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
+  let content: string;
+  try { content = await readFile(profilePath, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new RemoteAgentError("SETUP_PROFILE_NOT_FOUND", `No workspace profile ${input.bindingName ? `for binding '${input.bindingName}' ` : "for this project "}at ${profilePath}; call remote_setup without an action to create it`);
+    }
+    throw error;
+  }
+  let raw: unknown;
+  try { raw = JSON.parse(content); }
+  catch { throw new RemoteAgentError("SETUP_INVALID_CONFIG", "The existing profile is not valid JSON; it was left untouched"); }
+  const validated = profileSchema.safeParse(raw);
+  if (!validated.success) throw new RemoteAgentError("SETUP_INVALID_CONFIG", `The existing profile is invalid (${firstIssue(validated.error)}); it was left untouched`);
+  return { profilePath, content, raw: raw as Record<string, unknown> };
+}
+
+function checkBindingName(input: SetupInput) {
+  if (input.bindingName !== undefined && !bindingNamePattern.test(input.bindingName)) {
+    throw new RemoteAgentError("SETUP_INVALID_BINDING", "bindingName must be 1-64 lowercase letters, digits, or hyphens and start with a letter or digit; this keeps binding files unambiguous on case-insensitive systems");
+  }
+}
+
+async function inspectFromTool(input: SetupInput) {
+  checkBindingName(input);
+  if (!input.localRoot) return askLocalRoot;
+  const { profilePath, content, raw } = await loadProfileForAction(input);
+  const profile = profileSchema.parse(raw);
+  return {
+    status: "inspected", profilePath, revision: revisionOf(content),
+    config: {
+      workspaceId: profile.workspaceId,
+      ...(profile.bindingName ? { bindingName: profile.bindingName } : {}),
+      connectionName: profile.connectionName,
+      sshConfigFile: profile.sshConfigFile,
+      remoteRoot: profile.remoteRoot,
+      remoteStateDir: profile.remoteStateDir,
+      directoryScope: profile.directoryScope ?? "restricted",
+      pythonPath: profile.pythonPath,
+      ...(profile.localRoot ? { localRoot: profile.localRoot } : {}),
+      ...(profile.localStateDir ? { localStateDir: profile.localStateDir } : {}),
+      policy: resolvePolicy(profile.policy),
+    },
+    authentication: {
+      source: resolve(dirname(profilePath), profile.sshConfigFile),
+      connectionName: profile.connectionName,
+      note: "Credentials stay inside the referenced SSH config file; inspect never reads, echoes, or rewrites passwords, passphrases, or private key contents",
+    },
+    updatable: ["policy", "directoryScope", "pythonPath"],
+    identityLocked: Object.keys(IDENTITY_LOCKED),
+    instructions: "config shows effective values including defaults. Change updatable fields with action='update' plus this revision. identityLocked fields (server connection, directories, workspaceId) cannot change in place: configure a new binding with a new bindingName for a new target and keep this binding until its tasks and state are finished and cleaned up. No SSH connection was made.",
+  };
+}
+
+async function updateFromTool(input: SetupInput) {
+  checkBindingName(input);
+  if (!input.localRoot) return askLocalRoot;
+  if (!input.revision) throw new RemoteAgentError("SETUP_REVISION_REQUIRED", "Update requires the revision returned by a previous inspect of this binding; inspect first, then retry with that revision");
+  const { profilePath, content, raw } = await loadProfileForAction(input);
+  if (revisionOf(content) !== input.revision) {
+    throw new RemoteAgentError("SETUP_CONFLICT", "The profile changed since it was inspected (stale revision); inspect again for the current revision and retry");
+  }
+  const locked = Object.keys(IDENTITY_LOCKED).find(field => (input as unknown as Record<string, unknown>)[field] !== undefined);
+  if (locked) {
+    throw new RemoteAgentError("SETUP_IDENTITY_LOCKED", `'${locked}' cannot be updated in place: ${IDENTITY_LOCKED[locked]}. Changing it would strand this binding's tasks, read credentials, and transfer records. Configure a new binding (a new bindingName via remote_setup) for the new target and keep this binding until its old state is finished and cleaned up`);
+  }
+  if (input.directoryScope !== undefined && input.directoryScope !== "restricted" && input.directoryScope !== "unrestricted") {
+    throw new RemoteAgentError("SETUP_INVALID_SCOPE", "directoryScope must be 'restricted' or 'unrestricted'; an unrestricted scope requires the user's explicit decision, never a default");
+  }
+  if (input.pythonPath !== undefined && (!posix.isAbsolute(input.pythonPath) || input.pythonPath.includes("\0"))) {
+    throw new RemoteAgentError("SETUP_INVALID_PATH", "pythonPath must be an absolute POSIX path without NUL");
+  }
+  const patch = parsePolicyPatch(input.policy);
+  const changed: string[] = [];
+  // Mutate a copy of the parsed JSON so unnamed fields and key order survive byte-for-byte.
+  const updated: Record<string, unknown> = { ...raw };
+  if (input.directoryScope !== undefined) {
+    const before = (updated.directoryScope as string | undefined) ?? "restricted";
+    if (input.directoryScope === "unrestricted") updated.directoryScope = "unrestricted";
+    else delete updated.directoryScope;
+    if (((updated.directoryScope as string | undefined) ?? "restricted") !== before) changed.push("directoryScope");
+  }
+  if (input.pythonPath !== undefined && updated.pythonPath !== input.pythonPath) {
+    updated.pythonPath = input.pythonPath;
+    changed.push("pythonPath");
+  }
+  if (patch) {
+    const stored = updated.policy && typeof updated.policy === "object" && !Array.isArray(updated.policy)
+      ? updated.policy as Record<string, unknown> : {};
+    const merged: Record<string, Record<string, unknown>> = {};
+    const incoming = patch as unknown as Record<string, unknown>;
+    for (const group of new Set([...Object.keys(stored), ...Object.keys(incoming)])) {
+      const existing = stored[group];
+      if (incoming[group] === undefined) {
+        if (existing !== undefined) merged[group] = { ...(existing as Record<string, unknown>) };
+        continue;
+      }
+      const base = existing && typeof existing === "object" && !Array.isArray(existing) ? existing as Record<string, unknown> : {};
+      merged[group] = { ...base, ...(incoming[group] as Record<string, unknown>) };
+    }
+    for (const [group, leaves] of Object.entries(incoming)) {
+      if (!leaves || typeof leaves !== "object") continue;
+      const previous = stored[group] && typeof stored[group] === "object" && !Array.isArray(stored[group])
+        ? stored[group] as Record<string, unknown> : {};
+      for (const leaf of Object.keys(leaves as Record<string, unknown>)) {
+        if (previous[leaf] !== merged[group][leaf]) changed.push(`policy.${group}.${leaf}`);
+      }
+    }
+    if (Object.keys(merged).length) updated.policy = merged;
+    else delete updated.policy;
+  }
+  const finalCheck = profileSchema.safeParse(updated);
+  if (!finalCheck.success) {
+    throw new RemoteAgentError("SETUP_INVALID_POLICY", `The update would produce an invalid profile (${firstIssue(finalCheck.error)}); nothing was written`);
+  }
+  const next = JSON.stringify(updated, null, 2) + "\n";
+  await writeAtomic(profilePath, next, content);
+  return {
+    status: "updated", profilePath, revision: revisionOf(next), changed,
+    policy: resolvePolicy(updated.policy),
+    effective: "Policy changes apply from the next operation or maintenance cycle; operations already running keep the snapshot they started with. Retention-period changes affect only records created afterwards — existing expiresAt values are never recalculated. directoryScope and pythonPath changes apply the next time this binding's workspace MCP server starts.",
+    instructions: "Only the listed fields changed; authentication was neither read nor rewritten. Verify with action='inspect'. Identity and authentication fields stay locked — configure a new binding for a new server or directory target.",
+  };
+}
+
+/** Single entry the MCP tool calls; dispatches on the optional action field. */
+export async function setupFromTool(input: SetupInput, defaultSshConfigFile?: string) {
+  const action = input.action ?? "configure";
+  if (action === "inspect") return inspectFromTool(input);
+  if (action === "update") return updateFromTool(input);
+  return configureFromTool(input, defaultSshConfigFile);
+}
+
 export async function configureFromTool(input: SetupInput, defaultSshConfigFile?: string) {
   // Explicit per-call SSH settings override the setup service's preset library.
   if (!input.sshConfigFile && !hasExplicitSsh(input) && defaultSshConfigFile) {
     input = { ...input, sshConfigFile: defaultSshConfigFile };
   }
   const questions: Array<{ fields: string[]; question: string }> = [];
-  if (input.bindingName !== undefined && !bindingNamePattern.test(input.bindingName)) {
-    throw new RemoteAgentError("SETUP_INVALID_BINDING", "bindingName must be 1-64 lowercase letters, digits, or hyphens and start with a letter or digit; this keeps binding files unambiguous on case-insensitive systems");
-  }
+  checkBindingName(input);
   if (input.directoryScope !== undefined && input.directoryScope !== "restricted" && input.directoryScope !== "unrestricted") {
     throw new RemoteAgentError("SETUP_INVALID_SCOPE", "directoryScope must be 'restricted' or 'unrestricted'; an unrestricted scope requires the user's explicit decision, never a default");
   }
+  const initialPolicy = parsePolicyPatch(input.policy);
   if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
   if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: input.directoryScope === "unrestricted"
     ? "无边界绑定的远端默认执行目录（建议远端 home，如 /home/user）和可写的持久状态目录分别是什么？均需绝对路径。"
@@ -104,14 +282,15 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   const profile = { workspaceId, ...(binding ? { bindingName: binding } : {}), connectionName, sshConfigFile, localRoot,
     remoteRoot: input.remoteRoot, remoteStateDir: input.remoteStateDir, pythonPath: input.pythonPath ?? "/usr/bin/python3",
     ...(input.directoryScope === "unrestricted" ? { directoryScope: "unrestricted" as const } : {}),
-    ...(input.localStateDir ? { localStateDir: input.localStateDir } : {}) };
+    ...(input.localStateDir ? { localStateDir: input.localStateDir } : {}),
+    ...(initialPolicy && Object.keys(initialPolicy).length ? { policy: initialPolicy } : {}) };
   const content = JSON.stringify(profile, null, 2) + "\n";
   // Dry-run integration first: a rejected binding must not leave a profile file behind.
   await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, false);
   let old: string | undefined;
   try { old = await readFile(profilePath, "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  if (old !== undefined && old !== content) throw new RemoteAgentError("SETUP_CONFLICT", "This project already has a different workspace profile. Inspect it before changing the target; choose an empty local project for a new target");
+  if (old !== undefined && old !== content) throw new RemoteAgentError("SETUP_CONFLICT", "This project already has a different workspace profile. Use remote_setup action='inspect'/'update' for this binding's adjustable fields, or choose an empty local project for a new target");
   if (!input.sshConfigFile) {
     const auth = JSON.stringify({ [connectionName]: { host: input.host, port: input.port ?? 22, username: input.username,
       ...(input.privateKey ? { privateKey: resolve(input.privateKey) } : {}), ...(input.sshAgent ? { agent: input.sshAgent } : {}) } }, null, 2) + "\n";
@@ -130,11 +309,11 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
+    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
   });
-  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project. With missing fields, returns questions for you to ask the user. With complete fields, creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. No manual setup command needed; no SSH connection during setup.",
+  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. No manual setup command needed; no SSH connection during setup.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => {
-    try { return { content: [{ type: "text" as const, text: JSON.stringify(await configureFromTool(input, defaultSshConfigFile)) }] }; }
+    try { return { content: [{ type: "text" as const, text: JSON.stringify(await setupFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {
       const known = error instanceof RemoteAgentError;
       return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ code: known ? error.code : "SETUP_FAILED",

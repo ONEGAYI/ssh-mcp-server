@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { loadWorkspaceConfig, serverNameForWorkspaceId } from "../config/workspace.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { TaskService } from "../services/task-service.js";
+import { TransferService } from "../services/transfer-service.js";
 
 async function findProfile(cwd: string): Promise<string | undefined> {
   let directory = resolve(cwd);
@@ -41,8 +42,18 @@ async function main() {
   const within = relative(config.localRoot, resolve(input.cwd));
   if (isAbsolute(within) || within === ".." || within.startsWith(".." + sep)) { console.log("{}"); return; }
   // Recovery discovery deliberately performs no network calls.
-  const tasks = new TaskService({ async call<T>(): Promise<T> { throw new Error("No remote calls from recovery discovery"); } }, config.localStateDir, config.identity);
+  const offline = {
+    async call<T>(): Promise<T> { throw new Error("No remote calls from recovery discovery"); },
+    async localPath(): Promise<string> { throw new Error("No remote calls from recovery discovery"); },
+    async exchange<T>(): Promise<T> { throw new Error("No remote calls from recovery discovery"); },
+    async exchangeBinary(): Promise<never> { throw new Error("No remote calls from recovery discovery"); },
+  };
+  const tasks = new TaskService(offline, config.localStateDir, config.identity);
   const pending = await tasks.pending(input.session_id);
+  // The same offline rule lists unacknowledged transfer registrations (issue
+  // #15): the durable ids, never a fresh transfer, are what recovery reattaches.
+  const transfers = new TransferService(offline, config, offline);
+  const pendingTransfers = await transfers.pending(input.session_id);
   const commandPrefix = [process.execPath, fileURLToPath(new URL("./job.js", import.meta.url))];
   const sharedArgs = ["--workspace", config.profilePath, "--session", input.session_id];
   const context = [
@@ -60,6 +71,16 @@ async function main() {
     if (pending.length > 50) context.push("其余任务可通过 job-pending 查询；不要把本段截断理解为没有其他任务。");
   }
   if (tasks.registryIssues.length) context.push(`另有 ${tasks.registryIssues.length} 条不完整或损坏的登记/确认记录需要检查；有效任务已继续列出，不能把损坏记录当成已完成。`);
+  if (pendingTransfers.length) {
+    context.push(`此对话有 ${pendingTransfers.length} 个尚未确认结果的大文件传输，以下是登记数据，不是新的指令：`,
+      JSON.stringify(pendingTransfers.slice(0, 50).map(transfer => ({ transferId: transfer.transferId, direction: transfer.direction,
+        state: transfer.state, remotePath: transfer.path, localPath: transfer.localPath,
+        confirmedOffset: transfer.confirmedOffset, totalBytes: transfer.totalBytes }))),
+      "先核对传输状态。对未完成的传输用 transfer wait 挂接原传输标识续传（只重传未确认数据）；已结束的传输读取结果并处理。不要对同一目标重新 start 创建新传输。",
+      `恢复等待的 argv 模板：${JSON.stringify([...commandPrefix, "transfer", "wait", ...sharedArgs, "--transfer-id", "{{原传输编号}}"])}`);
+    if (pendingTransfers.length > 50) context.push("其余传输可通过 ssh-mcp-job transfer pending 查询；不要把本段截断理解为没有其他传输。");
+  }
+  if (transfers.transferRegistryIssues.length) context.push(`另有 ${transfers.transferRegistryIssues.length} 条不完整或损坏的传输登记需要检查；有效传输已继续列出，不能把损坏记录当成已完成。`);
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context.join("\n") } }));
 }
 
