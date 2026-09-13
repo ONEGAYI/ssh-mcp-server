@@ -45,3 +45,36 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+it('workspace MCP storage report keeps the local end and marks an unreachable remote unknown (issue #19)', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-storage-'));
+  const client = new Client({ name: 'contract-test', version: '1' });
+  try {
+    // port 1 on loopback: connection refused, a real unreachable remote end.
+    await writeFile(join(directory, 'ssh.json'), JSON.stringify({ offline: { host: '127.0.0.1', port: 1, username: 'test', password: 'must-not-leak' } }));
+    await writeFile(join(directory, 'workspace.json'), JSON.stringify({ workspaceId: 'storage-contract', connectionName: 'offline', sshConfigFile: './ssh.json', remoteRoot: '/work', remoteStateDir: '/state', localStateDir: './state' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', join(directory, 'workspace.json')], stderr: 'pipe' }));
+    const tools = await client.listTools();
+    const workspace = tools.tools.find(tool => tool.name === 'remote_workspace');
+    assert.ok(workspace.inputSchema.properties.includeStorage, 'remote_workspace exposes includeStorage');
+    const report = await client.callTool({ name: 'remote_workspace', arguments: { sessionId: 'contract-session', includeStorage: true } });
+    assert.equal(report.isError, undefined, report.content?.[0]?.text);
+    const data = JSON.parse(report.content[0].text);
+    assert.equal(typeof data.storage.local.usedBytes, 'number');
+    assert.equal(typeof data.storage.local.limitBytes, 'number');
+    assert.equal(data.storage.local.usedBytes,
+      data.storage.local.stateBytes + data.storage.local.tempBytes + data.storage.local.reservedBytes);
+    assert.equal(data.storage.remote.status, 'unknown');
+    for (const field of ['usedBytes', 'limitBytes', 'stateBytes', 'tempBytes', 'reservedBytes']) {
+      assert.equal(field in data.storage.remote, false, `${field} must not appear on an unknown end`);
+    }
+    assert.ok(!JSON.stringify(data).includes('must-not-leak'));
+    assert.ok(Buffer.byteLength(JSON.stringify(data), 'utf8') <= 4096, 'the report stays within the 4 KiB budget');
+  } finally {
+    await client.close();
+    const child = relative(tmpdir(), directory);
+    assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
