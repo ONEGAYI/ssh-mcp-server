@@ -260,14 +260,6 @@ def line_metadata(payload, line_start, delivered_end, size):
     return line_end, complete
 
 
-def line_metadata(payload, line_start, delivered_end, size):
-    """Report (lineEnd, lineEndComplete) for a delivered line-mode window."""
-    breaks = payload.count(b'\n')
-    line_end = line_start + breaks - (1 if payload.endswith(b'\n') else 0)
-    complete = payload.endswith(b'\n') or delivered_end >= size
-    return line_end, complete
-
-
 # --- Byte-range and content helpers ------------------------------------------------
 
 def merge_ranges(ranges):
