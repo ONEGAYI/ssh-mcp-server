@@ -1,4 +1,4 @@
-"""Resumable verified transfer transactions, upload direction (issue #13).
+"""Resumable verified transfer transactions, both directions (issues #13/#14).
 
 Both ends of a workspace keep small records under <stateRoot>/transfers/
 <transferId>/: record.json (identity, state machine, confirmed offset),
@@ -12,24 +12,30 @@ identifier, and every later action accepts only that registered identifier --
 a missing record is REQUEST_EXPIRED_OR_UNKNOWN and never falls back to
 creation. Queries observe without starting anything or renewing expiry.
 
-Blocks travel as one bounded JSON control line followed by exactly `size`
-raw bytes on the helper's stdin binary stream (spec 6.2): no whole-file
-base64 in JSON, no model-driven per-block calls, one block in flight per
-transfer. A block advances the confirmed offset only after its digest is
-verified and its bytes are persisted; resume re-reads the persisted chunks
-streaming, drops the manifest and file back to the last trusted boundary and
-lets the caller refill from there. The final SHA-256 is computed
-independently on both ends over the full content and compared at verify; the
-full file is never shipped across the wire for checking.
+Uploads (issue #13) carry blocks as one bounded JSON control line followed by
+exactly `size` raw bytes on the helper's stdin binary stream; downloads
+(issue #14) reverse the roles. The remote end is the sender: it binds the
+source through a metadata-only m1- version observed while streaming the
+register-time digest, serves blocks framed on stdout (control line + exact
+bytes + the regular SSH_MCP_V1 envelope), and lets the receiver -- the local
+Node driver -- verify each digest, persist, advance the confirmed offset and
+finally publish under the issue #10 overwrite contract. A fetch may rewind to
+any already-served boundary: the receiver's confirmed position is
+authoritative, so a response lost after the sender advanced is simply
+re-served. No whole-file base64 ever enters JSON, no model-driven per-block
+calls, one block in flight per transfer.
 
-Commit follows the issue #10 skeleton: explicit version binding for
-overwrite, no-clobber creation by default, permission preservation, fsync of
-file and parent directory, atomic replacement, and ledger release so the
-formal target leaves space measurement. A lost commit response reconciles by
-object identity (rename keeps the inode): matching identity completes the
-receipt; identical content under a different identity is NOT proof and stays
-unknown. Cancel/acknowledge belong to issue #15 and stay unimplemented.
-Python 3.6 standard library only.
+The final SHA-256 is computed independently on both ends over the full
+content: the sender streams it at registration, the receiver recomputes it at
+verify and asserts it (transfer_verify compares the assertion). The full file
+is never shipped across the wire for checking.
+
+Commit follows the issue #10 skeleton. On upload the remote publishes the
+temp (intent first, atomic replacement, receipt last; a lost response
+reconciles by object identity). On download the receiver publishes locally
+and the sender records the asserted outcome idempotently so the shared
+active-transfer slot frees. Cancel/acknowledge belong to issue #15 and stay
+unimplemented. Python 3.6 standard library only.
 """
 import errno
 import hashlib
@@ -100,6 +106,9 @@ def describe(record):
               'sha256': record['totalSha256'], 'confirmedOffset': record['confirmedOffset'],
               'chunkCount': record['chunkCount'], 'overwrite': record['overwrite'], 'create': record['create'],
               'registeredAt': record['registeredAt'], 'expiresAt': record['expiresAt']}
+    if record['direction'] == 'download':
+        result['sourcePath'] = record['sourcePath']
+        result['sourceVersion'] = record['sourceVersion']
     for field in ('startedAt', 'lastProgressAt', 'completedAt', 'error'):
         if record.get(field) is not None:
             result[field] = record[field]
@@ -136,6 +145,63 @@ def _match_source(record, source_identity):
                          'The local source changed since registration; refuse to mix versions, register a new transfer')
 
 
+def _validate_source_version(value):
+    if not isinstance(value, str) or not value:
+        raise AgentError('INVALID_REQUEST', 'sourceVersion must be the observed m1- version echoed by registration')
+    return value
+
+
+def _match_source_version(record, echoed):
+    if echoed != record['sourceVersion']:
+        raise AgentError('TRANSFER_SOURCE_CHANGED',
+                         'The remote source changed since registration; refuse to mix versions, register a new transfer')
+
+
+def _require_live_source(record):
+    """Refuse unless the live file still is the registered source version."""
+    from files import current_version
+    source = Path(record['sourcePath'])
+    try:
+        version = current_version(source)
+    except FileNotFoundError:
+        version = None
+    if version != record['sourceVersion']:
+        raise AgentError('TRANSFER_SOURCE_CHANGED',
+                         'The remote source no longer matches the registered version; register a new transfer')
+
+
+def _observe_source(path):
+    """Version and stream-digest the download source in one stable window.
+
+    The metadata-only version (spec 4.1) is observed before and re-checked
+    after the streamed SHA-256, so the registered digest always describes one
+    stable source version even if the file is rewritten mid-read.
+    """
+    from files import content_version, metadata, require_regular_file, same_object
+    try:
+        stream = path.open('rb')
+    except FileNotFoundError:
+        raise AgentError('PATH_NOT_FOUND', 'Download source does not exist')
+    except IsADirectoryError:
+        raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
+    with stream:
+        before = os.fstat(stream.fileno())
+        require_regular_file(before)
+        if not same_object(before, path):
+            raise AgentError('FILE_CONFLICT', 'Source identity changed while observing')
+        version = content_version(before)
+        digest = hashlib.sha256()
+        while True:
+            block = stream.read(STREAM_CHUNK)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(stream.fileno())
+        if metadata(before) != metadata(after) or not same_object(after, path):
+            raise AgentError('FILE_CONFLICT', 'Source changed while digesting; register again after it settles')
+    return version, before.st_size, digest.hexdigest()
+
+
 def _active_transfer_count(root):
     count = 0
     for candidate in sorted(transfers_directory(root).iterdir()):
@@ -154,16 +220,10 @@ def register(root, request):
     """Durably assign a transfer identity; no bytes move and no temp exists."""
     _require_protocol(request)
     service = _file_service(root, request)
-    if request.get('direction') != 'upload':
-        raise AgentError('INVALID_REQUEST', "direction must be 'upload' for this action")
+    direction = request.get('direction')
+    if direction not in ('upload', 'download'):
+        raise AgentError('INVALID_REQUEST', "direction must be 'upload' or 'download' for this action")
     chunk = _require_int(request.get('chunkSize'), 'chunkSize', MIN_CHUNK, MAX_CHUNK)
-    total = _require_int(request.get('totalBytes'), 'totalBytes', 0, 9007199254740991)
-    digest = request.get('totalSha256')
-    if not isinstance(digest, str) or not HEX64.fullmatch(digest):
-        raise AgentError('INVALID_REQUEST', 'totalSha256 must be a 64-hex digest')
-    source = _validate_source_identity(request.get('sourceIdentity'))
-    if source['size'] != total:
-        raise AgentError('INVALID_REQUEST', 'sourceIdentity.size must equal totalBytes (one stat, one registration)')
     overwriting = request.get('overwrite', False)
     creating = request.get('create', False)
     if not isinstance(overwriting, bool) or not isinstance(creating, bool):
@@ -172,44 +232,77 @@ def register(root, request):
     if overwriting and creating:
         raise AgentError('INVALID_REQUEST', 'Choose create (target must be absent) or overwrite (bound to its observed version), not both')
     if overwriting and not isinstance(expected, str):
-        raise AgentError('INVALID_REQUEST', 'overwrite requires the expectedVersion observed through a metadataOnly read')
+        raise AgentError('INVALID_REQUEST', 'overwrite requires the expectedVersion observed for the target')
     if not overwriting and expected is not None:
         raise AgentError('INVALID_REQUEST', 'expectedVersion only pairs with overwrite=true')
-    target = service.path(request.get('targetPath'), writing=True)
-    from files import content_version, current_version, replaceable
-    # Fail fast on the target state (issue #10 semantics); the authoritative
-    # recheck still happens inside commit.
-    if overwriting:
-        try:
-            info = target.stat()
-        except FileNotFoundError:
-            raise AgentError('FILE_CONFLICT', 'Overwrite target does not exist; keep overwrite bound to an existing observed version or create instead')
-        if not stat_module.S_ISREG(info.st_mode):
-            raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
-        replaceable(info)
-        if current_version(target) != expected:
-            raise AgentError('FILE_CONFLICT', 'File changed since the observed version; read the metadata again and re-issue the upload')
-    elif target.exists():
-        raise AgentError('FILE_CONFLICT',
-                         'Target already exists; uploads default to create-only. To replace it, observe the version '
-                         'with a metadataOnly read and re-issue with overwrite=true and that expectedVersion')
+    if direction == 'upload':
+        total = _require_int(request.get('totalBytes'), 'totalBytes', 0, 9007199254740991)
+        digest = request.get('totalSha256')
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            raise AgentError('INVALID_REQUEST', 'totalSha256 must be a 64-hex digest')
+        source = _validate_source_identity(request.get('sourceIdentity'))
+        if source['size'] != total:
+            raise AgentError('INVALID_REQUEST', 'sourceIdentity.size must equal totalBytes (one stat, one registration)')
+        target = service.path(request.get('targetPath'), writing=True)
+        from files import content_version, current_version, replaceable
+        # Fail fast on the target state (issue #10 semantics); the authoritative
+        # recheck still happens inside commit.
+        if overwriting:
+            try:
+                info = target.stat()
+            except FileNotFoundError:
+                raise AgentError('FILE_CONFLICT', 'Overwrite target does not exist; keep overwrite bound to an existing observed version or create instead')
+            if not stat_module.S_ISREG(info.st_mode):
+                raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
+            replaceable(info)
+            if current_version(target) != expected:
+                raise AgentError('FILE_CONFLICT', 'File changed since the observed version; read the metadata again and re-issue the upload')
+        elif target.exists():
+            raise AgentError('FILE_CONFLICT',
+                             'Target already exists; uploads default to create-only. To replace it, observe the version '
+                             'with a metadataOnly read and re-issue with overwrite=true and that expectedVersion')
+    else:
+        # Downloads compute their own facts about the source: the caller cannot
+        # assert a size or digest for a file only the remote end can see.
+        for field in ('totalBytes', 'totalSha256', 'sourceIdentity'):
+            if request.get(field) is not None:
+                raise AgentError('INVALID_REQUEST',
+                                 '{} is derived from the remote source; do not send it'.format(field))
+        reported_target = request.get('targetPath')
+        if not isinstance(reported_target, str) or not reported_target:
+            raise AgentError('INVALID_REQUEST', 'targetPath must report the local destination of the download')
+        source = service.path(request.get('sourcePath'), writing=False)
+        version, total, digest = _observe_source(source)
     transfer_id = uuid.uuid4().hex
     path = transfer_path(root, transfer_id)
     with acquire_slots(root, ['transfer-registry']):
+        if direction == 'download':
+            # The digest streamed outside the lock: re-verify cheaply that the
+            # live file still is the observed version before anchoring it.
+            from files import current_version
+            if current_version(source) != version:
+                raise AgentError('FILE_CONFLICT', 'Source changed while registering; register again after it settles')
         if _active_transfer_count(root) >= MAX_ACTIVE_TRANSFERS:
             raise AgentError('TRANSFER_LIMIT_REACHED',
                              'At most {} active transfers are allowed per workspace'.format(MAX_ACTIVE_TRANSFERS))
         now = _now()
-        record = {'schemaVersion': 1, 'transferId': transfer_id, 'direction': 'upload',
-                  'sessionId': service.session, 'targetPath': str(target),
+        record = {'schemaVersion': 1, 'transferId': transfer_id, 'direction': direction,
+                  'sessionId': service.session,
                   'chunkSize': chunk, 'totalBytes': total, 'totalSha256': digest,
-                  'sourceIdentity': source, 'overwrite': overwriting, 'create': creating,
+                  'overwrite': overwriting, 'create': creating,
                   'expectedVersion': expected if overwriting else None,
                   'state': 'prepared', 'confirmedOffset': 0, 'chunkCount': 0,
                   'resourceId': None,
-                  'tempPath': str(target.parent / ('.ssh-mcp-upload-' + transfer_id)),
                   'registeredAt': now, 'startedAt': None, 'lastProgressAt': None,
                   'expiresAt': now + TRANSFER_TTL_SECONDS, 'completedAt': None, 'error': None}
+        if direction == 'upload':
+            record.update(targetPath=str(target), sourceIdentity=source,
+                          tempPath=str(target.parent / ('.ssh-mcp-upload-' + transfer_id)))
+        else:
+            # The sender materializes nothing remotely; the receiver owns the
+            # temp, the manifest and the publication.
+            record.update(targetPath=reported_target, sourcePath=str(source),
+                          sourceVersion=version, tempPath=None)
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
@@ -317,27 +410,49 @@ def _heal(root, transfer_id, record):
     return record
 
 
+def _validate_source_echo(record, request):
+    """Check whichever source identity the registered direction echoes."""
+    if record['direction'] == 'download':
+        return _validate_source_version(request.get('sourceVersion'))
+    return _validate_source_identity(request.get('sourceIdentity'))
+
+
+def _match_source_echo(record, request, echoed):
+    if record['direction'] == 'download':
+        _match_source_version(record, echoed)
+        # The live file is re-observed while the transfer can still move;
+        # terminal records stay observable instead of raising over a source
+        # that no longer matters to them.
+        if record['state'] not in ('failed', 'completed', 'cancelled', 'unknown'):
+            _require_live_source(record)
+    else:
+        _match_source(record, echoed)
+
+
 def start(root, request):
     """Idempotently move prepared -> transferring; later calls only observe.
 
-    Every call re-heals persisted data so a crash between writes can never
-    turn into a trusted-but-wrong confirmed offset.
+    Uploads re-heal persisted data on every call so a crash between writes can
+    never turn into a trusted-but-wrong confirmed offset; downloads have no
+    remote data to heal and instead re-observe the live source version.
     """
     _require_protocol(request)
     transfer_id = _transfer_id(request.get('transferId'))
-    source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
-        _match_source(record, source)
+        echoed = _validate_source_echo(record, request)
+        _match_source_echo(record, request, echoed)
         if record['state'] == 'prepared':
-            _materialize(root, record)
+            if record['direction'] == 'upload':
+                _materialize(root, record)
             record.update(state='transferring', startedAt=_now())
             _save_record(root, transfer_id, record)
             return describe(record)
         if record['state'] in ('transferring', 'interrupted'):
             if record['state'] == 'interrupted':
                 record['state'] = 'transferring'
-            _heal(root, transfer_id, record)
+            if record['direction'] == 'upload':
+                _heal(root, transfer_id, record)
             _save_record(root, transfer_id, record)
             return describe(record)
         return describe(record)
@@ -347,16 +462,17 @@ def resume(root, request):
     """Re-attach to a started transfer: verify the source, heal, report."""
     _require_protocol(request)
     transfer_id = _transfer_id(request.get('transferId'))
-    source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
-        _match_source(record, source)
+        echoed = _validate_source_echo(record, request)
+        _match_source_echo(record, request, echoed)
         if record['state'] == 'prepared':
             raise AgentError('INVALID_STATE', 'This transfer never started; call transfer_start first')
         if record['state'] in ('transferring', 'interrupted'):
             if record['state'] == 'interrupted':
                 record['state'] = 'transferring'
-            _heal(root, transfer_id, record)
+            if record['direction'] == 'upload':
+                _heal(root, transfer_id, record)
             _save_record(root, transfer_id, record)
         return describe(record)
 
@@ -417,14 +533,123 @@ def receive_block(root, transfer_id, control, payload):
             'totalBytes': record['totalBytes'], 'complete': end >= record['totalBytes']}
 
 
+def fetch_exchange(root, stdin):
+    """Serve one download block on a framed stdout channel (issue #14).
+
+    The request mirrors the upload block channel: one bounded JSON control
+    line on stdin. The response inverts it onto stdout -- control line,
+    exactly `size` raw bytes, a newline, then the regular SSH_MCP_V1 envelope
+    -- so binary content never passes through a base64 JSON payload.
+
+    The receiver's confirmed position is authoritative: a request at the
+    sender's next boundary serves the next block, and a request at any
+    already-served boundary (a response lost after the sender advanced)
+    rewinds and re-serves. The live source is version-checked before and
+    after the read; a change fails the whole transfer rather than mixing
+    versions.
+    """
+    line = stdin.readline()
+    if not line:
+        raise AgentError('INVALID_REQUEST', 'Block fetch requires a control line')
+    try:
+        control = json.loads(line.decode('utf8'))
+    except ValueError:
+        raise AgentError('INVALID_REQUEST', 'Block fetch control line must be JSON')
+    if not isinstance(control, dict):
+        raise AgentError('INVALID_REQUEST', 'Block fetch control frame must be an object')
+    index = control.get('index')
+    offset = control.get('offset')
+    size = control.get('size')
+    for name, value in (('index', index), ('offset', offset), ('size', size)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise AgentError('INVALID_REQUEST', '{} must be a nonnegative integer'.format(name))
+    transfer_id = _transfer_id(control.get('transferId'))
+    with acquire_slots(root, [transfer_id]):
+        record = _load_record(root, transfer_id)
+        if record['direction'] != 'download':
+            raise AgentError('INVALID_REQUEST', 'Only download transfers serve blocks')
+        if control.get('sessionId') != record['sessionId']:
+            raise AgentError('TRANSFER_SCOPE_MISMATCH', 'Transfer belongs to a different session')
+        if record['state'] != 'transferring':
+            raise AgentError('INVALID_STATE', 'This transfer is not serving blocks in state {}'.format(record['state']))
+        chunk_size = record['chunkSize']
+        next_block = index == record['chunkCount'] and offset == record['confirmedOffset']
+        # Rewind: the receiver asserts a boundary at or before the served one.
+        rewind = index < record['chunkCount'] and offset == index * chunk_size
+        if not (next_block or rewind):
+            raise AgentError('INVALID_REQUEST',
+                             'Blocks are served strictly in order from the receiver confirmed offset; resume first if the offset moved')
+        if offset != index * chunk_size or size < 1 or size > chunk_size:
+            raise AgentError('INVALID_REQUEST', 'The block must align to its index and fit the registered chunk size')
+        end = offset + size
+        if end > record['totalBytes'] or (end < record['totalBytes'] and size != chunk_size):
+            raise AgentError('INVALID_REQUEST', 'Only the final block may be shorter than the chunk size')
+
+        def fail(error):
+            record.update(state='failed', error={'code': error.code, 'message': str(error)}, completedAt=_now())
+            _save_record(root, transfer_id, record)
+            raise error
+
+        try:
+            _require_live_source(record)
+        except AgentError as error:
+            fail(error)
+        source = Path(record['sourcePath'])
+        try:
+            stream = source.open('rb')
+        except OSError as error:
+            fail(AgentError('TRANSFER_SOURCE_CHANGED', 'The download source became unreadable: {}'.format(error)))
+        with stream:
+            stream.seek(offset)
+            payload = stream.read(size)
+        if len(payload) != size:
+            fail(AgentError('TRANSFER_DATA_SHORT',
+                            'The source no longer holds the requested bytes; the transfer cannot continue'))
+        try:
+            _require_live_source(record)
+        except AgentError as error:
+            fail(error)
+        checksum = hashlib.sha256(payload).hexdigest()
+        now = _now()
+        record.update(chunkCount=index + 1, confirmedOffset=end, lastProgressAt=now,
+                      expiresAt=now + TRANSFER_TTL_SECONDS)
+        _save_record(root, transfer_id, record)
+    control_frame = {'transferId': transfer_id, 'index': index, 'offset': offset,
+                     'size': size, 'sha256': checksum}
+    result = {'transferId': transfer_id, 'index': index, 'confirmedOffset': end,
+              'totalBytes': record['totalBytes'], 'complete': end >= record['totalBytes']}
+    return control_frame, payload, result
+
+
 def verify(root, request):
-    """Stream the full temp digest and compare it to the registered one."""
+    """Compare the two independent full-content digests.
+
+    Uploads stream the persisted temp's digest here; downloads receive the
+    receiver's recomputed digest as an assertion and compare it to the digest
+    the sender streamed at registration. Both directions transition into
+    verifying only when the two ends agree.
+    """
     transfer_id = _transfer_id(request.get('transferId'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
         if record['state'] == 'verifying':
             return describe(record)
         if record['state'] in ('committing', 'completed'):
+            return describe(record)
+        if record['direction'] == 'download':
+            asserted = request.get('sha256')
+            if not isinstance(asserted, str) or not HEX64.fullmatch(asserted):
+                raise AgentError('INVALID_REQUEST', 'Download verify carries the receiver-computed sha256')
+            if record['state'] != 'transferring' or record['confirmedOffset'] != record['totalBytes']:
+                raise AgentError('INVALID_STATE', 'Verify requires the receiver to confirm all blocks first')
+            if asserted != record['totalSha256']:
+                record.update(state='failed', error={'code': 'VERIFY_MISMATCH',
+                                                     'message': 'Receiver digest does not match the registered source digest'},
+                              completedAt=_now())
+                _save_record(root, transfer_id, record)
+                raise AgentError('VERIFY_MISMATCH', 'Receiver digest does not match the registered source digest')
+            record['state'] = 'verifying'
+            _save_record(root, transfer_id, record)
             return describe(record)
         if record['state'] != 'transferring' or record['confirmedOffset'] != record['totalBytes']:
             raise AgentError('INVALID_STATE', 'Verify requires all blocks confirmed first')
@@ -464,16 +689,38 @@ def _receipt_result(record, receipt):
 def commit(root, request):
     """Publish the verified temp under the explicit target contract.
 
-    Intent first, action second, receipt last. A retry after a lost response
-    reconciles by object identity: rename keeps the inode, so a matching
-    identity completes the receipt; anything else stays unknown instead of
-    blindly overwriting (spec 6.2).
+    Uploads publish here (intent first, action second, receipt last; a retry
+    after a lost response reconciles by object identity because rename keeps
+    the inode). Downloads publish on the receiver's machine; the sender only
+    records the asserted outcome so the shared active slot frees -- the local
+    receipt on the receiver stays the authoritative proof.
     """
     transfer_id = _transfer_id(request.get('transferId'))
     record = None
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
         directory = transfer_path(root, transfer_id)
+        if record['direction'] == 'download':
+            if record['state'] in ('completed', 'committing'):
+                receipt_path = directory / 'receipt.json'
+                if receipt_path.is_file():
+                    return _receipt_result(record, read_json(receipt_path))
+                # A committing download without a receipt: the receiver asserts
+                # completion; record it now (idempotent on retry).
+                receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': record['totalBytes'],
+                           'targetIdentity': request.get('targetIdentity')}
+                atomic_json(receipt_path, receipt)
+                record.update(state='completed', completedAt=receipt['committedAt'])
+                _save_record(root, transfer_id, record)
+                return _receipt_result(record, receipt)
+            if record['state'] != 'verifying':
+                raise AgentError('INVALID_STATE', 'Commit requires a verified transfer in state verifying')
+            receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': record['totalBytes'],
+                       'targetIdentity': request.get('targetIdentity')}
+            atomic_json(directory / 'receipt.json', receipt)
+            record.update(state='completed', completedAt=receipt['committedAt'])
+            _save_record(root, transfer_id, record)
+            return _receipt_result(record, receipt)
         if record['state'] in ('completed', 'committing'):
             receipt_path = directory / 'receipt.json'
             if receipt_path.is_file():
