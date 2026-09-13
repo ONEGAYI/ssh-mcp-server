@@ -283,7 +283,11 @@ export class TransferService {
         workspaceId: this.config.workspaceId, sessionId, direction: "upload",
         localPath, remotePath: request.path, sourceIdentity, totalBytes: info.size, totalSha256,
         chunkSize, overwrite: request.overwrite ?? false, create: request.create ?? false,
-        expectedVersion: request.expectedVersion ?? null, createdAt: new Date().toISOString() };
+        expectedVersion: request.expectedVersion ?? null, createdAt: new Date().toISOString(),
+        // The mirror carries the same 3-day TTL as a download receiver record
+        // so the local maintenance pass can reclaim a stalled upload's
+        // registration even though the remote side owns the state.
+        expiresAt: Date.now() + TRANSFER_TTL_MS };
       await mkdir(join(this.directory, record.transferId), { recursive: true, mode: 0o700 });
       await atomicJson(join(this.directory, record.transferId, "record.json"), record);
       try {
@@ -793,7 +797,14 @@ export class TransferService {
       }
       if (!matches) {
         const message = "Commit outcome cannot be reconciled with the persisted intent; inspect the target manually";
-        await this.failLocal(record, "TRANSFER_STATE_UNKNOWN", message);
+        // Unprovable outcomes stay unknown (contracts, transfer section): not
+        // failed -- an unverified result must never enter the acknowledgeable
+        // set -- and not completed. The unknown record keeps its recorded TTL;
+        // the local maintenance pass reclaims it once that window lapses.
+        record.state = "unknown";
+        record.error = { code: "TRANSFER_STATE_UNKNOWN", message };
+        record.completedAt = Date.now();
+        await this.saveRecord(record);
         throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN", message);
       }
       const completed = { bytes: intent.totalBytes, committedAt: Date.now(), targetIdentity: intent.tempIdentity };
@@ -842,8 +853,25 @@ export class TransferService {
     if (info.size !== record.sourceIdentity!.size || info.mtimeMs !== record.sourceIdentity!.mtimeMs) {
       throw new RemoteAgentError("FILE_CONFLICT", "Local upload source changed since registration; register a new transfer instead");
     }
-    const state = await this.raw<{ state: string; confirmedOffset: number; totalBytes: number; sha256?: string; error?: { code: string; message: string } }>(
-      "transfer_resume", sessionId, { protocol: 2, transferId, sourceIdentity: record.sourceIdentity });
+    let state;
+    try {
+      state = await this.raw<{ state: string; confirmedOffset: number; totalBytes: number; sha256?: string; error?: { code: string; message: string } }>(
+        "transfer_resume", sessionId, { protocol: 2, transferId, sourceIdentity: record.sourceIdentity });
+    } catch (error) {
+      // The remote retention (#16) may have reclaimed the registration (3-day
+      // TTL since the last real progress). Converge the local mirror to a
+      // terminal failure so the recovery hook stops listing a transfer that
+      // can never resume, then report the refusal itself.
+      if ((error as RemoteAgentError).code === "REQUEST_EXPIRED_OR_UNKNOWN") {
+        await this.failLocal(record, "REQUEST_EXPIRED_OR_UNKNOWN",
+          "The remote registration expired and was reclaimed; register a new transfer instead of resuming");
+      }
+      throw error;
+    }
+    // The remote registration is alive again: refresh the mirrored TTL the
+    // same way the download driver refreshes it on every confirmed block.
+    record.expiresAt = Date.now() + TRANSFER_TTL_MS;
+    await this.saveRecord(record);
     if (state.state === "completed") {
       return { transferId, direction: "upload", state: "completed", path: record.remotePath, localPath: record.localPath,
         totalBytes: record.totalBytes, confirmedOffset: record.totalBytes, blocksSent: 0,
@@ -926,8 +954,20 @@ export class TransferService {
   /** Uploads keep the received data remotely; the remote record and its lock
    * are the authority for whether the transfer actually stopped. */
   private async cancelUpload(record: LocalTransferRecord, sessionId: string): Promise<TransferOutcome> {
-    const remote = await this.raw<{ state: string; confirmedOffset?: number; sha256?: string }>(
-      "transfer_cancel", sessionId, { transferId: record.transferId });
+    let remote;
+    try {
+      remote = await this.raw<{ state: string; confirmedOffset?: number; sha256?: string }>(
+        "transfer_cancel", sessionId, { transferId: record.transferId });
+    } catch (error) {
+      // A reclaimed remote registration leaves nothing to cancel; converge
+      // the local mirror to a terminal failure (resume/cancel can then never
+      // loop on it again) and surface the refusal.
+      if ((error as RemoteAgentError).code === "REQUEST_EXPIRED_OR_UNKNOWN") {
+        await this.failLocal(record, "REQUEST_EXPIRED_OR_UNKNOWN",
+          "The remote registration expired and was reclaimed; nothing remains to cancel");
+      }
+      throw error;
+    }
     return { transferId: record.transferId, direction: "upload", state: remote.state,
       path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
       confirmedOffset: remote.confirmedOffset ?? 0, blocksSent: 0,
@@ -1041,14 +1081,28 @@ export class TransferService {
     const record = await this.localRecord(transferId, sessionId);
     const state = record.direction === "download"
       ? record.state ?? "prepared"
-      : (await this.raw<{ state: string }>("transfer_status", sessionId, { transferId })).state;
+      : await this.raw<{ state: string }>("transfer_status", sessionId, { transferId })
+        .then(observed => observed.state)
+        .catch(error => {
+          // The remote registration may already be reclaimed (#16). A locally
+          // converged terminal mirror is then the only authority left, and it
+          // is sufficient to consume: without this fallback a converged
+          // upload record could never be acknowledged at all.
+          if ((error as RemoteAgentError).code !== "REQUEST_EXPIRED_OR_UNKNOWN") throw error;
+          if (typeof record.state !== "string") throw error;
+          return record.state;
+        });
     if (state === "unknown") {
       throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN", "An unverified outcome cannot be acknowledged; inspect it first");
     }
     if (!TERMINAL_TRANSFER_STATES.has(state)) {
       throw new RemoteAgentError("TRANSFER_NOT_FINISHED", "Only a terminal transfer result can be acknowledged");
     }
-    await this.raw("transfer_ack", sessionId, { transferId });
+    // A reclaimed remote registration has nothing left to consume remotely;
+    // the local ack.json is then the whole record.
+    await this.raw("transfer_ack", sessionId, { transferId }).catch(error => {
+      if ((error as RemoteAgentError).code !== "REQUEST_EXPIRED_OR_UNKNOWN") throw error;
+    });
     await atomicJson(join(this.directory, transferId, "ack.json"),
       { schemaVersion: 1, transferId, state, acknowledgedAt: new Date().toISOString() });
     return { acknowledged: true, transferId, state };
@@ -1079,12 +1133,16 @@ export class TransferService {
         if (ack.transferId !== entry.name) throw new RemoteAgentError("REGISTRY_CORRUPT", "Invalid transfer acknowledgement");
         continue; // already consumed
       } catch (error) {
-        if (!isMissing(error) && (error as RemoteAgentError).code === "REGISTRY_CORRUPT") {
-          // No valid acknowledgement exists: it stays pending, with the issue noted.
-          this.transferRegistryIssues.push({ transferId: entry.name, code: "INVALID_ACKNOWLEDGEMENT" });
-        } else if (!isMissing(error) && (error as NodeJS.ErrnoException).code !== "ENOENT") {
-          this.transferRegistryIssues.push({ transferId: entry.name, code: "REGISTRY_CORRUPT" });
-          continue;
+        if (!isMissing(error)) {
+          // An unreadable (torn JSON) or mismatching acknowledgement is an
+          // INVALID one: the transfer stays pending with the defect reported,
+          // never silently treated as consumed (contracts: pending section).
+          if ((error as RemoteAgentError).code === "REGISTRY_CORRUPT" || error instanceof SyntaxError) {
+            this.transferRegistryIssues.push({ transferId: entry.name, code: "INVALID_ACKNOWLEDGEMENT" });
+          } else {
+            this.transferRegistryIssues.push({ transferId: entry.name, code: "REGISTRY_CORRUPT" });
+            continue;
+          }
         }
       }
       pending.push({ transferId: entry.name, direction: record.direction,

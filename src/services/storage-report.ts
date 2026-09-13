@@ -30,6 +30,7 @@ const REASON_LIMIT = 200;
 
 interface MaintenanceCounters {
   lastCompletedAt: number;
+  lastRunAt?: number;
   removedTasks?: number;
   removedTransfers?: number;
   reclaimedResources?: number;
@@ -53,11 +54,35 @@ export interface StorageFilesGateway {
 interface LocalMaintenanceState {
   schemaVersion?: number;
   lastCompletedAt?: unknown;
+  lastRunAt?: unknown;
   lastLocalSummary?: { removedTasks?: unknown; removedTransfers?: unknown; reclaimedResources?: unknown; itemsConsidered?: unknown };
 }
 
 function counter(value: unknown): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+/** The remote helper's clock is time.time() (seconds, reclaim.py), while this
+ * end reports Date.now() milliseconds. The assembly layer normalizes the
+ * remote maintenance timestamps to milliseconds so both ends of one report
+ * share one unit (review R3; the remote helper itself is left untouched).
+ * A value below 1e11 cannot be a millisecond epoch of any plausible year, so
+ * it is treated as seconds; zeros (never ran) stay zero. */
+function normalizeRemoteTimestamp(value: number): number {
+  return Number.isFinite(value) && value > 0 && value < 1e11 ? value * 1000 : value;
+}
+
+function normalizeRemoteMaintenance(storage: EndSummary): EndSummary {
+  const maintenance = storage.maintenance as unknown as Record<string, unknown> | undefined;
+  if (!maintenance || typeof maintenance !== "object") return storage;
+  const normalized = { ...maintenance };
+  if (typeof normalized.lastCompletedAt === "number") {
+    normalized.lastCompletedAt = normalizeRemoteTimestamp(normalized.lastCompletedAt);
+  }
+  if (typeof normalized.lastRunAt === "number") {
+    normalized.lastRunAt = normalizeRemoteTimestamp(normalized.lastRunAt);
+  }
+  return { ...storage, maintenance: normalized as unknown as MaintenanceCounters };
 }
 
 /** Aggregate the persisted local maintenance record into counters. The stored
@@ -68,15 +93,16 @@ async function readLocalMaintenance(identityDirectory: string): Promise<Maintena
   try {
     state = JSON.parse(await readFile(join(identityDirectory, "maintenance.json"), "utf8"));
   } catch {
-    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
+    return { lastCompletedAt: 0, lastRunAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
   }
   if (typeof state !== "object" || state === null) {
-    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
+    return { lastCompletedAt: 0, lastRunAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
   }
   const summary = typeof state.lastLocalSummary === "object" && state.lastLocalSummary !== null
     ? state.lastLocalSummary : {};
   return {
     lastCompletedAt: typeof state.lastCompletedAt === "number" ? state.lastCompletedAt : 0,
+    lastRunAt: typeof state.lastRunAt === "number" ? state.lastRunAt : 0,
     removedTasks: Array.isArray(summary.removedTasks) ? summary.removedTasks.length : counter(summary.removedTasks),
     removedTransfers: Array.isArray(summary.removedTransfers) ? summary.removedTransfers.length : counter(summary.removedTransfers),
     reclaimedResources: Array.isArray(summary.reclaimedResources) ? summary.reclaimedResources.length : counter(summary.reclaimedResources),
@@ -142,7 +168,9 @@ export async function buildStorageReport(
     const result = await files.call("file_workspace", sessionId, { includeStorage: true });
     const storage = (result as { storage?: unknown } | null)?.storage;
     if (isEndSummary(storage)) {
-      remote = storage;
+      // The helper's maintenance timestamps are second-precision; normalize
+      // them to the local end's milliseconds here (review R3).
+      remote = normalizeRemoteMaintenance(storage);
     } else {
       // Reachable helper without a storage section (upgrade window): absent
       // data is unknown, never zeros.

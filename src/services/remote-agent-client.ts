@@ -183,7 +183,8 @@ export class RemoteAgentClient {
     }
   }
 
-  async call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>): Promise<T> {
-    return this.exchange(action, Buffer.from(JSON.stringify(request), "utf8"));
+  async call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>,
+    options: { timeoutMs?: number } = {}): Promise<T> {
+    return this.exchange(action, Buffer.from(JSON.stringify(request), "utf8"), options);
   }
 }

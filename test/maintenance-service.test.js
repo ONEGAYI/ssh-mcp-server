@@ -47,13 +47,17 @@ async function writeTransfer(identityDir, transferId, record, extra = {}) {
 function recordingRemote(outcome = { completed: true }) {
   const remote = {
     calls: [],
-    async call(action, request) {
-      remote.calls.push({ action, request });
+    async call(action, request, options) {
+      remote.calls.push({ action, request, options });
       if (typeof outcome === 'function') return outcome(action, request);
       return outcome;
     },
   };
   return remote;
+}
+
+async function readMaintenanceState(identityDir) {
+  return JSON.parse(await readFile(join(identityDir, 'maintenance.json'), 'utf8'));
 }
 
 it('reclaims expired local task records, keeps fresh ones, and drives the remote round', async () => {
@@ -151,6 +155,60 @@ it('expires local transfer records by terminal retention and stalled TTL, releas
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+it('expires stalled upload mirror records by their recorded TTL like downloads (review R1)', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const staleUpload = hex32();
+  const liveUpload = hex32();
+  const untimestampedUpload = hex32();
+  try {
+    // Upload mirrors carry no state of their own; the expiry is the recorded
+    // TTL, exactly like a stalled download receiver record.
+    await writeTransfer(fixture.identityDir, staleUpload, {
+      schemaVersion: 1, transferId: staleUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now() - 4 * DAY, expiresAt: Date.now() - DAY,
+    });
+    await writeTransfer(fixture.identityDir, liveUpload, {
+      schemaVersion: 1, transferId: liveUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now(), expiresAt: Date.now() + 3 * DAY,
+    });
+    // Pre-R1 upload records have no expiresAt: kept conservatively.
+    await writeTransfer(fixture.identityDir, untimestampedUpload, {
+      schemaVersion: 1, transferId: untimestampedUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now() - 40 * DAY,
+    });
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', staleUpload)).then(() => true, () => false), false,
+      'an expired upload mirror must be reclaimed');
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', liveUpload)).then(() => true, () => false), true);
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', untimestampedUpload)).then(() => true, () => false), true);
+    assert.deepEqual(result.local.removedTransfers, [staleUpload]);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+it('unknown download records are non-terminal: they expire by their TTL, not the terminal retention (review R2)', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const expiredUnknown = hex32();
+  const freshUnknown = hex32();
+  try {
+    for (const [id, offset] of [[expiredUnknown, -DAY], [freshUnknown, 3 * DAY]]) {
+      await writeTransfer(fixture.identityDir, id, {
+        schemaVersion: 1, transferId: id, workspaceId: 'maint-test', sessionId: 's',
+        direction: 'download', state: 'unknown', tempPath: null, resourceId: null,
+        completedAt: Date.now() - DAY, error: { code: 'TRANSFER_STATE_UNKNOWN', message: 'inspect manually' },
+        registeredAt: Date.now() - 4 * DAY, expiresAt: Date.now() + offset,
+      });
+    }
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', expiredUnknown)).then(() => true, () => false), false,
+      'an unknown record past its TTL is reclaimed with the retention window');
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', freshUnknown)).then(() => true, () => false), true,
+      'a fresh unknown record stays for manual inspection');
+    assert.deepEqual(result.local.removedTransfers, [expiredUnknown]);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 it('throttles by the persisted maintenance interval', async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();
@@ -194,13 +252,137 @@ it('a failed remote round keeps the timestamp unset so the next trigger retries 
     const service = new MaintenanceService(fixture.config, remote);
     const first = await service.maybeMaintain();
     assert.equal(first.remoteError, 'connection down');
-    assert.equal(await stat(join(fixture.identityDir, 'maintenance.json')).then(() => true, () => false), false,
-      'no completion timestamp after a failed remote round');
+    assert.equal(await stat(join(fixture.identityDir, 'maintenance.json')).then(() => true, () => false), true,
+      'the attempt itself is recorded (lastRunAt / lastRemoteAttemptAt) even when the remote round fails');
+    const afterFailure = await readMaintenanceState(fixture.identityDir);
+    assert.equal(afterFailure.lastCompletedAt, 0, 'no completion timestamp after a failed remote round');
+    assert.ok(afterFailure.lastRemoteAttemptAt > 0);
+    // The five-minute failure backoff has elapsed by the next trigger: the
+    // retry runs for real and completes.
+    afterFailure.lastRemoteAttemptAt = Date.now() - 6 * 60_000;
+    await writeFile(join(fixture.identityDir, 'maintenance.json'), JSON.stringify(afterFailure));
     failing = false;
     const second = await service.maybeMaintain();
     assert.equal(second.remoteError, undefined);
-    const state = JSON.parse(await readFile(join(fixture.identityDir, 'maintenance.json'), 'utf8'));
+    const state = await readMaintenanceState(fixture.identityDir);
     assert.ok(state.lastCompletedAt > 0);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+it('records lastRunAt for every executed round, whether the remote round succeeds or fails (review R3)', async () => {
+  assert.ok(MaintenanceService, 'MaintenanceService is not implemented');
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  try {
+    await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    const state = await readMaintenanceState(fixture.identityDir);
+    assert.equal(typeof state.lastRunAt, 'number');
+    assert.ok(state.lastRunAt > 0 && state.lastRunAt <= Date.now(), 'the executed round stamps lastRunAt');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  const failing = await buildFixture();
+  const down = recordingRemote(() => { const error = new Error('connection down'); throw error; });
+  try {
+    await new MaintenanceService(failing.config, down).maybeMaintain();
+    const state = await readMaintenanceState(failing.identityDir);
+    assert.equal(typeof state.lastRunAt, 'number');
+    assert.ok(state.lastRunAt > 0 && state.lastRunAt <= Date.now(), 'a failed round is still a run');
+  } finally { await rm(failing.root, { recursive: true, force: true }); }
+});
+
+it('passes the remote call a timeout that covers the configured time budget (review R6)', async () => {
+  assert.ok(MaintenanceService, 'MaintenanceService is not implemented');
+  const bigBudget = await buildFixture({ maintenance: { timeBudgetMs: 3_600_000 } });
+  const remote = recordingRemote();
+  try {
+    await new MaintenanceService(bigBudget.config, remote).maybeMaintain();
+    assert.equal(remote.calls.length, 1);
+    assert.ok(remote.calls[0].options && typeof remote.calls[0].options.timeoutMs === 'number',
+      'the maintenance call must carry an explicit exchange timeout');
+    assert.ok(remote.calls[0].options.timeoutMs >= 3_600_000 + 15_000,
+      'the timeout must cover the full remote budget plus slack, not the 30 s command default');
+  } finally { await rm(bigBudget.root, { recursive: true, force: true }); }
+  const smallBudget = await buildFixture({ maintenance: { timeBudgetMs: 2_000 } });
+  const smallRemote = recordingRemote();
+  try {
+    await new MaintenanceService(smallBudget.config, smallRemote).maybeMaintain();
+    assert.ok(smallRemote.calls[0].options.timeoutMs >= 60_000,
+      'small budgets still get the one-minute floor');
+  } finally { await rm(smallBudget.root, { recursive: true, force: true }); }
+});
+
+it('a half-written lock file is cleaned up so the next attempt is not permanently busy (review R8)', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const scratch = await open(join(fixture.root, 'probe'), 'w');
+  const handlePrototype = Object.getPrototypeOf(scratch);
+  await scratch.close();
+  const original = handlePrototype.writeFile;
+  try {
+    // ENOSPC/EIO shape: the exclusive lock file opens fine but its content
+    // write fails, leaving a zero-byte lock behind unless cleaned up.
+    let injected = false;
+    handlePrototype.writeFile = async function (buffer, ...rest) {
+      if (!injected) {
+        injected = true;
+        throw Object.assign(new Error('simulated no space'), { code: 'ENOSPC' });
+      }
+      return original.call(this, buffer, ...rest);
+    };
+    await assert.rejects(new MaintenanceService(fixture.config, remote).maybeMaintain(),
+      error => error.code === 'ENOSPC');
+    handlePrototype.writeFile = original;
+    // The failed writer removed its own half-written lock...
+    await assert.rejects(stat(join(fixture.identityDir, 'maintenance.lock')),
+      error => error.code === 'ENOENT', 'the half-written lock must be cleaned up');
+    // ...so the next trigger acquires the lock instead of reading a corrupt
+    // holder forever and skipping as busy.
+    const recovered = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(recovered.skipped, undefined, JSON.stringify(recovered));
+    assert.equal(remote.calls.length, 1, 'the remote round ran once the lock healed');
+  } finally {
+    handlePrototype.writeFile = original;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+it('backs off the remote round for five minutes after a failure while local reclamation continues (review R12)', async () => {
+  const fixture = await buildFixture();
+  let failing = true;
+  const remote = recordingRemote((action) => {
+    if (failing) { const error = new Error('connection down'); error.retriable = true; throw error; }
+    return { completed: true };
+  });
+  try {
+    const service = new MaintenanceService(fixture.config, remote);
+    const first = await service.maybeMaintain();
+    assert.equal(first.remoteError, 'connection down');
+    assert.equal(remote.calls.length, 1);
+    // A task that expires during the offline window.
+    await writeTask(fixture.identityDir, 'job-backoff', {
+      'record.json': { schemaVersion: 1, jobId: 'job-backoff', workspaceId: 'maint-test' },
+      'ack.json': { jobId: 'job-backoff', acknowledgedAt: new Date(Date.now() - 40 * DAY).toISOString() },
+    });
+    // Immediate retrigger: the remote round is skipped for the backoff
+    // window (no per-tool-call 30 s connection timeout stacking)...
+    const second = await service.maybeMaintain();
+    assert.equal(remote.calls.length, 1, 'the backoff window must not retry the remote round');
+    assert.equal(second.remoteSkipped, 'backoff');
+    assert.equal(second.remoteError, undefined);
+    // ...while local reclamation keeps running normally.
+    assert.deepEqual(second.local.removedTasks, ['job-backoff']);
+    assert.equal(await stat(join(fixture.identityDir, 'tasks', 'job-backoff')).then(() => true, () => false), false);
+    // No completion was recorded for the skipped round: the catch-up duty stands.
+    assert.equal((await readMaintenanceState(fixture.identityDir)).lastCompletedAt, 0);
+    // Once the backoff window lapses, the remote round retries (offline
+    // reconnect semantics preserved) and completes.
+    failing = false;
+    const state = await readMaintenanceState(fixture.identityDir);
+    state.lastRemoteAttemptAt = Date.now() - 6 * 60_000;
+    await writeFile(join(fixture.identityDir, 'maintenance.json'), JSON.stringify(state));
+    const third = await service.maybeMaintain();
+    assert.equal(remote.calls.length, 2);
+    assert.equal(third.remoteError, undefined);
+    assert.ok((await readMaintenanceState(fixture.identityDir)).lastCompletedAt > 0);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 

@@ -36,10 +36,21 @@ import { SpaceLedger } from "./space-ledger.js";
 const TASK_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const TRANSFER_ID = /^[0-9a-f]{32}$/;
 const TERMINAL_TRANSFER_STATES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+/** While consecutive remote rounds fail, the retry waits this long before
+ * paying another connection timeout (review R12): offline windows must not
+ * stack a 30 s SSH connect delay onto every tool call. */
+const REMOTE_FAILURE_BACKOFF_MS = 300_000;
 
 interface MaintenanceState {
   schemaVersion: 1;
   lastCompletedAt: number;
+  /** The last round that actually ran, success or failure (the local twin of
+   * the remote lastRunAt; review R3 -- both ends feed the storage report). */
+  lastRunAt?: number;
+  /** The last remote attempt; the failure backoff window is measured from
+   * here (review R12). Cleared implicitly on success: a completed round
+   * throttles by lastCompletedAt instead. */
+  lastRemoteAttemptAt?: number;
   lastLocalSummary?: LocalSummary;
   lastRemoteSummary?: unknown;
   lastRemoteError?: string;
@@ -57,11 +68,15 @@ export interface MaintenanceOutcome {
   local?: LocalSummary;
   remote?: unknown;
   remoteError?: string;
+  /** The remote round was skipped by the failure backoff window (review R12);
+   * local reclamation still ran and lastCompletedAt stays unset. */
+  remoteSkipped?: "backoff";
   lastCompletedAt?: number;
 }
 
 export interface MaintenanceRemote {
-  call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>): Promise<T>;
+  call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>,
+    options?: { timeoutMs?: number }): Promise<T>;
 }
 
 function isMissing(error: unknown): boolean {
@@ -144,7 +159,12 @@ export class MaintenanceService {
         await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
         return { handle };
       } catch (error) {
+        // The file was exclusively created by this attempt: a failed content
+        // write (ENOSPC/EIO) must remove it again. Leaving a zero-byte lock
+        // behind would parse as no holder on every later read and look busy
+        // forever (review R8).
         await handle.close();
+        await unlink(this.lockPath).catch(() => undefined);
         throw error;
       }
     }
@@ -221,16 +241,6 @@ export class MaintenanceService {
     return true;
   }
 
-  /** Reclaim crash-leftover local ledger resources (spec 7.2, issue #17).
-   *
-   * Occupancy evidence mirrors the remote end: the holder pid decides
-   * liveness (Windows offers no boot-anchored identity; that limitation is
-   * documented on SpaceLedger), and the recorded dev:ino identity decides
-   * whether the object at the registered path is still ours. A live holder
-   * keeps everything; a dead holder releases the registration, deleting the
-   * file only when the identity matches. A never-anchored identity stays
-   * behind as management fields only; files without any registration are
-   * never this pass's business. Age never flips a verdict. */
   /** Resource ids that living transfer records still manage themselves.
    *
    * A transfer's receiver temp and its ledger entry live across many short
@@ -241,7 +251,7 @@ export class MaintenanceService {
     const managed = new Set<string>();
     let entries;
     try { entries = await readdir(this.transfersDirectory, { withFileTypes: true }); }
-    catch (error) { if (isMissing(error)) return managed; throw error; }
+    catch (error) { if (!isMissing(error)) throw error; return managed; }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       try {
@@ -252,6 +262,16 @@ export class MaintenanceService {
     return managed;
   }
 
+  /** Reclaim crash-leftover local ledger resources (spec 7.2, issue #17).
+   *
+   * Occupancy evidence mirrors the remote end: the holder pid decides
+   * liveness (Windows offers no boot-anchored identity; that limitation is
+   * documented on SpaceLedger), and the recorded dev:ino identity decides
+   * whether the object at the registered path is still ours. A live holder
+   * keeps everything; a dead holder releases the registration, deleting the
+   * file only when the identity matches. A never-anchored identity stays
+   * behind as management fields only; files without any registration are
+   * never this pass's business. Age never flips a verdict. */
   private async reclaimLedgerResources(ledger: SpaceLedger,
     policy: Awaited<ReturnType<typeof loadPolicy>>, summary: LocalSummary, deadline: number): Promise<void> {
     let resources: Record<string, Record<string, unknown>> = {};
@@ -338,6 +358,10 @@ export class MaintenanceService {
       if (Date.now() - fresh.lastCompletedAt < policy.maintenance.intervalMs) {
         return { skipped: "interval" };
       }
+      // A real round is running now, success or failure: stamp it durably
+      // before anything can fail (review R3, the twin of the remote lastRunAt).
+      const round = { ...fresh, schemaVersion: 1 as const, lastRunAt: Date.now() };
+      await this.writeState(round);
       const deadline = Date.now() + policy.maintenance.timeBudgetMs;
       const local = await this.reclaimLocal(policy, deadline);
       const retentionMs = {
@@ -349,19 +373,38 @@ export class MaintenanceService {
       };
       let remote: unknown;
       let remoteError: string | undefined;
+      let remoteSkipped: "backoff" | undefined;
       if (this.remote) {
-        try {
-          remote = await this.remote.call("maintenance", { retentionMs,
-            maxItemsPerRun: policy.maintenance.maxItemsPerRun, timeBudgetMs: policy.maintenance.timeBudgetMs });
-        } catch (error) {
-          remoteError = (error as Error).message;
+        // Consecutive-failure backoff (review R12): within the window after a
+        // failed attempt the remote round is skipped entirely -- local
+        // reclamation above still ran. Once the window lapses, the next
+        // trigger retries for real (offline reconnect catch-up is preserved).
+        if (typeof round.lastRemoteAttemptAt === "number"
+          && Date.now() - round.lastRemoteAttemptAt < REMOTE_FAILURE_BACKOFF_MS) {
+          remoteSkipped = "backoff";
+        } else {
+          // Persist the attempt moment before the call: a hard failure during
+          // the exchange must still open the backoff window.
+          await this.writeState({ ...round, lastRemoteAttemptAt: Date.now() });
+          try {
+            remote = await this.remote.call("maintenance", { retentionMs,
+              maxItemsPerRun: policy.maintenance.maxItemsPerRun, timeBudgetMs: policy.maintenance.timeBudgetMs },
+              // The remote round may legally spend the whole configured budget
+              // (up to 3.6e6 ms); the 30 s command default would kill every
+              // large-budget round at the client (review R6).
+              { timeoutMs: Math.max(60_000, policy.maintenance.timeBudgetMs + 15_000) });
+          } catch (error) {
+            remoteError = (error as Error).message;
+          }
         }
       }
-      if (remoteError === undefined) {
-        const completed: MaintenanceState = { schemaVersion: 1, lastCompletedAt: Date.now(), lastLocalSummary: local, lastRemoteSummary: remote };
+      if (remoteError === undefined && remoteSkipped === undefined) {
+        const completed: MaintenanceState = { schemaVersion: 1, lastCompletedAt: Date.now(),
+          lastRunAt: round.lastRunAt, lastLocalSummary: local, lastRemoteSummary: remote };
         await this.writeState(completed);
         return { local, remote, lastCompletedAt: completed.lastCompletedAt };
       }
+      if (remoteSkipped === "backoff") return { local, remoteSkipped };
       return { local, remoteError };
     } finally {
       await unlink(this.lockPath).catch(() => undefined);

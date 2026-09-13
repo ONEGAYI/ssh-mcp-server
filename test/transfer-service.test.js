@@ -1285,3 +1285,127 @@ it('pending tolerates broken registrations through registry issues', async () =>
     assert.equal(transfers.transferRegistryIssues[0].code, 'TRANSFER_NOT_FOUND');
   } finally { await fake.cleanup(); }
 });
+
+// --- upload-side local record lifecycle (review R1/R2/R9) ----------------------
+
+const DAY_MS = 86400000;
+
+it('upload registrations carry the same expiresAt TTL as downloads and refresh it on resume', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const source = await writeSource(fake.workspace, 'ttl-up-' + randomUUID() + '.bin', Buffer.alloc(CHUNK * 4, 0x1a));
+    fake.blockDelayMs = 400;
+    const partial = await transfers.upload('session-a', {
+      localPath: source.target, path: 'ttl-up-dest.bin', chunkSize: CHUNK, budgetMs: 1000,
+    });
+    assert.equal(partial.state, 'transferring');
+    fake.blockDelayMs = 0;
+    const recordPath = join(localTransfersDir(fake), partial.transferId, 'record.json');
+    const record = JSON.parse(await readFile(recordPath, 'utf8'));
+    assert.equal(typeof record.expiresAt, 'number', 'upload records must record their TTL');
+    assert.ok(record.expiresAt > Date.now() + 2 * DAY_MS, 'the TTL is the 3-day transfer window');
+    assert.ok(record.expiresAt <= Date.now() + 3 * DAY_MS + 60_000);
+    // Simulate elapsed time, then resume: the mirror TTL refreshes like the
+    // download driver refreshes it per block.
+    record.expiresAt = Date.now() - DAY_MS;
+    await writeFile(recordPath, JSON.stringify(record));
+    await transfers.resume('session-a', partial.transferId);
+    const refreshed = JSON.parse(await readFile(recordPath, 'utf8'));
+    assert.ok(refreshed.expiresAt > Date.now() + 2 * DAY_MS, 'resume refreshes the mirrored expiry');
+  } finally { await fake.cleanup(); }
+});
+
+it('a remotely reclaimed upload converges the local record to failed and stays consumable', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.alloc(200, 0x1b);
+    const source = await writeSource(fake.workspace, 'reclaim-up-' + randomUUID() + '.bin', data);
+    const first = await transfers.upload('session-a', {
+      localPath: source.target, path: 'reclaim-up-dest.bin', chunkSize: CHUNK, budgetMs: 1000 });
+    const second = await transfers.upload('session-a', {
+      localPath: source.target, path: 'reclaim-up-dest2.bin', chunkSize: CHUNK, budgetMs: 1000 });
+    // The remote retention (#16) reclaimed both registrations after 3 days.
+    fake.records.delete(first.transferId);
+    fake.records.delete(second.transferId);
+    // resume reports the expiry and CONVERGES the local mirror to a terminal
+    // failure instead of leaving a zombie pending that fails every session.
+    await assert.rejects(transfers.resume('session-a', first.transferId),
+      error => error.code === 'REQUEST_EXPIRED_OR_UNKNOWN');
+    let record = JSON.parse(await readFile(join(localTransfersDir(fake), first.transferId, 'record.json'), 'utf8'));
+    assert.equal(record.state, 'failed');
+    assert.equal(record.error.code, 'REQUEST_EXPIRED_OR_UNKNOWN');
+    assert.ok(record.completedAt > 0);
+    // cancel converges the same way.
+    await assert.rejects(transfers.cancel('session-a', second.transferId),
+      error => error.code === 'REQUEST_EXPIRED_OR_UNKNOWN');
+    record = JSON.parse(await readFile(join(localTransfersDir(fake), second.transferId, 'record.json'), 'utf8'));
+    assert.equal(record.state, 'failed');
+    assert.equal(record.error.code, 'REQUEST_EXPIRED_OR_UNKNOWN');
+    // The converged record stays visible in pending until consumed...
+    let pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId).sort(), [first.transferId, second.transferId].sort());
+    // ...and acknowledging it works even though the remote record is gone.
+    const acked = await transfers.acknowledge('session-a', first.transferId);
+    assert.equal(acked.acknowledged, true);
+    assert.equal(acked.state, 'failed');
+    assert.ok(await stat(join(localTransfersDir(fake), first.transferId, 'ack.json')).then(() => true, () => false));
+    assert.equal((await transfers.acknowledge('session-a', first.transferId)).acknowledged, true, 'idempotent');
+    pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId), [second.transferId]);
+  } finally { await fake.cleanup(); }
+});
+
+it('insufficient download commit evidence stays unknown: not failed, not acknowledged, not cancelled', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'unknown-evidence.bin');
+    const directory = join(localTransfersDir(fake), partial.transferId);
+    // Crash shape: the record sits in the commit window but neither the
+    // target nor the temp matches the persisted intent -- no proof either way.
+    await rm(join(fake.workspace, '.ssh-mcp-download-' + partial.transferId));
+    const intent = { schemaVersion: 1, targetPath: join(fake.workspace, 'unknown-evidence.bin'),
+      expectedVersion: null, overwrite: false, create: false,
+      tempIdentity: '9:9', totalSha256: 'f'.repeat(64), totalBytes: 12345, plannedAt: Date.now() };
+    const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    record.state = 'committing';
+    await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+    await writeFile(join(directory, 'intent.json'), JSON.stringify(intent));
+    await assert.rejects(transfers.resume('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_STATE_UNKNOWN');
+    const after = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    assert.equal(after.state, 'unknown', 'unprovable outcomes must not collapse into failed');
+    assert.equal(after.error.code, 'TRANSFER_STATE_UNKNOWN');
+    assert.ok(after.completedAt > 0);
+    // The unknown defence line is reachable: neither ack nor cancel consume it.
+    await assert.rejects(transfers.acknowledge('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_STATE_UNKNOWN');
+    await assert.rejects(transfers.cancel('session-a', partial.transferId),
+      error => error.code === 'TRANSFER_STATE_UNKNOWN');
+    // A later resume only observes the unknown outcome, never re-drives it.
+    const fetches = fake.exchanges.filter(exchange => exchange.action === 'transfer_fetch').length;
+    const observed = await transfers.resume('session-a', partial.transferId);
+    assert.equal(observed.state, 'unknown');
+    assert.equal(fake.exchanges.filter(exchange => exchange.action === 'transfer_fetch').length, fetches,
+      'an unknown outcome must not move more blocks');
+  } finally { await fake.cleanup(); }
+});
+
+it('a corrupted ack.json keeps the transfer pending with an INVALID_ACKNOWLEDGEMENT issue', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'pending-corrupt-ack.bin');
+    const ackPath = join(localTransfersDir(fake), partial.transferId, 'ack.json');
+    // Torn/garbled JSON: same treatment as an invalid acknowledgement -- the
+    // transfer stays pending and the defect is reported, never hidden.
+    await writeFile(ackPath, '{"transferId": "not json', 'utf8');
+    let pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId), [partial.transferId]);
+    assert.deepEqual(transfers.transferRegistryIssues,
+      [{ transferId: partial.transferId, code: 'INVALID_ACKNOWLEDGEMENT' }]);
+    // Well-formed JSON naming a different transfer: the existing locked shape.
+    await writeFile(ackPath, JSON.stringify({ transferId: 'f'.repeat(32), acknowledgedAt: new Date().toISOString() }));
+    pending = await transfers.pending('session-a');
+    assert.deepEqual(pending.map(entry => entry.transferId), [partial.transferId]);
+    assert.equal(transfers.transferRegistryIssues[0].code, 'INVALID_ACKNOWLEDGEMENT');
+  } finally { await fake.cleanup(); }
+});
