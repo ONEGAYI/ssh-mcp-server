@@ -483,7 +483,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
         'link', 'logs', 'logs/keep.log', 'logs/skip.log', 'nested', 'nested/.gitignore',
         'nested/deep', 'nested/deep/kept.txt', 'nested/inner.txt', 'nested/keep.txt', 'visible.log']
     FIND_ALL_GITIGNORE = [
-        '.dotdir', '.dotdir/inner.txt', '.gitignore', 'a.txt', 'b.txt', 'empty-dir',
+        '.dotdir', '.dotdir/inner.txt', '.gitignore', '.hidden.txt', 'a.txt', 'b.txt', 'empty-dir',
         'link', 'logs', 'logs/keep.log', 'nested', 'nested/.gitignore', 'nested/deep',
         'nested/deep/kept.txt', 'nested/inner.txt', 'nested/keep.txt', 'visible.log']
     FIND_ALL_HIDDEN_OFF = [
@@ -593,9 +593,15 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertEqual(crashed['entries'], baseline['entries'])
 
     def test_find_byte_budget_stops_enumeration_with_resumable_lossless_cursor(self):
+        # Non-matching candidates charge the enumeration budget by path bytes
+        # without filling the result page, so the 64 KiB byte budget stops the
+        # walk mid-stream before any matching entry is even reached; later
+        # pages resume after the last considered candidate without loss.
+        for index in range(2500):
+            self.write('aa-padding-entry-with-longer-names-{:04}.log'.format(index), 'x')
         for index in range(1700):
             self.write('f{:04}.txt'.format(index), 'x')
-        first = self.call('file_find', {'path': '.', 'pattern': 'f*.txt',
+        first = self.call('file_find', {'path': '.', 'pattern': 'f*.txt', 'limit': 1000,
                                          'scanBudgetBytes': 64 * 1024})['result']
         self.assertTrue(first['truncated'])
         self.assertEqual(first['reason'], 'SCAN_BYTE_LIMIT')
@@ -604,7 +610,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
         collected = [entry['path'] for entry in first['entries']]
         cursor, pages = first['nextCursor'], 1
         while cursor:
-            result = self.call('file_find', {'path': '.', 'pattern': 'f*.txt',
+            result = self.call('file_find', {'path': '.', 'pattern': 'f*.txt', 'limit': 1000,
                                               'scanBudgetBytes': 64 * 1024,
                                               'cursor': cursor})['result']
             collected.extend(entry['path'] for entry in result['entries'])
