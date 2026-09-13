@@ -24,6 +24,22 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
     assert.equal((await call('remote_workspace')).data.capabilities.persistentTasks, true);
+    // Issue #19: the default workspace reply stays free of statistics; the
+    // opt-in storage report is a bounded two-end ledger + maintenance summary.
+    const plainWorkspace = await call('remote_workspace');
+    assert.equal('storage' in plainWorkspace.data, false, 'default call must not attach statistics');
+    const storage = await call('remote_workspace', { includeStorage: true });
+    assert.equal(storage.error, undefined, JSON.stringify(storage));
+    const report = storage.data.storage;
+    for (const end of ['local', 'remote']) {
+      assert.equal(typeof report[end].usedBytes, 'number', end);
+      assert.equal(report[end].usedBytes,
+        report[end].stateBytes + report[end].tempBytes + report[end].reservedBytes, end);
+      assert.equal(typeof report[end].limitBytes, 'number', end);
+      assert.equal(typeof report[end].maintenance.lastCompletedAt, 'number', end);
+    }
+    assert.equal('status' in report.remote, false, 'a reachable end reports numbers, not unknown');
+    assert.ok(Buffer.byteLength(JSON.stringify(storage.data), 'utf8') <= 4096, 'the report stays within the 4 KiB budget');
     // metadataOnly observes the version (or absence) without content or a credential.
     const absent = await call('remote_read', { path: 'never-created-' + sessionId, metadataOnly: true });
     assert.equal(absent.error, undefined, JSON.stringify(absent));
