@@ -3,6 +3,7 @@ import { posix } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { parseArgs } from "node:util";
 import { createWorkspaceRuntime } from "../services/workspace-runtime.js";
+import { FileService } from "../services/file-service.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { RemoteTask } from "../services/task-service.js";
 
@@ -48,7 +49,7 @@ async function main(): Promise<void> {
   const runtime = await createWorkspaceRuntime(values.workspace);
   try {
     if (action === "cleanup") { console.log(JSON.stringify(await runtime.remote.call("cleanup", { retentionDays: numberOption(values["retention-days"]) ?? 7 }))); return; }
-    if (action === "doctor") { console.log(JSON.stringify(await runtime.remote.call("file_workspace", { sessionId: values.session, workspaceRoot: runtime.config.remoteRoot }))); return; }
+    if (action === "doctor") { console.log(JSON.stringify(await new FileService(runtime.remote, runtime.config).call("file_workspace", values.session))); return; }
     if (action === "pending") { console.log(JSON.stringify({ tasks: await runtime.tasks.pending(values.session) })); return; }
     let jobId = values["job-id"];
     if (action === "run") {

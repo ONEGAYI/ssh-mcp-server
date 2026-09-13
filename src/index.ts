@@ -5,11 +5,13 @@ import { SERVER_CONFIG } from "./config/server.js";
 import { Logger } from "./utils/logger.js";
 import { runWorkspaceServer } from "./core/workspace-server.js";
 import { runSetupServer } from "./core/setup-server.js";
+import { parseArgs } from "node:util";
+import { resolve } from "node:path";
 
 const HELP_TEXT = `Usage: ssh-mcp-server [options] [host port username password]
 
 Options:
-  --setup                          Setup MCP: ask Agent to call remote_setup and prepare project integration
+  --setup [--config-file <path>]   Setup MCP with optional reusable named SSH connections
   --workspace <profile.json>       Guarded remote-development mode (separate from legacy tools)
   --config-file <path>             Load SSH server configs from a JSON file
   --ssh-config-file <path>         Read host aliases from SSH config (default: ~/.ssh/config)
@@ -55,8 +57,8 @@ async function main(): Promise<void> {
   }
 
   if (hasArg("--setup")) {
-    if (process.argv.slice(2).length !== 1) throw new Error("Use --setup without legacy or workspace options");
-    await runSetupServer();
+    const { values } = parseArgs({ options: { setup: { type: "boolean" }, "config-file": { type: "string" } } });
+    await runSetupServer(values["config-file"] ? resolve(values["config-file"]) : undefined);
     return;
   }
   if (hasArg("--workspace")) {

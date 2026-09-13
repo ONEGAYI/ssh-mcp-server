@@ -80,14 +80,20 @@ def replaceable(info):
 
 
 class FileService:
-    def __init__(self, state_root, workspace_root, session_id, allowed_roots=None):
+    def __init__(self, state_root, workspace_root, session_id, allowed_roots=None, directory_scope='restricted'):
         if not isinstance(workspace_root, str) or not os.path.isabs(workspace_root):
             raise AgentError('INVALID_WORKSPACE', 'Workspace must have an absolute remote root')
+        if directory_scope not in ('restricted', 'unrestricted'):
+            raise AgentError('INVALID_REQUEST', "directoryScope must be 'restricted' or 'unrestricted'")
         if not isinstance(session_id, str) or not session_id or len(session_id) > 256 or '\0' in session_id:
             raise AgentError('INVALID_SESSION', 'A session identifier is required')
         self.workspace = Path(workspace_root).resolve(strict=True)
         self.root = state_root
         self.session = session_id
+        # An explicit unrestricted choice only drops the workspace boundary;
+        # every other guard (tokens, ranges, change checks) and any explicit
+        # allowedRemotePaths restriction stay in force.
+        self.unrestricted = directory_scope == 'unrestricted'
         self.allowed_roots = [Path(value).resolve(strict=False) for value in (allowed_roots or [])]
         self.reads = state_root / 'reads'
         self.reads.mkdir(mode=0o700, exist_ok=True)
@@ -97,7 +103,7 @@ class FileService:
             raise AgentError('INVALID_PATH', 'Path must be nonempty text without NUL')
         original = Path(os.path.abspath(str(self.workspace / value)))
         resolved = original.resolve(strict=False)
-        if os.path.commonpath([str(self.workspace), str(resolved)]) != str(self.workspace):
+        if not self.unrestricted and os.path.commonpath([str(self.workspace), str(resolved)]) != str(self.workspace):
             raise AgentError('PATH_NOT_ALLOWED', 'Path is outside the remote workspace')
         if self.allowed_roots and not any(os.path.commonpath([str(root), str(resolved)]) == str(root) for root in self.allowed_roots):
             raise AgentError('PATH_NOT_ALLOWED', 'Path is outside configured allowedRemotePaths')
@@ -379,7 +385,8 @@ class FileService:
         if action == 'file_workspace':
             import platform
             import shutil
-            return {'remoteRoot': str(self.workspace), 'python': platform.python_version(),
+            return {'remoteRoot': str(self.workspace), 'directoryScope': 'unrestricted' if self.unrestricted else 'restricted',
+                    'python': platform.python_version(),
                     'runtimeLibc': os.confstr('CS_GNU_LIBC_VERSION'),
                     'ruleFiles': [str(path.relative_to(self.workspace)) for path in
                                   [self.workspace / 'AGENTS.md', self.workspace / 'CLAUDE.md'] if path.is_file()],

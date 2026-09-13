@@ -31,6 +31,14 @@ def candidates(service, root, recursive):
     return sorted(result, key=str)
 
 
+def display(service, path):
+    """Relative to the workspace root when inside it, otherwise the absolute path (unrestricted scope)."""
+    try:
+        return str(path.relative_to(service.workspace))
+    except ValueError:
+        return str(path)
+
+
 def discover(service, action, request):
     root = service.path(request.get('path', '.'))
     if not root.exists():
@@ -74,7 +82,7 @@ def discover(service, action, request):
             for number, line in enumerate(text.splitlines(), 1):
                 if pattern not in line:
                     continue
-                item = {'path': str(path.relative_to(service.workspace)), 'line': number,
+                item = {'path': display(service, path), 'line': number,
                         'text': line[:2000], 'lineTruncated': len(line) > 2000}
                 item_bytes = len(json.dumps(item, ensure_ascii=False).encode('utf8'))
                 if len(matches) == limit or output_bytes + item_bytes > 65536:
@@ -86,7 +94,7 @@ def discover(service, action, request):
                 'skippedFiles': skipped, 'scannedFiles': scanned, 'ignores': ['.git'], 'gitignoreSupported': False}
     entries = []
     for path in paths:
-        relative = str(path.relative_to(service.workspace))
+        relative = display(service, path)
         if action == 'file_find' and not (fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative, pattern)):
             continue
         info = path.lstat()
