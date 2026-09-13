@@ -266,19 +266,29 @@ export class SpaceLedger {
     if (reservationId !== undefined) requireId(reservationId, "reservationId");
     const resourceId = randomUUID().replaceAll("-", "");
     return this.withLedger(async state => {
+      // A cited reservation must exist before any quota arithmetic: a stale
+      // id is RESOURCE_NOT_FOUND regardless of the remaining quota headroom.
+      const reservation = reservationId !== undefined
+        ? state.reservations[reservationId] ?? null
+        : null;
+      if (reservationId !== undefined && reservation === null) {
+        throw new RemoteAgentError("RESOURCE_NOT_FOUND", "Reservation is not registered or was fully consumed");
+      }
       const summary = await this.summary(state);
-      this.requireQuota(summary, bytes);
-      if (reservationId !== undefined) {
-        const reservation = state.reservations[reservationId];
-        if (!reservation) {
-          throw new RemoteAgentError("RESOURCE_NOT_FOUND", "Reservation is not registered or was fully consumed");
-        }
+      // The reservation's bytes are already inside summary.usedBytes, so
+      // charging the full amount again would double count. Only the growth
+      // beyond the cited reservation may consume quota: redeeming a
+      // reservation that exactly fits is net zero even at the limit. This
+      // mirrors the remote helper's net-delta check (remote/ledger.py).
+      const net = reservation === null ? bytes : Math.max(0, bytes - reservation.bytes);
+      this.requireQuota(summary, net);
+      if (reservation !== null && reservationId !== undefined) {
         reservation.bytes -= bytes;
         if (reservation.bytes <= 0) delete state.reservations[reservationId];
       }
       state.resources[resourceId] = { kind: "temp-file", path, bytes, identity: null,
         holderPid: process.pid, origin, reservationId: reservationId ?? null, createdAt: Date.now() };
-      return { resourceId, usedBytes: summary.usedBytes + bytes, limitBytes: this.limitBytes };
+      return { resourceId, usedBytes: summary.usedBytes + net, limitBytes: this.limitBytes };
     });
   }
 
