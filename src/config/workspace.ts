@@ -23,6 +23,9 @@ const profileSchema = z.object({
   localStateDir: z.string().min(1).optional(),
   localRoot: z.string().min(1).optional(),
   pythonPath: remotePath.default("/usr/bin/python3"),
+  // Issue #8 configuration hook for the per-workspace space limit; #18 will
+  // extend this object into the unified policy structure (retention, budgets).
+  policy: z.object({ spaceLimitBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional() }).strict().optional(),
 }).strict();
 
 /** The MCP server name shown to ZCode; setup integration and recovery must derive it identically. */
@@ -44,6 +47,7 @@ export interface WorkspaceConfig {
   localStateDir: string;
   localRoot: string;
   pythonPath: string;
+  policy?: { spaceLimitBytes?: number };
 }
 
 export async function loadWorkspaceConfig(profilePath: string): Promise<WorkspaceConfig> {

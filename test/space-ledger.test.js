@@ -71,10 +71,10 @@ it('registering a resource consumes the reservation it cites without double coun
   const root = await fixture();
   try {
     const ledger = new SpaceLedger(join(root, 'ledger'), 1 << 20);
-    const reservationId = await ledger.reserve(4096, 'transfer plan');
+    const { reservationId } = await ledger.reserve(4096, 'transfer plan');
     const before = await ledger.usage();
     assert.equal(before.reservedBytes, 4096);
-    const resourceId = await ledger.register(join(root, 'transfer.part'), 1500, 'local-transfer', reservationId);
+    const { resourceId } = await ledger.register(join(root, 'transfer.part'), 1500, 'local-transfer', reservationId);
     const middle = await ledger.usage();
     assert.equal(middle.tempBytes, 1500);
     assert.equal(middle.reservedBytes, 2596);
@@ -116,8 +116,8 @@ it('a stale lock left by a dead holder is reclaimed, never while the holder live
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, 'ledger.lock'), JSON.stringify({ pid: dead.pid, acquiredAt: Date.now() }));
     const ledger = new SpaceLedger(directory, 1 << 20);
-    const reservationId = await ledger.reserve(512, 'after stale lock');
-    assert.match(reservationId, /^[0-9a-f]{32}$/);
+    const reservation = await ledger.reserve(512, 'after stale lock');
+    assert.match(reservation.reservationId, /^[0-9a-f]{32}$/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -128,7 +128,7 @@ it('local inspect reports object identity and holder evidence without age judgme
     const ledger = new SpaceLedger(join(root, 'ledger'), 1 << 20);
     const target = join(root, 'held.part');
     await writeFile(target, 'payload');
-    const resourceId = await ledger.register(target, 7, 'test');
+    const { resourceId } = await ledger.register(target, 7, 'test');
     const stats = await stat(target);
     await ledger.attachIdentity(resourceId, `${stats.dev}:${stats.ino}`);
     const live = await ledger.inspect(resourceId);
