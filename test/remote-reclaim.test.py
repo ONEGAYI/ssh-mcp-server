@@ -607,6 +607,43 @@ class RemoteReclaimTest(unittest.TestCase):
         again = self.maintenance(clock=now + 80 * DAY)['result']
         self.assertEqual(again['removedJobs'], [healthy], again)
 
+    def test_malformed_transfer_records_and_cursor_skip_without_aborting_the_round(self):
+        # Review round 3 G1/G2/G3 + cursor typing: the same type-invalid rule
+        # covers the transfers section -- a terminal record's ack.json with a
+        # string timestamp, a non-terminal record whose registeredAt fallback
+        # is a string, a corrupt record.json inside the managed-resource scan,
+        # and a maintenance.json cursor of the wrong type. None may abort the
+        # round or poison the name-order comparison.
+        now = time.time()
+        transfers = self.state / 'transfers'
+        transfers.mkdir(parents=True)
+        # Terminal-shape record with a string ack timestamp (G1).
+        terminal = transfers / ('a' * 32)
+        terminal.mkdir()
+        (terminal / 'record.json').write_text(json.dumps(
+            {'schemaVersion': 1, 'transferId': 'a' * 32, 'direction': 'download',
+             'state': 'completed', 'completedAt': now - 40 * DAY}))
+        (terminal / 'ack.json').write_text(json.dumps({'acknowledgedAt': 'soon'}))
+        # Non-terminal record whose registeredAt fallback is a string (G2).
+        stalled = transfers / ('b' * 32)
+        stalled.mkdir()
+        (stalled / 'record.json').write_text(json.dumps(
+            {'schemaVersion': 1, 'transferId': 'b' * 32, 'direction': 'download',
+             'state': 'transferring', 'registeredAt': 'yesterday'}))
+        # A corrupt (non-dict) record the managed-resource scan must survive (G3).
+        corrupt = transfers / ('c' * 32)
+        corrupt.mkdir()
+        (corrupt / 'record.json').write_text('[1, 2]')
+        # A poisoned cursor of the wrong type must reset, not crash (:598).
+        (self.state / 'maintenance.json').write_text(json.dumps(
+            {'schemaVersion': 1, 'transfersCursor': 12345, 'lastRunAt': 0}))
+        result = self.maintenance(clock=now + 40 * DAY)
+        self.assertTrue(result['ok'], result)
+        summary = result['result']
+        self.assertEqual(summary['removedTransfers'], [], summary)
+        for directory in (terminal, stalled, corrupt):
+            self.assertTrue(directory.is_dir(), directory)  # kept: undecidable/corrupt
+
     # --- issue #17: stale helper images ----------------------------------------
 
     def test_stale_helper_images_are_reclaimed_but_live_references_and_the_current_image_survive(self):

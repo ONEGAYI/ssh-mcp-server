@@ -91,6 +91,13 @@ def _load_maintenance_state(root):
         return _empty_maintenance_state()
     for key, default in _cursor_defaults().items():
         state.setdefault(key, default)
+    for key in ('jobsCursor', 'transfersCursor', 'readsCursor',
+                'helpersCursor', 'resourcesCursor'):
+        # A cursor of any type other than str/None would poison the
+        # name-order comparison; reset it to a full rescan instead.
+        value = state.get(key)
+        if value is not None and not isinstance(value, str):
+            state[key] = None
     return state
 
 
@@ -327,8 +334,13 @@ def _process_transfer(root, name, periods, now, summary):
             ack = path / 'ack.json'
             if ack.is_file():
                 try:
-                    acknowledged = read_json(ack).get('acknowledgedAt', 0)
+                    ack_record = read_json(ack)
                 except (OSError, ValueError):
+                    return
+                if not isinstance(ack_record, dict):
+                    return
+                acknowledged = ack_record.get('acknowledgedAt', 0)
+                if not _numeric(acknowledged):
                     return
                 if now - acknowledged >= periods['confirmedResultMs']:
                     _remove_tree(path)
@@ -344,8 +356,10 @@ def _process_transfer(root, name, periods, now, summary):
         # the same no-blocks-in-flight evidence cancel uses, so releasing
         # the temp here mirrors issue #15 instead of guessing.
         last_progress = record.get('lastProgressAt')
-        if not isinstance(last_progress, (int, float)) or isinstance(last_progress, bool):
-            last_progress = record.get('registeredAt', 0)
+        if not _numeric(last_progress):
+            last_progress = record.get('registeredAt')
+        if not _numeric(last_progress):
+            return  # undecidable timestamps never trigger release
         if now - last_progress < periods['interruptedTransferDataMs']:
             return
         if not _release_transfer_temp(root, record):
@@ -517,9 +531,12 @@ def _transfer_managed_resource_ids(root):
         if directory.is_symlink() or not directory.is_dir():
             continue
         try:
-            resource_id = read_json(directory / 'record.json').get('resourceId')
+            record = read_json(directory / 'record.json')
         except (OSError, ValueError):
             continue
+        if not isinstance(record, dict):
+            continue  # corrupt record: no readable resourceId to protect
+        resource_id = record.get('resourceId')
         if isinstance(resource_id, str) and resource_id:
             managed.add(resource_id)
     return managed
