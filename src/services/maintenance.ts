@@ -13,17 +13,21 @@
  *      registrations under the workspace identity directory), mirroring the
  *      remote retention rules; a stalled download's receiver temp is
  *      released together with its ledger entry, exactly like cancellation;
+ *      crash-leftover ledger resources whose holder is proven dead are
+ *      reclaimed the same verified way (issue #17);
  *   2. one remote `maintenance` helper call carrying the freshly loaded
  *      policy (loadPolicy re-reads the profile every round). Only a
  *      successful remote round advances lastCompletedAt, so a failed
- *      attempt retries on the next trigger.
+ *      attempt retries on the next trigger. The remote round itself also
+ *      reclaims expired read credentials, stale helper images and verified
+ *      crash-leftover temps (issue #17).
  *
  * Expired identifiers stay refused afterwards: local actions require the
  * registration record, the remote register-then-execute protocol rejects
  * unknown identifiers with REQUEST_EXPIRED_OR_UNKNOWN.
  */
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { loadPolicy } from "../config/policy.js";
 import { WorkspaceConfig } from "../config/workspace.js";
@@ -44,6 +48,7 @@ interface MaintenanceState {
 export interface LocalSummary {
   removedTasks: string[];
   removedTransfers: string[];
+  reclaimedResources: string[];
   itemsConsidered: number;
 }
 
@@ -216,8 +221,83 @@ export class MaintenanceService {
     return true;
   }
 
+  /** Reclaim crash-leftover local ledger resources (spec 7.2, issue #17).
+   *
+   * Occupancy evidence mirrors the remote end: the holder pid decides
+   * liveness (Windows offers no boot-anchored identity; that limitation is
+   * documented on SpaceLedger), and the recorded dev:ino identity decides
+   * whether the object at the registered path is still ours. A live holder
+   * keeps everything; a dead holder releases the registration, deleting the
+   * file only when the identity matches. A never-anchored identity stays
+   * behind as management fields only; files without any registration are
+   * never this pass's business. Age never flips a verdict. */
+  /** Resource ids that living transfer records still manage themselves.
+   *
+   * A transfer's receiver temp and its ledger entry live across many short
+   * helper processes, so the recorded holder is dead while the transfer is
+   * alive. reclaimTransfer already releases those entries with the record's
+   * own TTL evidence; the generic pass must never race it. */
+  private async transferManagedResourceIds(): Promise<Set<string>> {
+    const managed = new Set<string>();
+    let entries;
+    try { entries = await readdir(this.transfersDirectory, { withFileTypes: true }); }
+    catch (error) { if (isMissing(error)) return managed; throw error; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const record = JSON.parse(await readFile(join(this.transfersDirectory, entry.name, "record.json"), "utf8"));
+        if (typeof record.resourceId === "string" && record.resourceId) managed.add(record.resourceId);
+      } catch { /* a damaged record leaves its entry to the generic pass */ }
+    }
+    return managed;
+  }
+
+  private async reclaimLedgerResources(ledger: SpaceLedger,
+    policy: Awaited<ReturnType<typeof loadPolicy>>, summary: LocalSummary, deadline: number): Promise<void> {
+    let resources: Record<string, Record<string, unknown>> = {};
+    try {
+      // Atomic renames on the write side make an unlocked read consistent.
+      const state = JSON.parse(await readFile(join(this.identityDirectory, "ledger", "ledger.json"), "utf8"));
+      if (typeof state === "object" && state !== null && typeof state.resources === "object") {
+        resources = state.resources;
+      }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    const managed = await this.transferManagedResourceIds();
+    for (const resourceId of Object.keys(resources).sort()) {
+      if (summary.itemsConsidered >= policy.maintenance.maxItemsPerRun || Date.now() >= deadline) return;
+      // Real registrations are always 32-hex ids; anything else is not ours.
+      if (!/^[0-9a-f]{32}$/.test(resourceId)) continue;
+      if (managed.has(resourceId)) continue; // owned by a living transfer record
+      const entry = resources[resourceId];
+      if (typeof entry !== "object" || entry === null) continue;
+      summary.itemsConsidered += 1;
+      if (typeof entry.holderPid === "number" && processAlive(entry.holderPid)) continue;
+      const path = typeof entry.path === "string" ? entry.path : null;
+      let exists = false;
+      let identityMatches: boolean | null = null;
+      if (path) {
+        try {
+          const info = await stat(path);
+          exists = true;
+          if (typeof entry.identity === "string") identityMatches = entry.identity === `${info.dev}:${info.ino}`;
+        } catch (error) { if (!isMissing(error)) throw error; }
+      }
+      if (exists && typeof entry.identity !== "string") continue; // never anchored: unverifiable, keep
+      if (exists && identityMatches && path) {
+        await unlink(path).catch(error => { if (!isMissing(error)) throw error; });
+      }
+      // A mismatching identity releases the registration but never deletes
+      // the foreign object now living at that name; a missing file just
+      // leaves the ledger.
+      await ledger.release(resourceId).catch(() => undefined);
+      summary.reclaimedResources.push(resourceId);
+    }
+  }
+
   private async reclaimLocal(policy: Awaited<ReturnType<typeof loadPolicy>>, deadline: number): Promise<LocalSummary> {
-    const summary: LocalSummary = { removedTasks: [], removedTransfers: [], itemsConsidered: 0 };
+    const summary: LocalSummary = { removedTasks: [], removedTransfers: [], reclaimedResources: [], itemsConsidered: 0 };
     const now = Date.now();
     const ledger = new SpaceLedger(join(this.identityDirectory, "ledger"),
       policy.limits.localWorkspaceBytes);
@@ -239,6 +319,7 @@ export class MaintenanceService {
     };
     await consider("tasks");
     await consider("transfers");
+    await this.reclaimLedgerResources(ledger, policy, summary, deadline);
     return summary;
   }
 
