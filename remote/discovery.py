@@ -1093,7 +1093,14 @@ def file_find(service, root, request):
                 budget.ensure_within()
                 last = current
                 continue
-            info = path.lstat()
+            try:
+                info = path.lstat()
+            except OSError:
+                # The entry vanished between enumeration and this stat: it
+                # can no longer appear, so advance the cursor past it and
+                # skip it -- consistent with file_search's silent exclusion.
+                last = current
+                continue
             kind = 'symlink' if stat.S_ISLNK(info.st_mode) else \
                 'directory' if stat.S_ISDIR(info.st_mode) else \
                 'file' if stat.S_ISREG(info.st_mode) else 'other'

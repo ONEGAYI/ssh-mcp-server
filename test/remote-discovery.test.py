@@ -701,8 +701,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
     def test_find_second_page_zero_advance_raises_instead_of_repeating_cursor(self):
         # 续页把整个时间预算耗在跳过已返回候选上时，返回同游标的
         # partial 会让每页重新全量枚举又同样超时，查询永久不可完成：
-        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。
-        sys.path.insert(0, str(HELPER.parent))
+        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。        sys.path.insert(0, str(HELPER.parent))
         import discovery
         from common import AgentError
         from files import FileService
@@ -734,6 +733,33 @@ class RemoteDiscoveryTest(unittest.TestCase):
             discovery.shutil.which = saved_which
         self.assertEqual(caught.exception.code, 'SCAN_TIME_LIMIT')
         self.assertIn('narrow the search directory', str(caught.exception))
+
+    def test_find_skips_candidates_deleted_between_enumeration_and_lstat(self):
+        # 枚举与 lstat 之间条目被外部删除：该候选已不再出现，游标推进
+        # 过它并跳过，查询整体成功且其余结果完整（与 file_search 的
+        # 静默排除一致），而不是 FileNotFoundError 崩成 HELPER_ERROR。
+        sys.path.insert(0, str(HELPER.parent))
+        from pathlib import Path
+        import discovery
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        self.write('vanishing.txt', 'gone soon\n')
+        self.write('z.txt', 'z\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        original_lstat = Path.lstat
+
+        def flaky_lstat(self):
+            if self.name == 'vanishing.txt':
+                raise FileNotFoundError(2, 'No such file or directory')
+            return original_lstat(self)
+        Path.lstat = flaky_lstat
+        try:
+            result = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*', 'limit': 10})
+        finally:
+            Path.lstat = original_lstat
+        self.assertFalse(result['truncated'])
+        self.assertEqual([entry['path'] for entry in result['entries']], ['a.txt', 'z.txt'])
 
     def test_find_cursor_rejects_changed_query(self):
         self.write('a.txt', 'a\n')
