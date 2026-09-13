@@ -21,7 +21,7 @@
 
 ## 2026-09-13 审查轮 3/4：防护闭合与收口
 
-轮 3 收口复核判定轮 2 修复全部正确，但 N1 同模式类型防护未闭合，新确认 G1（transfers 段 ack.json 字符串时间戳）、G2（非终态记录 registeredAt fallback 字符串）、G3（managed 扫描对非 dict record 抛 AttributeError 且在游标捕获之外，后果最重）与游标键类型边缘点，另有 R1 本机收敛契约条目、N1 保守语义两个 P4 文档缺口。修复（0ae13ef）：四处对齐 _numeric/isinstance 模式（不可判定即保守保留；registeredAt 缺省 0 的激进语义一并收敛），契约补上传本机镜像 TTL 收敛与凭据不可判定保守保留两句。红→绿 stash 验证；npm 287（270/0/17）、WSL reclaim 29/29、VM job-cli-remote 8/8。备案：files.py 读路径 token 过期比较对损坏 token 报 HELPER_ERROR 而非 READ_REQUIRED（影响更小，同分布）。轮 4 对 0ae13ef 轻量独立复核后收口。
+轮 3 收口复核判定轮 2 修复全部正确，但 N1 同模式类型防护未闭合，新确认 G1（transfers 段 ack.json 字符串时间戳）、G2（非终态记录 registeredAt fallback 字符串）、G3（managed 扫描对非 dict record 抛 AttributeError 且在游标捕获之外，后果最重）与游标键类型边缘点，另有 R1 本机收敛契约条目、N1 保守语义两个 P4 文档缺口。修复（0ae13ef）：四处对齐 _numeric/isinstance 模式（不可判定即保守保留；registeredAt 缺省 0 的激进语义一并收敛），契约补上传本机镜像 TTL 收敛与凭据不可判定保守保留两句。红→绿 stash 验证；npm 287（270/0/17）、WSL reclaim 29/29、VM job-cli-remote 8/8。备案：files.py 读路径 token 过期比较对损坏 token 报 HELPER_ERROR 而非 READ_REQUIRED（影响更小，同分布）；lazy_attempt 的 lastLazyAt 被篡改为非数字时仅懒清理静默失效（整体包在 except Exception 内不炸轮，每小时在线维护持续兜底，后续维护时可在 _load_maintenance_state 顺带对齐 _numeric）。轮 4 对 0ae13ef 逐 hunk 独立复核全部通过，无 N1 同模式遗漏，判定审查通过。
 
 **验证（2026-09-13，f44ab35）**：npm 287 项（270 通过/0 失败/17 门控跳过）；WSL 七 Python 套件全 OK（reclaim 27 含新增 6 用例）；VM（wt21，脏工作区状态）三文件分开串行 workspace-mcp-remote 5/5、job-cli-remote 8/8、largefile-acceptance 4/4。修复均有先红后绿证据（见各 fix 提交）。
 
