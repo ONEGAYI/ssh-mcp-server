@@ -44,6 +44,27 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
+    def test_file_management_actions_are_retired(self):
+        # Issue #20 / ADR 0007: move, delete, mkdir and rmdir no longer exist
+        # as dedicated helper actions; directory management goes through the
+        # remote shell. Even a completely read credential must not resurrect
+        # the retired entry points.
+        (self.work / 'retired.txt').write_text('target\n')
+        token = self.call('file_read', {'path': 'retired.txt'})['result']['readToken']
+        requests = [
+            ('file_delete', {'path': 'retired.txt', 'readToken': token}),
+            ('file_move', {'path': 'retired.txt', 'target': 'moved.txt', 'readToken': token}),
+            ('file_mkdir', {'path': 'made'}),
+            ('file_rmdir', {'path': 'made'}),
+        ]
+        for action, request in requests:
+            result = self.call(action, request)
+            self.assertFalse(result['ok'], action)
+            self.assertEqual(result['error']['code'], 'UNSUPPORTED_ACTION', action)
+        self.assertTrue((self.work / 'retired.txt').exists(), 'nothing may be mutated through retired actions')
+        self.assertFalse((self.work / 'made').exists())
+        self.assertEqual((self.work / 'retired.txt').read_text(), 'target\n')
+
     def test_directory_scope_keeps_restrictions_by_default_and_only_opens_with_explicit_unrestricted(self):
         outside = self.root / 'outside'
         outside.mkdir()
@@ -155,7 +176,7 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertTrue(updated['ok'], updated)
         self.assertEqual((self.work / name).read_bytes(), b'new\r\nlines\r\n')
 
-    def test_binary_read_write_move_delete_share_full_read_guard(self):
+    def test_binary_read_and_explicit_overwrite_invalidate_old_credentials(self):
         original = b'\x00\xff\x01'
         (self.work / 'binary').write_bytes(original)
         token = self.call('file_read', {'path': 'binary', 'encoding': 'base64'})['result']['readToken']
@@ -163,21 +184,12 @@ class RemoteFilesTest(unittest.TestCase):
         write = self.call('file_write', {'path': 'binary', 'data': base64.b64encode(b'\xffNEW').decode(),
                                          'overwrite': True, 'expectedVersion': observed['version']})
         self.assertTrue(write['ok'], write)
-        stale = self.call('file_delete', {'path': 'binary', 'readToken': token})
+        # The pre-overwrite credential no longer names the current version.
+        stale = self.call('file_edit', {'path': 'binary', 'readToken': token,
+                                        'edits': [{'oldText': 'NEW', 'newText': 'lost'}]})
         self.assertEqual(stale['error']['code'], 'FILE_CONFLICT')
-        token = self.call('file_read', {'path': 'binary', 'encoding': 'base64'})['result']['readToken']
-        (self.work / 'target').write_text('keep')
-        conflict = self.call('file_move', {'path': 'binary', 'target': 'target', 'readToken': token})
-        self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
-        self.assertEqual((self.work / 'target').read_text(), 'keep')
-        moved = self.call('file_move', {'path': 'binary', 'target': 'new', 'readToken': token})
-        self.assertTrue(moved['ok'], moved)
-        self.assertFalse((self.work / 'binary').exists())
-        fresh = self.call('file_read', {'path': 'new', 'encoding': 'base64'})['result']
+        fresh = self.call('file_read', {'path': 'binary', 'encoding': 'base64'})['result']
         self.assertEqual(base64.b64decode(fresh['data']), b'\xffNEW')
-        deleted = self.call('file_delete', {'path': 'new', 'readToken': fresh['readToken']})
-        self.assertTrue(deleted['ok'], deleted)
-        self.assertFalse((self.work / 'new').exists())
 
     def test_paths_links_and_external_changes_rejected_without_data_loss(self):
         path = self.work / 'a'
@@ -195,7 +207,9 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(outside['error']['code'], 'PATH_NOT_ALLOWED')
 
     def test_discovery_pagination_search_and_directory_operations(self):
-        self.assertTrue(self.call('file_mkdir', {'path': 'nested'})['ok'])
+        # Directory creation left the file tools with issue #20 (ADR 0007);
+        # the fixture sets it up directly like a remote shell command would.
+        (self.work / 'nested').mkdir()
         (self.work / 'nested' / 'a.txt').write_text('needle\nother\n')
         (self.work / 'nested' / 'b.txt').write_text('needle too\n')
         first = self.call('file_list', {'path': 'nested', 'limit': 1})['result']
@@ -212,7 +226,11 @@ class RemoteFilesTest(unittest.TestCase):
         # The engine is the fastest available backend (issue #11): python-literal
         # remains the floor, but ripgrep/grep win when present on the host.
         self.assertIn(search['engine'], ('ripgrep', 'gnu-grep', 'python-literal'))
-        self.assertFalse(self.call('file_rmdir', {'path': 'nested'})['ok'])
+        # Retired with the tools (issue #20): removing directories is a shell
+        # concern, and the retired action must not mutate anything either way.
+        retired = self.call('file_rmdir', {'path': 'nested'})
+        self.assertEqual(retired['error']['code'], 'UNSUPPORTED_ACTION')
+        self.assertTrue((self.work / 'nested' / 'a.txt').exists())
 
     def test_overlapping_matches_rejected_and_serialized_read_is_bounded(self):
         (self.work / 'overlap').write_text('aaa')
@@ -476,10 +494,8 @@ class RemoteFilesTest(unittest.TestCase):
         files = self.helper_module()
         path = self.work / 'versioned.txt'
         path.write_bytes(b'stable content\n')
-        first = files.snapshot(path)
-        second = files.snapshot(path)
-        self.assertEqual(first[0], b'stable content\n')
-        self.assertEqual(first[2], second[2])
+        first = files.current_version(path)
+        self.assertEqual(first, files.current_version(path))
         # The version is decided by the observed metadata alone: one stat
         # result, no content argument, scheme-prefixed for the new semantics.
         info = path.stat()
@@ -490,9 +506,9 @@ class RemoteFilesTest(unittest.TestCase):
         # Same bytes, moved metadata: the version string must still change.
         stats = path.stat()
         os.utime(str(path), (stats.st_atime + 90, stats.st_mtime + 90))
-        self.assertNotEqual(files.snapshot(path)[2], first[2])
+        self.assertNotEqual(files.current_version(path), first)
         path.write_bytes(b'changed content\n')
-        self.assertNotEqual(files.snapshot(path)[2], first[2])
+        self.assertNotEqual(files.current_version(path), first)
         # A metadata-only touch must also invalidate a previously granted token.
         stale = self.call('file_read', {'path': 'versioned.txt'})['result']['readToken']
         stats = path.stat()

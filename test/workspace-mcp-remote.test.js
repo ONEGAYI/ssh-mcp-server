@@ -10,15 +10,35 @@ import { loadWorkspaceConfig } from '../build/config/workspace.js';
 
 const profile = process.env.SSH_MCP_TEST_WORKSPACE;
 it('real workspace MCP protects uploads and transfers binary data without granting hidden read coverage', { skip: !profile, timeout: 90000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
   const config = await loadWorkspaceConfig(profile);
   const sessionId = 'mcp-' + randomUUID();
   const path = sessionId + '.txt';
   const localPath = join(config.localRoot, sessionId + '.bin');
   const downloaded = join(config.localRoot, sessionId + '-download.bin');
+  const runtime = await createWorkspaceRuntime(profile);
   const client = new Client({ name: 'remote-contract', version: '1' });
   const call = async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
+  };
+  // Issue #20: remote_delete/remote_move are retired (ADR 0007); the test
+  // cleans up through a registered execute task, the shell replacement path.
+  const runTask = async command => {
+    const registration = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+    const deadline = Date.now() + 120000;
+    for (;;) {
+      const state = await runtime.remote.call('status', { jobId: registration.jobId });
+      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
+        assert.equal(state.state, 'exited', JSON.stringify(state));
+        assert.equal(state.exitCode, 0, JSON.stringify(state));
+        return state;
+      }
+      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
   };
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath,
@@ -71,8 +91,7 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.deepEqual(page2.data.matches.map(match => match.line), [4]);
     assert.equal(page2.data.truncated, false);
     assert.equal('readToken' in page1.data, false);
-    const searchRead = await call('remote_read', { path: searchPath });
-    await call('remote_delete', { path: searchPath, readToken: searchRead.data.readToken });
+    await runTask(`rm -f '${searchPath}'`);
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
     const transfer = await call('remote_download', { path, localPath: downloaded });
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));
@@ -118,10 +137,11 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal(overwritten.error, undefined, JSON.stringify(overwritten));
     const staleCursor = await call('remote_read', { path, offset: beforeWrite.data.nextOffset, expectedVersion: beforeWrite.data.version });
     assert.equal(staleCursor.data.code, 'FILE_CONFLICT');
-    const finalRead = await call('remote_read', { path });
-    assert.equal((await call('remote_delete', { path, readToken: finalRead.data.readToken })).error, undefined);
+    await runTask(`rm -f '${path}'`);
   } finally {
     await client.close();
+    await runTask(`rm -f '${path}'`).catch(() => undefined);
+    runtime.close();
     for (const target of [localPath, downloaded]) await unlink(target).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
 });

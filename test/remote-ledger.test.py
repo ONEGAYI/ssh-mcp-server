@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -345,16 +346,38 @@ class RemoteLedgerTest(unittest.TestCase):
                 break
             second = 'same-slot-b-{}'.format(index)
         self.assertEqual(locks_module.slot_index(str(self.work / first)), locks_module.slot_index(str(self.work / second)))
-        (self.work / first).write_text('left')
-        (self.work / second).write_text('right')
-        left = self.call('file_read', {'path': first})['result']['readToken']
-        right = self.call('file_read', {'path': second})['result']['readToken']
+        # The helper process normally creates the state root; this white-box
+        # case drives the slot machinery directly, so create it here.
+        self.state.mkdir(exist_ok=True)
         # Without dedupe the two flock calls would target the same slot file and
-        # the move would deadlock against itself; the timeout guards the claim.
-        moved = self.call('file_move', {'path': first, 'target': second, 'readToken': left, 'targetReadToken': right})
-        self.assertTrue(moved['ok'], moved)
-        self.assertEqual((self.work / second).read_text(), 'left')
-        self.assertFalse((self.work / first).exists())
+        # the acquisition would deadlock against itself; file_move retired with
+        # issue #20, so the slot machinery is driven directly. The thread
+        # watchdog turns a deadlock into a failure instead of a hang.
+        acquired = []
+        def holder():
+            with locks_module.acquire_slots(self.state, [str(self.work / first), str(self.work / second)]):
+                acquired.append(True)
+        worker = threading.Thread(target=holder)
+        worker.start()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive(), 'same-slot multi-target acquisition must not deadlock')
+        self.assertEqual(acquired, [True])
+        # The deduplicated slot is a real mutual exclusion: another holder of
+        # the same slot blocks a second acquisition, and the contender proceeds
+        # once the outer holder releases.
+        blocked = []
+        def contender():
+            with locks_module.acquire_slots(self.state, [str(self.work / first)]):
+                blocked.append(True)
+        rival = threading.Thread(target=contender)
+        with locks_module.acquire_slots(self.state, [str(self.work / first)]):
+            rival.start()
+            rival.join(timeout=0.5)
+            self.assertTrue(rival.is_alive(), 'the slot must exclude concurrent holders')
+            self.assertEqual(blocked, [])
+        rival.join(timeout=5)
+        self.assertFalse(rival.is_alive(), 'the contender must proceed once the slot is released')
+        self.assertEqual(blocked, [True])
 
     # --- physical ENOSPC maps to an explicit failure ----------------------------
 
