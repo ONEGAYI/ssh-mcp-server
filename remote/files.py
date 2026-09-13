@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import tempfile
 import uuid
 from common import AgentError, atomic_json, read_json
 import ledger
