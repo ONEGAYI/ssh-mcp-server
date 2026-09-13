@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
-import { writeFile, readFile, unlink } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { writeFile, readFile, open, rm, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -171,6 +171,96 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
   } finally {
     await client.close().catch(() => undefined);
     await runTask(`rm -f '${remoteName}'`).catch(() => undefined);
+    runtime.close();
+  }
+});
+
+it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (issue #13)', { skip: !profile, timeout: 300000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const sessionId = 'mcp-' + randomUUID();
+  const remoteName = 'big-upload-' + sessionId + '.bin';
+  const localPath = join((await loadWorkspaceConfig(profile)).localRoot, remoteName);
+  const runtime = await createWorkspaceRuntime(profile);
+  const client = new Client({ name: 'remote-contract', version: '1' });
+  const call = async (name, args = {}) => {
+    const result = await client.callTool({ name, arguments: { sessionId, ...args } });
+    return { error: result.isError, data: JSON.parse(result.content[0].text) };
+  };
+  const runTask = async command => {
+    const registration = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+    const deadline = Date.now() + 120000;
+    for (;;) {
+      const state = await runtime.remote.call('status', { jobId: registration.jobId });
+      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
+        assert.equal(state.state, 'exited', JSON.stringify(state));
+        assert.equal(state.exitCode, 0, JSON.stringify(state));
+        return state;
+      }
+      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  };
+  const startedAt = Date.now();
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
+    // A 200 MiB deterministic fixture: one random MiB tile repeated, digested
+    // while it is written.
+    const tile = randomBytes(1024 * 1024);
+    const digest = createHash('sha256');
+    const handle = await open(localPath, 'wx', 0o600);
+    try {
+      for (let index = 0; index < 200; index++) { await handle.writeFile(tile); digest.update(tile); }
+      await handle.sync();
+    } finally { await handle.close(); }
+    const totalSha256 = digest.digest('hex');
+    const size = (await stat(localPath)).size;
+    assert.equal(size, 200 * 1024 * 1024);
+    // First drive stops on a small budget: durable progress, no completion,
+    // and the tool returns the persistent identifier plus bounded state.
+    let partial;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const step = attempt === 0
+        ? await call('remote_upload', { localPath, path: remoteName, budgetMs: 1000 })
+        : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
+      assert.equal(step.error, undefined, JSON.stringify(step));
+      partial = step;
+      if (partial.data.state !== 'transferring' || partial.data.budgetExhausted !== true) break;
+      if (partial.data.confirmedOffset > 0 && partial.data.confirmedOffset < size) break;
+    }
+    assert.equal(partial.data.state, 'transferring', JSON.stringify(partial.data));
+    assert.equal(partial.data.budgetExhausted, true, JSON.stringify(partial.data));
+    const confirmedBefore = partial.data.confirmedOffset;
+    assert.ok(confirmedBefore > 0 && confirmedBefore < size, 'expected a mid-transfer stop, got ' + JSON.stringify(partial.data));
+    // Queries observe without side effects and without renewing anything.
+    const observed = await call('remote_upload', { action: 'status', transferId: partial.data.transferId });
+    assert.equal(observed.data.state, 'transferring');
+    assert.equal(observed.data.confirmedOffset, confirmedBefore);
+    assert.equal(observed.data.totalBytes, size);
+    // Resume finishes the upload; only the unconfirmed tail is resent.
+    const done = await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, budgetMs: 240000 });
+    assert.equal(done.error, undefined, JSON.stringify(done));
+    assert.equal(done.data.state, 'completed');
+    assert.equal(done.data.bytesWritten, size);
+    assert.equal(done.data.sha256, totalSha256);
+    const expectedBlocks = Math.ceil((size - confirmedBefore) / (1024 * 1024));
+    assert.equal(done.data.blocksSent, expectedBlocks,
+      'resume must send only the unconfirmed blocks');
+    // Independent remote-side digest over the committed target.
+    await runTask(`sha256sum '${remoteName}' > '${remoteName}.sha256'`);
+    const remoteDigest = await call('remote_read', { path: remoteName + '.sha256' });
+    assert.equal(remoteDigest.error, undefined, JSON.stringify(remoteDigest));
+    assert.equal(remoteDigest.data.text.trim().split(' ')[0], totalSha256);
+    const meta = await call('remote_read', { path: remoteName, metadataOnly: true });
+    assert.equal(meta.data.size, size);
+    console.log('[issue #13] 200 MiB upload: stopped at %d bytes, resumed %d blocks, total wall time %d ms',
+      confirmedBefore, done.data.blocksSent, Date.now() - startedAt);
+  } finally {
+    await client.close().catch(() => undefined);
+    await rm(localPath, { force: true });
+    await runTask(`rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
     runtime.close();
   }
 });

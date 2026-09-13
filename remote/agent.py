@@ -438,6 +438,14 @@ def main():
     if args.action == '_worker':
         worker(root, args.job_id)
         return
+    if args.action == 'transfer_block':
+        # Block exchanges frame their own stdin: a JSON control line followed
+        # by exactly `size` raw bytes, so the generic JSON parse never sees
+        # the binary tail.
+        from transfer import block_exchange
+        result = block_exchange(root, sys.stdin.buffer)
+        emit({'ok': True, 'result': result})
+        return
     request = json.loads(sys.stdin.buffer.read().decode('utf8'))
     if not isinstance(request, dict):
         raise AgentError('INVALID_REQUEST', 'Request must be an object')
@@ -462,6 +470,9 @@ def main():
     elif args.action.startswith('resource_'):
         from ledger import resource_action
         result = resource_action(root, args.action, request)
+    elif args.action.startswith('transfer_'):
+        from transfer import transfer_action
+        result = transfer_action(root, args.action, request)
     elif args.action.startswith('file_'):
         from files import FileService
         result = FileService(root, request.get('workspaceRoot'), request.get('sessionId'),
