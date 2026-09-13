@@ -16,7 +16,11 @@ it('injects only the current session pending tasks and ignores unrelated local w
     await writeFile(profile, JSON.stringify({ workspaceId: 'hook', connectionName: 'vm', sshConfigFile: 'ssh.json',
       remoteRoot: '/work', remoteStateDir: '/tmp/state', localStateDir: 'state' }));
     const config = await loadWorkspaceConfig(profile);
-    const tasks = new TaskService({ async call(action, data) { return { jobId: data.jobId, state: 'running' }; } }, config.localStateDir, config.identity);
+    let assigned = 0;
+    const tasks = new TaskService({ async call(action, data) {
+      if (action === 'task_register') return { jobId: 'job-hook-' + (++assigned), state: 'prepared' };
+      return { jobId: data.jobId, state: 'running' };
+    } }, config.localStateDir, config.identity);
     const own = await tasks.start({ sessionId: 'session-own', command: 'own-build', cwd: '/work' });
     const other = await tasks.start({ sessionId: 'session-other', command: 'other-private-command', cwd: '/work' });
     const invoke = cwd => spawnSync(process.execPath, [fileURLToPath(new URL('../build/cli/recovery.js', import.meta.url)), '--workspace', profile], {
