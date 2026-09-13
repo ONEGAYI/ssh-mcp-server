@@ -1,9 +1,8 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { randomUUID } from 'node:crypto';
-import { readdir, readFile, rm } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
@@ -207,4 +206,118 @@ it('a CLI cancel stops a real download and releases its uncommitted temp data (i
     await runTask(`rm -f '${remoteName}'`).catch(() => undefined);
     runtime.close();
   }
+});
+
+// --- issue #16: expiry reclamation on a real workspace ------------------------
+
+const waitTerminal16 = async (runtime, jobId) => {
+  const deadline = Date.now() + 60000;
+  for (;;) {
+    const state = await runtime.remote.call('status', { jobId });
+    if (['exited', 'cancelled', 'interrupted'].includes(state.state)) return state;
+    if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+};
+
+it('expiry reclamation purges logs then records and refuses replayed old requests (#16)', { skip: !profile, timeout: 180000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const session = 'test16-' + randomUUID();
+  const marker = '/tmp/ssh-mcp-ticket16-' + session + '.count';
+  const runtime = await createWorkspaceRuntime(profile);
+  try {
+    const active = await runtime.remote.call('handshake', { protocol: 2 });
+    assert.equal(active.status, 'active');
+    const registration = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command: "printf 'ONCE\\n' >> " + marker + "; cat " + marker });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+    const ended = await waitTerminal16(runtime, registration.jobId);
+    assert.equal(ended.state, 'exited');
+    await runtime.remote.call('ack', { jobId: registration.jobId });
+    // Log layer first (the 3-day rule, accelerated to zero): the acknowledged
+    // logs go, the deduplication record stays and still answers.
+    const logRound = await runtime.remote.call('maintenance', {
+      retentionMs: { confirmedTaskLogMs: 0, confirmedResultMs: 30 * 86400000 } });
+    assert.ok(logRound.purgedLogs.includes(registration.jobId), JSON.stringify(logRound));
+    const observed = await runtime.remote.call('status', { jobId: registration.jobId });
+    assert.equal(observed.state, 'exited');
+    await assert.rejects(() => runtime.remote.call('output', { jobId: registration.jobId }),
+      error => { assert.equal(error.code, 'LOGS_PURGED'); return true; });
+    // Record layer (the 30-day rule, accelerated to zero): the record goes.
+    const recordRound = await runtime.remote.call('maintenance', {
+      retentionMs: { confirmedTaskLogMs: 0, confirmedResultMs: 0 } });
+    assert.ok(recordRound.removedJobs.includes(registration.jobId), JSON.stringify(recordRound));
+    await assert.rejects(() => runtime.remote.call('status', { jobId: registration.jobId }),
+      error => { assert.equal(error.code, 'JOB_NOT_FOUND'); return true; });
+    // The replayed old request is refused, never rerun: the marker accumulated
+    // exactly one line.
+    await assert.rejects(() => runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId }),
+      error => { assert.equal(error.code, 'REQUEST_EXPIRED_OR_UNKNOWN'); return true; });
+    const check = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command: 'wc -l < ' + marker });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: check.jobId });
+    const counted = await waitTerminal16(runtime, check.jobId);
+    assert.equal(counted.exitCode, 0, JSON.stringify(counted));
+    const output = await runtime.remote.call('output', { jobId: check.jobId });
+    assert.equal(Buffer.from(output.stdout.data, 'base64').toString().trim(), '1');
+    const cleanup = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command: 'rm -f ' + marker });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: cleanup.jobId });
+    await waitTerminal16(runtime, cleanup.jobId);
+  } finally { runtime.close(); }
+});
+
+it('an interrupted transfer expires after its TTL and its identifier is refused afterwards (#16)', { skip: !profile, timeout: 180000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const config = await loadWorkspaceConfig(profile);
+  const session = 'test16-' + randomUUID();
+  const runtime = await createWorkspaceRuntime(profile);
+  const target = 'expired16-' + session + '.bin';
+  try {
+    const registered = await runtime.remote.call('transfer_register', { protocol: 2,
+      direction: 'upload', targetPath: target, chunkSize: 65536, totalBytes: 4096,
+      totalSha256: createHash('sha256').update(Buffer.alloc(4096)).digest('hex'),
+      sourceIdentity: { size: 4096, mtimeMs: 1 }, overwrite: false, create: false,
+      sessionId: session, workspaceRoot: config.remoteRoot });
+    const started = await runtime.remote.call('transfer_start', { protocol: 2,
+      transferId: registered.transferId, sourceIdentity: { size: 4096, mtimeMs: 1 }, sessionId: session });
+    assert.equal(started.state, 'transferring');
+    // Status observes without renewing anything (queries are not progress).
+    const observed = await runtime.remote.call('transfer_status', { transferId: registered.transferId, sessionId: session });
+    assert.equal(observed.expiresAt, started.expiresAt);
+    // Accelerated expiry: zero retention after the (zero) real progress
+    // reclaims the interrupted data and its record.
+    const round = await runtime.remote.call('maintenance', { retentionMs: { interruptedTransferDataMs: 0 } });
+    assert.ok(round.removedTransfers.includes(registered.transferId), JSON.stringify(round));
+    await assert.rejects(() => runtime.remote.call('transfer_resume', { protocol: 2,
+      transferId: registered.transferId, sourceIdentity: { size: 4096, mtimeMs: 1 }, sessionId: session }),
+      error => { assert.equal(error.code, 'REQUEST_EXPIRED_OR_UNKNOWN'); return true; });
+    await assert.rejects(() => runtime.remote.call('transfer_status', { transferId: registered.transferId, sessionId: session }),
+      error => { assert.equal(error.code, 'REQUEST_EXPIRED_OR_UNKNOWN'); return true; });
+  } finally { runtime.close(); }
+});
+
+it('the CLI maintain entry runs a real both-ends round and the persisted timestamp throttles it (#16)', { skip: !profile, timeout: 180000 }, async () => {
+  const config = await loadWorkspaceConfig(profile);
+  const identityDir = join(config.localStateDir,
+    createHash('sha256').update(config.identity).digest('hex').slice(0, 24));
+  const invoke = (...args) => spawnSync(process.execPath, [fileURLToPath(new URL('../build/cli/job.js', import.meta.url)),
+    ...args, '--workspace', profile, '--session', 'maintain-16'], { encoding: 'utf8', timeout: 120000 });
+  // Simulate the offline catch-up: the last completed round lies two hours
+  // behind, so the first trigger after reconnecting must run a real round.
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'maintenance.json'),
+    JSON.stringify({ schemaVersion: 1, lastCompletedAt: Date.now() - 2 * 3600000 }));
+  const first = invoke('maintain');
+  assert.equal(first.status, 0, first.stdout + '\n' + first.stderr);
+  const outcome = JSON.parse(first.stdout);
+  assert.equal(outcome.skipped, undefined, JSON.stringify(outcome));
+  assert.ok(outcome.local, 'a local summary must be reported');
+  assert.ok(outcome.lastCompletedAt > Date.now() - 3600000, JSON.stringify(outcome));
+  const state = JSON.parse(await readFile(join(identityDir, 'maintenance.json'), 'utf8'));
+  assert.ok(state.lastCompletedAt > 0);
+  // Within the interval the next trigger is throttled away.
+  const second = invoke('maintain');
+  assert.equal(second.status, 0, second.stdout + second.stderr);
+  assert.equal(JSON.parse(second.stdout).skipped, 'interval');
 });
