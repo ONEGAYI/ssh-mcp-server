@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 HELPER = Path(__file__).resolve().parents[1] / 'remote' / 'agent.py'
@@ -158,6 +159,19 @@ class RemoteAgentTest(unittest.TestCase):
         self.assertEqual(self.call('output', {'jobId': 'job-cleanup'})['error']['code'], 'LOGS_PURGED')
         self.assertTrue(self.call('start', request)['ok'])
         self.assertEqual((self.root / 'counter').read_text(), 'x')
+
+    def test_atomic_json_syncs_the_parent_directory_entry(self):
+        # os.replace 之后的目录项掉电持久性需要父目录 fsync 兜底；
+        # atomic_json 必须经过该辅助（打开失败时静默跳过不影响调用）。
+        sys.path.insert(0, str(HELPER.parent))
+        import common as common_module
+        target = self.root / 'state' / 'nested' / 'state.json'
+        target.parent.mkdir(parents=True)
+        with mock.patch.object(common_module, '_sync_parent_directory',
+                               wraps=common_module._sync_parent_directory) as observed:
+            common_module.atomic_json(target, {'b': 2, 'a': 1})
+        observed.assert_called_once_with(target)
+        self.assertEqual(json.loads(target.read_text()), {'a': 1, 'b': 2})
 
     def test_protocol_v2_registers_before_executing_and_rejects_unregistered_ids(self):
         registered = self.call('task_register', {'protocol': 2, 'cwd': str(self.root),
