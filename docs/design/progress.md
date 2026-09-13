@@ -1,5 +1,24 @@
 # 实施进展与验证证据
 
+## 2026-09-13 票据 #9：流式读取大文件与元数据版本凭据
+
+分支 `ticket/09-streaming-read`，按规格 4.1/4.2 实施（TDD，测试先红后绿，测试与实现分开提交）：
+
+1. **元数据版本**：`content_version` 改为 `m1-` + sha256(设备号, inode, 大小, mtime_ns, ctime_ns)，取消全文哈希；`current_version` 与提交前复核不再读全文。读取前后用描述符 fstat 并核对解析路径仍指向同一对象。
+2. **读侧 16 MiB 上限取消**：`file_read` 改为 256 KiB 流式缓冲；文本序列化预算 56 KiB 与 `maxBytes`（返回预算）保留。写侧（编辑/覆盖/删除/移动/提交输出）16 MiB 全文边界不变，待 #10/#13。
+3. **metadataOnly**：`remote_read` 新增参数，返回 `exists/version/size/bom` 或明确不存在状态，不返回内容、不签发凭据；#10 覆盖检查的 expectedVersion 来源。
+4. **游标与按行扫描**：行请求顺序扫描定位（不回传前文、不缓存全文、无行索引），行模式返回 `lineStart/lineEnd/lineEndComplete`；超长行分块；UTF-8 不切断；窗口级编码校验；`expectedVersion` 拒绝旧游标。
+5. **凭据期限**：readToken 记录含 `lastSuccessAt/expiresAt`（3 天常量），过期拒绝（`READ_TOKEN_EXPIRED`）且新读不复活旧范围；时钟经 `SSH_MCP_TEST_CLOCK` 窄入口注入。到期记录的物理回收属 #17。
+
+验证证据（2026-09-13，worktree ticket-09）：
+
+- WSL Ubuntu / Python 3.12：`remote-files.test.py` 32/32 通过（含 64 MiB 分页/行扫描、200 MiB 首中末、超长行、UTF-8 矩阵、时钟注入过期、VmRSS 内存自证增量 < 16 MiB）；`remote-agent.test.py` 通过。
+- Windows Node 24.15：`npm test` 188 项（185 通过、3 门控跳过、0 失败）。
+- CentOS 7.9 VM / Python 3.6.8（profile 按 workspaceId 隔离）：`workspace-mcp-remote.test.js` 通过，覆盖 metadataOnly 存在/不存在、`m1-` 版本、覆盖后旧游标 `FILE_CONFLICT`。
+- 20/200 MiB 完整对比与网络成本测量留待 #21；本票仅做基础内存自证。
+
+本票尚未由用户人工验收；`m1-` 前缀使升级前签发的旧凭据必然失效（要求重读，属预期迁移行为）。
+
 ## 当前状态
 
 首版核心链路已实现：持久命令、ZCode 原生后台回传、继续原对话时恢复跟进、受保护文件工具、项目接入生成和离线目录打包。用户于 2026-09-11 报告：本机 ZCode 与 VMware CentOS 7 的人工验收全部通过，无遗留问题。最终内网离线环境尚未现场验收。
@@ -103,7 +122,7 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 
 ## 当前交付边界
 
-- 专用文件操作单文件上限 16 MiB；Python 搜索不模拟 rg/.gitignore。
+- 读侧无文件体积上限（流式有界交付，#9 已实施）；写侧单文件 16 MiB 全文边界保留（编辑/覆盖/删除/移动/提交输出），待 #10/#13。Python 搜索不模拟 rg/.gitignore。
 - 无交互式 stdin/PTY；延期方案见 interactive-assessment.md。
 - 协作锁不能消除不遵守锁的外部写入者的最后竞争窗口。
 - 不自动判断 ZCode 原对话是否已删除，不自动转投其他对话。

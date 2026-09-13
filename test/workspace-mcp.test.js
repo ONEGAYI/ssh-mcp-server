@@ -20,6 +20,10 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
       assert.ok(tools.tools.some(tool => tool.name === name), name);
     }
     assert.ok(!tools.tools.some(tool => tool.name === 'upload' || tool.name === 'execute_command'));
+    const read = tools.tools.find(tool => tool.name === 'remote_read');
+    assert.ok(read.inputSchema.properties.metadataOnly, 'remote_read exposes metadataOnly');
+    assert.ok(read.inputSchema.properties.expectedVersion, 'remote_read exposes expectedVersion');
+    assert.ok(!/16 MiB/.test(read.description), 'remote_read no longer caps file size');
     const pending = await client.callTool({ name: 'remote_pending', arguments: { sessionId: 'new-session' } });
     assert.equal(pending.isError, undefined);
     assert.doesNotMatch(JSON.stringify(pending), /must-not-leak/);

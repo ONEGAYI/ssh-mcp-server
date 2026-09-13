@@ -320,28 +320,53 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
-    def test_size_gate_rejects_directories_oversized_reads_and_oversized_commits(self):
+    def test_size_gate_rejects_directories_but_streams_oversized_reads_and_gates_commits(self):
         directory = self.call('file_read', {'path': '.'})
         self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
+        # Reads no longer carry a file-size cap (issue #9): a >16 MiB file
+        # streams its first window instead of being rejected.
         oversized = self.work / 'oversized.bin'
         oversized.write_bytes(b'0' * (16 * 1024 * 1024 + 1))
-        too_large = self.call('file_read', {'path': 'oversized.bin'})
-        self.assertEqual(too_large['error']['code'], 'FILE_TOO_LARGE')
-        # The commit-side output gate applies even to creations with no prior read.
+        streamed = self.call('file_read', {'path': 'oversized.bin', 'offset': 16 * 1024 * 1024 - 10, 'maxBytes': 100})
+        self.assertTrue(streamed['ok'], streamed)
+        self.assertEqual(streamed['result']['endOffset'], 16 * 1024 * 1024 + 1)
+        self.assertIsNone(streamed['result']['nextOffset'])
+        self.assertFalse(streamed['result']['complete'])
+        # The commit-side output gate still applies, even to creations.
         payload = base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')
         rejected = self.call('file_write', {'path': 'created.bin', 'data': payload, 'create': True})
         self.assertEqual(rejected['error']['code'], 'FILE_TOO_LARGE')
         self.assertFalse((self.work / 'created.bin').exists())
+        # Guarded mutations keep the whole-file bound until streaming
+        # replacement lands (#10).
+        edit = self.call('file_edit', {'path': 'oversized.bin', 'readToken': streamed['result']['readToken'],
+                                       'edits': [{'oldText': '0', 'newText': 'x'}]})
+        self.assertEqual(edit['error']['code'], 'FILE_TOO_LARGE')
 
-    def test_version_string_joins_metadata_and_full_content(self):
+    def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
         import files
+        return files
+
+    def service(self, session='session-one'):
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        return self.helper_module().FileService(self.root / 'state', str(self.work), session)
+
+    def test_version_string_observes_linux_metadata_only(self):
+        files = self.helper_module()
         path = self.work / 'versioned.txt'
         path.write_bytes(b'stable content\n')
         first = files.snapshot(path)
         second = files.snapshot(path)
         self.assertEqual(first[0], b'stable content\n')
         self.assertEqual(first[2], second[2])
+        # The version is decided by the observed metadata alone: one stat
+        # result, no content argument, scheme-prefixed for the new semantics.
+        info = path.stat()
+        self.assertTrue(files.content_version(info).startswith('m1-'))
+        self.assertEqual(files.content_version(info), files.content_version(info))
+        (self.work / 'other.txt').write_bytes(b'different bytes entirely\n')
+        self.assertNotEqual(files.content_version(info), files.content_version((self.work / 'other.txt').stat()))
         # Same bytes, moved metadata: the version string must still change.
         stats = path.stat()
         os.utime(str(path), (stats.st_atime + 90, stats.st_mtime + 90))
@@ -356,6 +381,42 @@ class RemoteFilesTest(unittest.TestCase):
                                            'edits': [{'oldText': 'changed', 'newText': 'lost'}]})
         self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
         self.assertEqual(path.read_bytes(), b'changed content\n')
+
+    def test_metadata_only_reports_observed_version_without_content_or_grant(self):
+        path = self.work / 'meta.txt'
+        path.write_bytes(b'\xef\xbb\xbfhello\n')
+        observed = self.call('file_read', {'path': 'meta.txt', 'metadataOnly': True})['result']
+        self.assertTrue(observed['exists'])
+        self.assertEqual(observed['size'], 9)
+        self.assertTrue(observed['bom'])
+        self.assertTrue(observed['version'].startswith('m1-'))
+        for forbidden in ('text', 'data', 'readToken', 'complete'):
+            self.assertNotIn(forbidden, observed)
+        # The observed version is exactly what a content read would report.
+        read = self.call('file_read', {'path': 'meta.txt'})['result']
+        self.assertEqual(observed['version'], read['version'])
+        # No credential was issued: any edit still demands a real read first.
+        denied = self.call('file_edit', {'path': 'meta.txt', 'readToken': '0' * 32,
+                                         'edits': [{'oldText': 'hello', 'newText': 'lost'}]})
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        # Absent targets report an explicit non-existence state, not an error.
+        missing = self.call('file_read', {'path': 'absent.txt', 'metadataOnly': True})['result']
+        self.assertFalse(missing['exists'])
+        self.assertIsNone(missing['version'])
+        self.assertIsNone(missing['size'])
+        directory = self.call('file_read', {'path': '.', 'metadataOnly': True})
+        self.assertFalse(directory['ok'])
+        self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
+        # Content selectors are meaningless without content: reject mixing.
+        mixed = self.call('file_read', {'path': 'meta.txt', 'metadataOnly': True, 'offset': 0})
+        self.assertEqual(mixed['error']['code'], 'INVALID_REQUEST')
+
+    def test_capabilities_report_streamed_read_and_the_write_side_gate(self):
+        capabilities = self.call('file_workspace', {})['result']['capabilities']
+        self.assertNotIn('maxGuardedFileBytes', capabilities)
+        self.assertTrue(capabilities['streamedRead'])
+        self.assertEqual(capabilities['maxCommitBytes'], 16 * 1024 * 1024)
+        self.assertEqual(capabilities['readTokenTtlDays'], 3)
 
     def test_read_window_validates_offsets_lines_limits_and_encodings(self):
         path = self.work / 'window.txt'
@@ -436,6 +497,285 @@ class RemoteFilesTest(unittest.TestCase):
                                           'edits': [{'oldText': 'content', 'newText': 'changed'}]})
         self.assertEqual(refused['error']['code'], 'UNSUPPORTED_METADATA')
         self.assertEqual(path.read_text(), 'content\n')
+
+    # --- Streaming reads, cursors and credential lifetimes (issue #9) -------
+
+    def call_at(self, clock, action, request, session='session-one'):
+        data = dict(request, workspaceRoot=str(self.work), sessionId=session)
+        run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.root / 'state'), action],
+                             input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True, timeout=30,
+                             env=dict(os.environ, SSH_MCP_TEST_CLOCK=str(float(clock))))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
+
+    def write_fixed_lines(self, path, total_lines, line_bytes=64):
+        """Write fixed-width ASCII lines and return the line-content oracle."""
+        def line(index):
+            prefix = 'L%06d ' % index
+            return prefix + 'x' * (line_bytes - len(prefix) - 1) + '\n'
+        with open(str(path), 'wb') as stream:
+            batch = []
+            for index in range(1, total_lines + 1):
+                batch.append(line(index).encode('ascii'))
+                if len(batch) >= 4096:
+                    stream.write(b''.join(batch))
+                    batch = []
+            if batch:
+                stream.write(b''.join(batch))
+        return line
+
+    def vm_rss_kb(self):
+        with open('/proc/self/status') as stream:
+            for row in stream:
+                if row.startswith('VmRSS:'):
+                    return int(row.split()[1])
+        self.skipTest('VmRSS is unavailable on this platform')
+
+    def read_rejects(self, service, request, code):
+        try:
+            service.read(request)
+        except self.helper_module().AgentError as error:
+            self.assertEqual(error.code, code, request)
+            return error
+        self.fail('Expected {} from {!r}'.format(code, request))
+
+    def prefix_lines(self, line_of, upto, first_index=1):
+        """Oracle for the first `upto` bytes of generated lines."""
+        parts, index, remaining = [], first_index, upto
+        while remaining > 0:
+            row = line_of(index).encode('ascii')
+            parts.append(row[:remaining])
+            remaining -= len(row)
+            index += 1
+        return b''.join(parts).decode('ascii')
+
+    def test_streamed_read_pages_large_files_with_byte_cursor(self):
+        size = 64 * 1024 * 1024
+        line_of = self.write_fixed_lines(self.work / 'large.txt', size // 64)
+        service = self.service()
+        first = service.read({'path': 'large.txt', 'offset': 0, 'maxBytes': 65536})
+        self.assertEqual(first['startOffset'], 0)
+        self.assertLessEqual(first['endOffset'], 65536 - 8192)  # serialized budget applies
+        self.assertTrue(first['truncated'])
+        self.assertEqual(first['nextOffset'], first['endOffset'])
+        self.assertEqual(first['text'], self.prefix_lines(line_of, first['endOffset']))
+        self.assertLessEqual(len(json.dumps(first, ensure_ascii=False).encode('utf8')), 65536)
+        version = first['version']
+        tokens = {first['readToken']}
+        # Sampling pages across the file all continue the same version and
+        # credential, and land exactly on the generated bytes.
+        for offset in (size // 4, size // 2, size - 65536):
+            page = service.read({'path': 'large.txt', 'offset': offset, 'maxBytes': 65536})
+            self.assertEqual(page['version'], version)
+            tokens.add(page['readToken'])
+            delivered = page['endOffset'] - page['startOffset']
+            self.assertEqual(page['text'], self.prefix_lines(line_of, delivered, offset // 64 + 1))
+            if offset + delivered < size:
+                self.assertEqual(page['nextOffset'], offset + delivered)
+                self.assertTrue(page['truncated'])
+            else:
+                self.assertIsNone(page['nextOffset'])
+                self.assertFalse(page['truncated'])
+        self.assertEqual(len(tokens), 1)
+        # The public CLI entry behaves identically on first and last pages.
+        tail = self.call('file_read', {'path': 'large.txt', 'offset': size - 192, 'maxBytes': 192})['result']
+        self.assertFalse(tail['truncated'])
+        self.assertIsNone(tail['nextOffset'])
+        self.assertEqual(tail['text'], ''.join(line_of(size // 64 - index) for index in (2, 1, 0)))
+
+    def test_line_requests_scan_to_boundaries_without_transmitting_the_prefix(self):
+        size = 64 * 1024 * 1024
+        total = size // 64
+        line_of = self.write_fixed_lines(self.work / 'lines.txt', total)
+        service = self.service()
+        middle = service.read({'path': 'lines.txt', 'fromLine': 500000, 'toLine': 500002})
+        self.assertEqual(middle['text'], ''.join(line_of(index) for index in range(500000, 500003)))
+        self.assertEqual((middle['startOffset'], middle['endOffset']), ((500000 - 1) * 64, 500002 * 64))
+        self.assertEqual((middle['lineStart'], middle['lineEnd'], middle['lineEndComplete']), (500000, 500002, True))
+        self.assertFalse(middle['truncated'])
+        self.assertNotIn('x' * 64, middle['text'][:63])
+        # toLine omitted means through the end of the file; the budget still
+        # bounds what is delivered.
+        tail = service.read({'path': 'lines.txt', 'fromLine': total - 3})
+        self.assertEqual((tail['lineStart'], tail['lineEnd'], tail['lineEndComplete']), (total - 3, total, True))
+        self.assertFalse(tail['truncated'])
+        self.assertEqual(tail['text'], ''.join(line_of(index) for index in range(total - 3, total + 1)))
+        # A budget-constrained middle window reports the partial last line.
+        window = service.read({'path': 'lines.txt', 'fromLine': 10, 'maxBytes': 100})
+        self.assertEqual(window['lineStart'], 10)
+        self.assertTrue(window['truncated'])
+        self.assertEqual(len(window['text'].encode('utf8')), 100)
+        self.assertEqual(window['lineEnd'], 11)
+        self.assertFalse(window['lineEndComplete'])
+        self.assertEqual(window['text'], line_of(10) + line_of(11)[:36])
+
+    def test_overlong_line_chunks_report_line_metadata_and_resume(self):
+        head = b'short\n' + '中文行\n'.encode('utf8')
+        giant = 'y' * (5 * 1024 * 1024)
+        body = head + giant.encode('ascii') + b'\nend\n'
+        (self.work / 'tenant.txt').write_bytes(body)
+        service = self.service()
+        page = service.read({'path': 'tenant.txt', 'fromLine': 3, 'toLine': 3})
+        self.assertEqual(page['startOffset'], len(head))
+        self.assertTrue(page['truncated'])
+        self.assertEqual((page['lineStart'], page['lineEnd'], page['lineEndComplete']), (3, 3, False))
+        self.assertTrue(page['text'])  # the chunk is nonempty
+        self.assertTrue(set(page['text']) <= {'y'})  # only giant-line bytes
+        delivered = page['text'].encode('utf8')
+        offset = page['nextOffset']
+        pages = 1
+        while offset is not None:
+            page = service.read({'path': 'tenant.txt', 'offset': offset, 'maxBytes': 1048576})
+            delivered += page['text'].encode('utf8')
+            offset = page['nextOffset']
+            pages += 1
+        self.assertGreater(pages, 10)  # the single line really was chunked
+        # Byte-cursor pages run to end of file, so the whole tail arrived.
+        self.assertEqual(delivered, giant.encode('ascii') + b'\nend\n')
+        self.assertFalse(page['complete'])  # lines 1-2 were never read
+        end = service.read({'path': 'tenant.txt', 'fromLine': 4, 'toLine': 4})
+        self.assertEqual((end['text'], end['lineStart'], end['lineEndComplete']), ('end\n', 4, True))
+        token = service.read({'path': 'tenant.txt', 'fromLine': 4, 'toLine': 4})['readToken']
+        edited = self.call('file_edit', {'path': 'tenant.txt', 'readToken': token,
+                                         'edits': [{'oldText': 'end', 'newText': 'END'}]})
+        self.assertTrue(edited['ok'], edited)
+        denied = self.call('file_edit', {'path': 'tenant.txt', 'readToken': token,
+                                         'edits': [{'oldText': 'short', 'newText': 'lost'}]})
+        self.assertEqual(denied['error']['code'], 'FILE_CONFLICT')  # token rotated after the edit
+
+    def test_utf8_pages_never_split_multibyte_characters(self):
+        row = ('结' * 20 + '\n').encode('utf8')
+        (self.work / 'wide.txt').write_bytes(row * 20000)
+        service = self.service()
+        offset, parts = 0, []
+        while True:
+            page = service.read({'path': 'wide.txt', 'offset': offset, 'maxBytes': 100000})
+            self.assertEqual(len(page['text'].encode('utf8')), page['endOffset'] - page['startOffset'])
+            parts.append(page['text'])
+            offset = page['nextOffset']
+            if offset is None:
+                break
+        self.assertEqual(''.join(parts), (row * 20000).decode('utf8'))
+        # BOM bytes are skipped for text but counted as read (first-version
+        # behaviour) and stay visible in the delivered payload elsewhere.
+        (self.work / 'bombed.txt').write_bytes(b'\xef\xbb\xbf' + row * 200)
+        first = service.read({'path': 'bombed.txt', 'offset': 0, 'maxBytes': 61})
+        self.assertEqual(first['startOffset'], 3)
+        self.assertTrue(first['bom'])
+        self.assertEqual(first['text'], row.decode('utf8'))
+
+    def test_invalid_utf8_window_reports_encoding_and_allows_binary(self):
+        (self.work / 'mixed.txt').write_bytes(b'good line\n' + b'\xff\xfe bad\n' + b'more\n')
+        head = self.call('file_read', {'path': 'mixed.txt', 'fromLine': 1, 'toLine': 1})['result']
+        self.assertEqual(head['text'], 'good line\n')
+        invalid = self.call('file_read', {'path': 'mixed.txt', 'fromLine': 2, 'toLine': 2})
+        self.assertFalse(invalid['ok'])
+        self.assertEqual(invalid['error']['code'], 'UNSUPPORTED_ENCODING')
+        self.assertIn('base64', invalid['error']['message'])
+        binary = self.call('file_read', {'path': 'mixed.txt', 'encoding': 'base64'})['result']
+        self.assertEqual(base64.b64decode(binary['data']), b'good line\n' + b'\xff\xfe bad\n' + b'more\n')
+        # Byte cursors may not land inside a multibyte UTF-8 character.
+        (self.work / 'char.txt').write_bytes('a中\n'.encode('utf8'))
+        split = self.call('file_read', {'path': 'char.txt', 'offset': 2})
+        self.assertEqual(split['error']['code'], 'INVALID_OFFSET')
+        whole = self.call('file_read', {'path': 'char.txt', 'offset': 1})['result']
+        self.assertEqual(whole['text'], '中\n')
+
+    def test_read_token_expires_after_three_idle_days_and_never_revives_ranges(self):
+        (self.work / 'aging.txt').write_text('alpha\nbeta\ngamma\n')
+        day = 86400.0
+        start = 1000000.0
+        first = self.call_at(start, 'file_read', {'path': 'aging.txt', 'fromLine': 1, 'toLine': 1})['result']
+        record = json.load(open(str(self.root / 'state' / 'reads' / (first['readToken'] + '.json'))))
+        self.assertEqual(record['expiresAt'] - record['lastSuccessAt'], 3 * day)
+        edited = self.call_at(start + 2 * day, 'file_edit', {'path': 'aging.txt', 'readToken': first['readToken'],
+                                                             'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})['result']
+        renewed = edited['readToken']
+        record = json.load(open(str(self.root / 'state' / 'reads' / (renewed + '.json'))))
+        self.assertEqual(record['expiresAt'] - record['lastSuccessAt'], 3 * day)
+        # Three idle days pass: the credential is dead and named as expired.
+        expired = self.call_at(start + 5 * day + 60, 'file_edit', {'path': 'aging.txt', 'readToken': renewed,
+                                                                   'edits': [{'oldText': 'ALPHA', 'newText': 'lost'}]})
+        self.assertEqual(expired['error']['code'], 'READ_TOKEN_EXPIRED')
+        # Failed attempts do not renew anything.
+        again = self.call_at(start + 8 * day, 'file_edit', {'path': 'aging.txt', 'readToken': renewed,
+                                                            'edits': [{'oldText': 'ALPHA', 'newText': 'lost'}]})
+        self.assertEqual(again['error']['code'], 'READ_TOKEN_EXPIRED')
+        # A fresh read of one line builds a new credential without reviving
+        # the ranges of the expired one.
+        fresh = self.call_at(start + 8 * day, 'file_read', {'path': 'aging.txt', 'fromLine': 3, 'toLine': 3})['result']
+        self.assertNotEqual(fresh['readToken'], renewed)
+        blocked = self.call_at(start + 8 * day, 'file_edit', {'path': 'aging.txt', 'readToken': fresh['readToken'],
+                                                              'edits': [{'oldText': 'ALPHA', 'newText': 'lost'}]})
+        self.assertEqual(blocked['error']['code'], 'READ_REQUIRED')
+        allowed = self.call_at(start + 8 * day, 'file_edit', {'path': 'aging.txt', 'readToken': fresh['readToken'],
+                                                              'edits': [{'oldText': 'gamma', 'newText': 'GAMMA'}]})
+        self.assertTrue(allowed['ok'], allowed)
+
+    def test_external_change_rejects_stale_cursor_and_old_credentials(self):
+        (self.work / 'moving.txt').write_text('page one\npage two\n')
+        service = self.service()
+        first = service.read({'path': 'moving.txt', 'offset': 0, 'maxBytes': 8})
+        self.assertEqual(first['text'], 'page one')
+        (self.work / 'moving.txt').write_text('page one\nREPLACED\n')
+        self.read_rejects(service, {'path': 'moving.txt', 'offset': first['nextOffset'],
+                                    'expectedVersion': first['version']}, 'FILE_CONFLICT')
+        # Without an expectation the new version is simply observed; the old
+        # credential does not silently extend into the new version.
+        resumed = service.read({'path': 'moving.txt', 'offset': first['nextOffset']})
+        self.assertEqual(resumed['text'], '\nREPLACED\n')
+        self.assertNotEqual(resumed['version'], first['version'])
+        conflict = self.call('file_edit', {'path': 'moving.txt', 'readToken': first['readToken'],
+                                           'edits': [{'oldText': 'REPLACED', 'newText': 'lost'}]})
+        self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
+        # Continuing with the fresh version's own cursor stays consistent.
+        pinned = service.read({'path': 'moving.txt', 'offset': 0, 'maxBytes': 8, 'expectedVersion': resumed['version']})
+        self.assertEqual(pinned['text'], 'page one')
+        # A cursor bound to the new version is rejected once it changes again.
+        (self.work / 'moving.txt').write_text('page one\nFINAL\n')
+        self.read_rejects(service, {'path': 'moving.txt', 'offset': 0,
+                                    'expectedVersion': resumed['version']}, 'FILE_CONFLICT')
+
+    def test_streamed_reads_keep_helper_memory_bounded(self):
+        size = 64 * 1024 * 1024
+        self.write_fixed_lines(self.work / 'rss.txt', size // 64)
+        service = self.service()
+        base = self.vm_rss_kb()
+        peak = base
+        offset, pages, delivered = 0, 0, 0
+        while offset is not None and pages < 40:
+            page = service.read({'path': 'rss.txt', 'offset': offset, 'maxBytes': 1048576})
+            delivered += len(page['text'].encode('utf8'))
+            peak = max(peak, self.vm_rss_kb())
+            offset = page['nextOffset']
+            pages += 1
+        self.assertEqual(pages, 40)
+        self.assertGreater(delivered, 40 * 32768)  # real content streamed out
+        # Scanning to a middle line must stream too, not buffer the prefix.
+        before = self.vm_rss_kb()
+        service.read({'path': 'rss.txt', 'fromLine': 1000000, 'toLine': 1000000})
+        after = self.vm_rss_kb()
+        self.assertLess(peak - base, 16 * 1024)
+        self.assertLess(after - before, 16 * 1024)
+
+    def test_200mib_file_reads_first_middle_and_last_with_cursor_continuation(self):
+        size = 200 * 1024 * 1024
+        line_of = self.write_fixed_lines(self.work / 'netlist.txt', size // 64)
+        service = self.service()
+        base = self.vm_rss_kb()
+        for offset in (0, size // 2, size - 3 * 64):
+            page = service.read({'path': 'netlist.txt', 'offset': offset, 'maxBytes': 192})
+            expected = ''.join(line_of(index) for index in range(offset // 64 + 1, offset // 64 + 4))
+            self.assertEqual(page['text'], expected)
+            self.assertEqual(page['version'][:3], 'm1-')
+        middle = service.read({'path': 'netlist.txt', 'offset': size // 2, 'maxBytes': 64})
+        continuation = service.read({'path': 'netlist.txt', 'offset': middle['nextOffset'], 'maxBytes': 64,
+                                     'expectedVersion': middle['version']})
+        self.assertEqual(continuation['text'], line_of(size // 128 + 2))
+        row = service.read({'path': 'netlist.txt', 'fromLine': size // 128 + 10, 'toLine': size // 128 + 10})
+        self.assertEqual(row['text'], line_of(size // 128 + 10))
+        self.assertLessEqual(self.vm_rss_kb() - base, 16 * 1024)
 
 
 if __name__ == '__main__':
