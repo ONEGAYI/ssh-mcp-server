@@ -141,12 +141,16 @@ class RemoteFilesTest(unittest.TestCase):
         conflict = self.call('file_write', {'path': name, 'text': 'lost', 'create': True})
         self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
         page = self.call('file_read', {'path': name, 'fromLine': 1, 'toLine': 1})['result']
+        # Whole-file writes dropped the readToken path entirely: even a
+        # complete read no longer authorizes an overwrite (issue #10 / ADR 0008).
         blocked = self.call('file_write', {'path': name, 'text': 'lost', 'readToken': page['readToken']})
-        self.assertEqual(blocked['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(blocked['error']['code'], 'INVALID_REQUEST')
         full = self.call('file_read', {'path': name, 'fromLine': 2})['result']
         self.assertEqual(full['readToken'], page['readToken'])
         self.assertTrue(full['complete'])
-        updated = self.call('file_write', {'path': name, 'text': 'new\nlines\n', 'readToken': full['readToken']})
+        observed = self.call('file_read', {'path': name, 'metadataOnly': True})['result']
+        updated = self.call('file_write', {'path': name, 'text': 'new\nlines\n',
+                                           'overwrite': True, 'expectedVersion': observed['version']})
         self.assertTrue(updated['ok'], updated)
         self.assertEqual((self.work / name).read_bytes(), b'new\r\nlines\r\n')
 
@@ -154,7 +158,9 @@ class RemoteFilesTest(unittest.TestCase):
         original = b'\x00\xff\x01'
         (self.work / 'binary').write_bytes(original)
         token = self.call('file_read', {'path': 'binary', 'encoding': 'base64'})['result']['readToken']
-        write = self.call('file_write', {'path': 'binary', 'data': base64.b64encode(b'\xffNEW').decode(), 'readToken': token})
+        observed = self.call('file_read', {'path': 'binary', 'metadataOnly': True})['result']
+        write = self.call('file_write', {'path': 'binary', 'data': base64.b64encode(b'\xffNEW').decode(),
+                                         'overwrite': True, 'expectedVersion': observed['version']})
         self.assertTrue(write['ok'], write)
         stale = self.call('file_delete', {'path': 'binary', 'readToken': token})
         self.assertEqual(stale['error']['code'], 'FILE_CONFLICT')
@@ -175,9 +181,10 @@ class RemoteFilesTest(unittest.TestCase):
     def test_paths_links_and_external_changes_rejected_without_data_loss(self):
         path = self.work / 'a'
         path.write_text('old')
-        token = self.call('file_read', {'path': 'a'})['result']['readToken']
+        observed = self.call('file_read', {'path': 'a', 'metadataOnly': True})['result']
         path.write_text('external')
-        result = self.call('file_write', {'path': 'a', 'text': 'lost', 'readToken': token})
+        result = self.call('file_write', {'path': 'a', 'text': 'lost',
+                                          'overwrite': True, 'expectedVersion': observed['version']})
         self.assertEqual(result['error']['code'], 'FILE_CONFLICT')
         self.assertEqual(path.read_text(), 'external')
         (self.work / 'link').symlink_to(path)
@@ -220,9 +227,10 @@ class RemoteFilesTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda text: self.call('file_write', {'path': 'race', 'text': text, 'create': True}), ['a', 'b']))
         self.assertEqual(sum(result['ok'] for result in results), 1)
-        token = self.call('file_read', {'path': 'race'})['result']['readToken']
+        observed = self.call('file_read', {'path': 'race', 'metadataOnly': True})['result']
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda text: self.call('file_write', {'path': 'race', 'text': text, 'readToken': token}), ['first', 'second']))
+            results = list(pool.map(lambda text: self.call('file_write', {
+                'path': 'race', 'text': text, 'overwrite': True, 'expectedVersion': observed['version']}), ['first', 'second']))
         self.assertEqual(sum(result['ok'] for result in results), 1)
         self.assertEqual([result['error']['code'] for result in results if not result['ok']], ['FILE_CONFLICT'])
 
@@ -240,12 +248,12 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertTrue(changed['ok'], changed)
         renewed = changed['result']
         self.assertFalse(renewed['complete'])
-        for action, request in [
-            ('file_edit', {'edits': [{'oldText': 'secret gap', 'newText': 'lost'}]}),
-            ('file_write', {'text': 'lost'}),
-        ]:
-            denied = self.call(action, dict(request, path='ranges.txt', readToken=renewed['readToken']))
-            self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        denied = self.call('file_edit', {'path': 'ranges.txt', 'readToken': renewed['readToken'],
+                                         'edits': [{'oldText': 'secret gap', 'newText': 'lost'}]})
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        # Whole-file writes never take a readToken anymore (issue #10).
+        denied_write = self.call('file_write', {'path': 'ranges.txt', 'text': 'lost', 'readToken': renewed['readToken']})
+        self.assertEqual(denied_write['error']['code'], 'INVALID_REQUEST')
         foreign = self.call('file_edit', {'path': 'ranges.txt', 'readToken': renewed['readToken'],
                                          'edits': [{'oldText': '乙', 'newText': 'lost'}]}, session='session-two')
         self.assertEqual(foreign['error']['code'], 'READ_SCOPE_MISMATCH')
@@ -276,8 +284,11 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertTrue(deleted_text['ok'], deleted_text)
         self.assertTrue(deleted_text['result']['complete'])
         self.assertEqual(deleted_text['result']['size'], 0)
-        # Full coverage remains full; a complete read is not required again.
-        rewritten = self.call('file_write', {'path': 'emptying', 'readToken': deleted_text['result']['readToken'], 'text': 'replacement'})
+        # Whole-file replacement of the emptied file goes through the explicit
+        # overwrite path bound to the observed version, not the edit credential.
+        observed = self.call('file_read', {'path': 'emptying', 'metadataOnly': True})['result']
+        rewritten = self.call('file_write', {'path': 'emptying', 'text': 'replacement',
+                                             'overwrite': True, 'expectedVersion': observed['version']})
         self.assertTrue(rewritten['ok'], rewritten)
 
     def test_external_replacement_after_commit_does_not_receive_a_renewed_token(self):
@@ -288,10 +299,11 @@ class RemoteFilesTest(unittest.TestCase):
         token = self.call('file_read', {'path': 'post-image'})['result']['readToken']
 
         class ExternalReplacement(FileService):
-            def commit(inner, target, data, info=None, version=None, origin='file'):
-                written = super(ExternalReplacement, inner).commit(target, data, info, version, origin)
+            def commit_spliced(inner, target, replacements, info, version, output_size, origin='file-edit'):
+                written = super(ExternalReplacement, inner).commit_spliced(target, replacements, info, version, output_size, origin)
                 other = target.with_name('external-temp')
-                other.write_bytes(data)  # Same content, but a different file identity.
+                with target.open('rb') as source:
+                    other.write_bytes(source.read())  # Same content, but a different file identity.
                 other.replace(target)
                 return written
 
@@ -320,28 +332,28 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
-    def test_size_gate_rejects_directories_but_streams_oversized_reads_and_gates_commits(self):
+    def test_size_gate_rejects_directories_but_streams_oversized_reads_and_edits(self):
         directory = self.call('file_read', {'path': '.'})
         self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
         # Reads no longer carry a file-size cap (issue #9): a >16 MiB file
         # streams its first window instead of being rejected.
         oversized = self.work / 'oversized.bin'
-        oversized.write_bytes(b'0' * (16 * 1024 * 1024 + 1))
-        streamed = self.call('file_read', {'path': 'oversized.bin', 'offset': 16 * 1024 * 1024 - 10, 'maxBytes': 100})
+        marker = b'UNIQUE-MARKER-12345678\n'
+        oversized.write_bytes(marker + b'0' * (16 * 1024 * 1024 + 1 - len(marker)))
+        streamed = self.call('file_read', {'path': 'oversized.bin', 'offset': 0, 'maxBytes': 100})
         self.assertTrue(streamed['ok'], streamed)
-        self.assertEqual(streamed['result']['endOffset'], 16 * 1024 * 1024 + 1)
-        self.assertIsNone(streamed['result']['nextOffset'])
+        self.assertEqual(streamed['result']['endOffset'], 100)
         self.assertFalse(streamed['result']['complete'])
-        # The commit-side output gate still applies, even to creations.
-        payload = base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')
-        rejected = self.call('file_write', {'path': 'created.bin', 'data': payload, 'create': True})
-        self.assertEqual(rejected['error']['code'], 'FILE_TOO_LARGE')
-        self.assertFalse((self.work / 'created.bin').exists())
-        # Guarded mutations keep the whole-file bound until streaming
-        # replacement lands (#10).
+        # Since issue #10 the mutation paths stream too: editing a >16 MiB
+        # file works, and inline writes no longer stop at the old 16 MiB gate.
         edit = self.call('file_edit', {'path': 'oversized.bin', 'readToken': streamed['result']['readToken'],
-                                       'edits': [{'oldText': '0', 'newText': 'x'}]})
-        self.assertEqual(edit['error']['code'], 'FILE_TOO_LARGE')
+                                       'edits': [{'oldText': 'UNIQUE-MARKER-12345678', 'newText': 'zero-block'}]})
+        self.assertTrue(edit['ok'], edit)
+        self.assertEqual(edit['result']['bytesWritten'], 16 * 1024 * 1024 + 1 - len('UNIQUE-MARKER-12345678') + len('zero-block'))
+        service = self.service()
+        service.write({'path': 'created.bin', 'create': True,
+                       'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')})
+        self.assertEqual((self.work / 'created.bin').stat().st_size, 16 * 1024 * 1024 + 1)
 
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
@@ -411,11 +423,12 @@ class RemoteFilesTest(unittest.TestCase):
         mixed = self.call('file_read', {'path': 'meta.txt', 'metadataOnly': True, 'offset': 0})
         self.assertEqual(mixed['error']['code'], 'INVALID_REQUEST')
 
-    def test_capabilities_report_streamed_read_and_the_write_side_gate(self):
+    def test_capabilities_report_streamed_read_and_streamed_write(self):
         capabilities = self.call('file_workspace', {})['result']['capabilities']
         self.assertNotIn('maxGuardedFileBytes', capabilities)
+        self.assertNotIn('maxCommitBytes', capabilities)
         self.assertTrue(capabilities['streamedRead'])
-        self.assertEqual(capabilities['maxCommitBytes'], 16 * 1024 * 1024)
+        self.assertTrue(capabilities['streamedWrite'])
         self.assertEqual(capabilities['readTokenTtlDays'], 3)
 
     def test_read_window_validates_offsets_lines_limits_and_encodings(self):
@@ -776,6 +789,230 @@ class RemoteFilesTest(unittest.TestCase):
         row = service.read({'path': 'netlist.txt', 'fromLine': size // 128 + 10, 'toLine': size // 128 + 10})
         self.assertEqual(row['text'], line_of(size // 128 + 10))
         self.assertLessEqual(self.vm_rss_kb() - base, 16 * 1024)
+
+    # --- Streaming replacement and explicit overwrite (issue #10) ---------
+
+    def test_edit_locates_matches_across_stream_chunk_boundaries(self):
+        boundary = 256 * 1024  # MAX_STREAM_CHUNK
+        needle = 'CROSS-CHUNK-NEEDLE-{}'
+        # A match straddling the first chunk boundary, plus one fully inside
+        # the carry window on each side of it.
+        layouts = [
+            boundary - 12,            # match crosses the boundary
+            boundary - len(needle.format('A')) - 2,  # ends just before the boundary
+            boundary - 1,             # starts on the boundary's last byte
+        ]
+        for index, start in enumerate(layouts):
+            name = 'cross{}.txt'.format(index)
+            filler = b'y' * boundary * 2
+            payload = bytearray(filler)
+            tag = needle.format(index).encode('ascii')
+            payload[start:start + len(tag)] = tag
+            (self.work / name).write_bytes(bytes(payload))
+            window = self.call('file_read', {'path': name, 'offset': start - 8, 'maxBytes': 128})['result']
+            edited = self.call('file_edit', {'path': name, 'readToken': window['readToken'],
+                                             'edits': [{'oldText': needle.format(index), 'newText': 'PATCHED-OK'}]})
+            self.assertTrue(edited['ok'], '{}: {}'.format(index, edited))
+            content = (self.work / name).read_bytes()
+            self.assertEqual(content[:start], filler[:start])
+            self.assertTrue(content[start:].startswith(b'PATCHED-OK'))
+            self.assertEqual(edited['result']['bytesWritten'], 2 * boundary - len(tag) + len('PATCHED-OK'))
+        # Zero matches still demand a reread, ambiguity still demands a wider
+        # oldText, and a match outside the delivered range stays protected.
+        path = self.work / 'counts.txt'
+        path.write_bytes(b'prefix needle suffix\n' * 3 + b'padding')
+        partial = self.call('file_read', {'path': 'counts.txt', 'fromLine': 1, 'toLine': 1})['result']
+        zero = self.call('file_edit', {'path': 'counts.txt', 'readToken': partial['readToken'],
+                                       'edits': [{'oldText': 'absent', 'newText': 'x'}]})
+        self.assertEqual(zero['error']['code'], 'EDIT_MATCH_ERROR')
+        self.assertIn('read', zero['error']['message'])
+        many = self.call('file_edit', {'path': 'counts.txt', 'readToken': partial['readToken'],
+                                       'edits': [{'oldText': 'needle', 'newText': 'x'}]})
+        self.assertEqual(many['error']['code'], 'EDIT_MATCH_ERROR')
+        self.assertIn('widen', many['error']['message'])
+        unread = self.call('file_read', {'path': 'counts.txt', 'fromLine': 1, 'toLine': 1},
+                           session='session-two')['result']
+        blocked = self.call('file_edit', {'path': 'counts.txt', 'readToken': unread['readToken'],
+                                          'edits': [{'oldText': 'suffix', 'newText': 'x'}]}, session='session-two')
+        self.assertEqual(blocked['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(path.read_bytes(), b'prefix needle suffix\n' * 3 + b'padding')
+
+    def test_large_edit_splices_streaming_and_keeps_memory_bounded(self):
+        size = 20 * 1024 * 1024
+        line_of = self.write_fixed_lines(self.work / 'splice.txt', size // 64)
+        service = self.service()
+        target = 150000  # a unique line in the middle of the file
+        old_line = line_of(target)
+        new_line = 'L%06d patched with a much longer replacement body plus padding\n' % target
+        self.assertGreater(len(new_line), len(old_line))  # the edit grows the file
+        window = service.read({'path': 'splice.txt', 'offset': (target - 1) * 64, 'maxBytes': 64})
+        self.assertEqual(window['text'], old_line)
+        base = self.vm_rss_kb()
+        peak = base
+        edited = service.edit({'path': 'splice.txt', 'readToken': window['readToken'],
+                               'edits': [{'oldText': old_line.rstrip('\n'), 'newText': new_line.rstrip('\n')}]})
+        peak = max(peak, self.vm_rss_kb())
+        self.assertTrue(edited['written'])
+        delta = len(new_line) - len(old_line)
+        self.assertEqual(edited['bytesWritten'], size + delta)
+        self.assertEqual(edited['editsApplied'], 1)
+        self.assertFalse(edited['rereadRequired'])
+        with open(str(self.work / 'splice.txt'), 'rb') as stream:
+            head = stream.read(64)
+            stream.seek((target - 1) * 64)
+            patched = stream.readline()
+            stream.seek(target * 64 + delta)
+            after = stream.readline()
+        self.assertEqual(head, line_of(1).encode('ascii'))
+        self.assertEqual(patched, new_line.encode('ascii'))
+        self.assertEqual(after, line_of(target + 1).encode('ascii'))
+        # The known range was remapped: the very next line stays editable
+        # without a reread, and a couple more streamed edits keep memory flat.
+        followup = service.edit({'path': 'splice.txt', 'readToken': edited['readToken'],
+                                 'edits': [{'oldText': line_of(target + 1).rstrip('\n'), 'newText': 'next'}]})
+        peak = max(peak, self.vm_rss_kb())
+        service.edit({'path': 'splice.txt', 'readToken': followup['readToken'],
+                      'edits': [{'oldText': 'next', 'newText': 'n'}]})
+        peak = max(peak, self.vm_rss_kb())
+        self.assertLess(peak - base, 16 * 1024)  # no whole-file buffering anywhere
+
+    def test_large_edit_preserves_bom_crlf_and_permissions(self):
+        # A CRLF+BOM file above two stream chunks keeps its identity markers
+        # through a length-changing streamed edit.
+        chunk = 256 * 1024
+        row = '中文行 tail\r\n'.encode('utf8')
+        body = row * (2 * chunk // len(row) + 10)
+        unique = 'UNIQUE-CRLF-锚点-XYZ'
+        payload = b'\xef\xbb\xbf' + body + unique.encode('utf8') + b'\r\n'
+        path = self.work / 'identity.txt'
+        path.write_bytes(payload)
+        path.chmod(0o640)
+        service = self.service()
+        window = service.read({'path': 'identity.txt', 'encoding': 'base64',
+                               'offset': len(payload) - 64, 'maxBytes': 64})
+        edited = service.edit({'path': 'identity.txt', 'readToken': window['readToken'],
+                               'edits': [{'oldText': unique, 'newText': '替换\n成多行'}]})
+        self.assertTrue(edited['written'])
+        content = path.read_bytes()
+        self.assertTrue(content.startswith(b'\xef\xbb\xbf' + body))
+        # The CRLF file converts the newline inside newText to CRLF as well.
+        self.assertTrue(content.endswith('替换\r\n成多行\r\n'.encode('utf8')))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+
+    def test_multi_edit_failure_never_partially_commits(self):
+        original = b'alpha line\nbeta line\ngamma line\n'
+        for edits in [
+            [{'oldText': 'alpha', 'newText': 'BROKEN'}, {'oldText': 'nowhere', 'newText': 'x'}],
+            [{'oldText': 'alpha', 'newText': 'BROKEN'}, {'oldText': 'line', 'newText': 'x'}],
+        ]:
+            path = self.work / 'atomic.txt'
+            path.write_bytes(original)
+            token = self.call('file_read', {'path': 'atomic.txt'})['result']['readToken']
+            result = self.call('file_edit', {'path': 'atomic.txt', 'readToken': token, 'edits': edits})
+            self.assertFalse(result['ok'], edits)
+            self.assertIn(result['error']['code'], ('EDIT_MATCH_ERROR', 'READ_REQUIRED'))
+            self.assertEqual(path.read_bytes(), original)
+        # A partially-read file rejects the unread member before any write.
+        path.write_bytes(original)
+        partial = self.call('file_read', {'path': 'atomic.txt', 'fromLine': 1, 'toLine': 1})['result']
+        result = self.call('file_edit', {'path': 'atomic.txt', 'readToken': partial['readToken'], 'edits': [
+            {'oldText': 'alpha line', 'newText': 'ok'},
+            {'oldText': 'gamma line', 'newText': 'unread'},
+        ]})
+        self.assertEqual(result['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_whole_file_write_requires_explicit_overwrite_bound_to_observed_version(self):
+        path = self.work / 'overwrite.txt'
+        path.write_bytes(b'\xef\xbb\xbfversion one\r\n')
+        path.chmod(0o755)
+        full = self.call('file_read', {'path': 'overwrite.txt'})['result']
+        # Default is create-only: an existing target is refused, even with a
+        # complete read credential in hand (issue #10 / ADR 0008).
+        bare = self.call('file_write', {'path': 'overwrite.txt', 'text': 'lost'})
+        self.assertEqual(bare['error']['code'], 'FILE_CONFLICT')
+        with_token = self.call('file_write', {'path': 'overwrite.txt', 'text': 'lost', 'readToken': full['readToken']})
+        self.assertEqual(with_token['error']['code'], 'INVALID_REQUEST')
+        for request in [
+            {'overwrite': True},
+            {'overwrite': True, 'expectedVersion': 7},
+            {'expectedVersion': 'm1-anything'},
+            {'create': True, 'overwrite': True, 'expectedVersion': 'm1-x'},
+        ]:
+            result = self.call('file_write', dict(request, path='overwrite.txt', text='lost'))
+            self.assertEqual(result['error']['code'], 'INVALID_REQUEST', request)
+        observed = self.call('file_read', {'path': 'overwrite.txt', 'metadataOnly': True})['result']
+        path.write_bytes(b'externally replaced\n')
+        stale = self.call('file_write', {'path': 'overwrite.txt', 'text': 'lost',
+                                         'overwrite': True, 'expectedVersion': observed['version']})
+        self.assertEqual(stale['error']['code'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_bytes(), b'externally replaced\n')
+        fresh = self.call('file_read', {'path': 'overwrite.txt', 'metadataOnly': True})['result']
+        applied = self.call('file_write', {'path': 'overwrite.txt', 'text': 'version two\n',
+                                           'overwrite': True, 'expectedVersion': fresh['version']})
+        self.assertTrue(applied['ok'], applied)
+        self.assertTrue(applied['result']['overwritten'])
+        self.assertNotIn('readToken', applied['result'])
+        self.assertEqual(path.read_bytes(), b'version two\n')
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        # The old edit credential died with the replaced version.
+        stale_token = self.call('file_edit', {'path': 'overwrite.txt', 'readToken': full['readToken'],
+                                              'edits': [{'oldText': 'version two', 'newText': 'lost'}]})
+        self.assertEqual(stale_token['error']['code'], 'FILE_CONFLICT')
+        # Overwriting an absent target has no version to bind to.
+        absent = self.call('file_write', {'path': 'missing.txt', 'text': 'x',
+                                          'overwrite': True, 'expectedVersion': 'm1-none'})
+        self.assertEqual(absent['error']['code'], 'FILE_CONFLICT')
+        self.assertFalse((self.work / 'missing.txt').exists())
+        # Plain creation keeps refusing existing targets and still works.
+        conflict = self.call('file_write', {'path': 'overwrite.txt', 'text': 'x', 'create': True})
+        self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
+        created = self.call('file_write', {'path': 'fresh.txt', 'text': 'new file\n'})
+        self.assertTrue(created['ok'], created)
+        self.assertEqual((self.work / 'fresh.txt').read_bytes(), b'new file\n')
+
+    def test_text_overwrite_keeps_bom_and_crlf_and_refuses_binary_targets(self):
+        path = self.work / 'markers.txt'
+        path.write_bytes(b'\xef\xbb\xbfline one\r\nline two\r\n')
+        observed = self.call('file_read', {'path': 'markers.txt', 'metadataOnly': True})['result']
+        applied = self.call('file_write', {'path': 'markers.txt', 'text': 'short\nsecond\n',
+                                           'overwrite': True, 'expectedVersion': observed['version']})
+        self.assertTrue(applied['ok'], applied)
+        self.assertEqual(path.read_bytes(), b'\xef\xbb\xbfshort\r\nsecond\r\n')
+        binary = self.work / 'blob.bin'
+        binary.write_bytes(b'\xff\xfe raw')
+        meta = self.call('file_read', {'path': 'blob.bin', 'metadataOnly': True})['result']
+        refused = self.call('file_write', {'path': 'blob.bin', 'text': 'text',
+                                           'overwrite': True, 'expectedVersion': meta['version']})
+        self.assertEqual(refused['error']['code'], 'UNSUPPORTED_ENCODING')
+        self.assertEqual(binary.read_bytes(), b'\xff\xfe raw')
+        via_base64 = self.call('file_write', {'path': 'blob.bin', 'data': base64.b64encode(b'\x00NEW').decode(),
+                                              'overwrite': True, 'expectedVersion': meta['version']})
+        self.assertTrue(via_base64['ok'], via_base64)
+        self.assertEqual(binary.read_bytes(), b'\x00NEW')
+
+    def test_commit_persists_the_renamed_directory_entry(self):
+        # sync_directory is the observable seam for the #6 gap: publication
+        # must flush the directory entry change, not only the file bytes.
+        # The in-process service is used because subprocess helpers would not
+        # observe the monkeypatched module.
+        files = self.helper_module()
+        service = self.service()
+        (self.work / 'synced.txt').write_text('one\n')
+        synced = []
+        original = files.sync_directory
+        files.sync_directory = lambda directory: synced.append(str(directory)) or original(directory)
+        try:
+            window = service.read({'path': 'synced.txt'})
+            service.edit({'path': 'synced.txt', 'readToken': window['readToken'],
+                          'edits': [{'oldText': 'one', 'newText': 'two'}]})
+            observed = service.read({'path': 'synced.txt', 'metadataOnly': True})
+            service.write({'path': 'synced.txt', 'text': 'three\n',
+                           'overwrite': True, 'expectedVersion': observed['version']})
+            service.write({'path': 'made.txt', 'text': 'new\n', 'create': True})
+        finally:
+            files.sync_directory = original
+        self.assertEqual(synced, [str(self.work)] * 3)
 
 
 if __name__ == '__main__':
