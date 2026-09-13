@@ -15,6 +15,10 @@
 
 **不修记档**：本机锁偷取 TOCTOU 窗口（narrowing 后仍存，双持幂等无实害，与 space-ledger 同款平台局限）；Windows PID 复用可致维护 busy（无 boot 锚定可用，误判方向只是停回收）；维护轮每条目双重 fsync 与 helpers 段逐 digest /proc 扫描效率（正确性无影响）；远端 policy.json 维护参数 float 未按请求侧严格 int 校验（无现实调用方写 float）
 
+## 2026-09-13 审查轮 2：独立复核与追加修复
+
+独立复核（未参与修复的审查者）判定轮 1 全部 14 项修复「已解决」，无阻断问题；R1/R2 收敛闭环、R4b 捕获范围、收敛断言 fail-safe 方向经组合分支推演确认。新发现采纳修复三项（fcf837f）：N1 远端维护轮时间戳字段类型防护（TypeError 软卡死，四处 _numeric 守卫，损坏绝不触发删除）；N3 R8 锁自愈 close 吞错保证 unlink 必执行；N4 三个收敛断言 break 条件改为目标 id 命中（VM 脏工作区实测触发过早 break 后修正）。轮 2 不修记档：N2 backoff 窗口内本机回收无节流（空转 readdir 量级）；N5 backoff 轮不持久化 lastLocalSummary（本机 lastRunAt 与计数轻微不同源，数值无碍）；N6 upload mirror ack 后按 3 天 TTL 回收而非 30 天确认期（更短方向，语义自洽）。
+
 **验证（2026-09-13，f44ab35）**：npm 287 项（270 通过/0 失败/17 门控跳过）；WSL 七 Python 套件全 OK（reclaim 27 含新增 6 用例）；VM（wt21，脏工作区状态）三文件分开串行 workspace-mcp-remote 5/5、job-cli-remote 8/8、largefile-acceptance 4/4。修复均有先红后绿证据（见各 fix 提交）。
 
 
