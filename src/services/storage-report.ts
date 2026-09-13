@@ -32,6 +32,7 @@ interface MaintenanceCounters {
   lastCompletedAt: number;
   removedTasks?: number;
   removedTransfers?: number;
+  reclaimedResources?: number;
   itemsConsidered?: number;
 }
 
@@ -52,7 +53,7 @@ export interface StorageFilesGateway {
 interface LocalMaintenanceState {
   schemaVersion?: number;
   lastCompletedAt?: unknown;
-  lastLocalSummary?: { removedTasks?: unknown; removedTransfers?: unknown; itemsConsidered?: unknown };
+  lastLocalSummary?: { removedTasks?: unknown; removedTransfers?: unknown; reclaimedResources?: unknown; itemsConsidered?: unknown };
 }
 
 function counter(value: unknown): number {
@@ -67,10 +68,10 @@ async function readLocalMaintenance(identityDirectory: string): Promise<Maintena
   try {
     state = JSON.parse(await readFile(join(identityDirectory, "maintenance.json"), "utf8"));
   } catch {
-    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, itemsConsidered: 0 };
+    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
   }
   if (typeof state !== "object" || state === null) {
-    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, itemsConsidered: 0 };
+    return { lastCompletedAt: 0, removedTasks: 0, removedTransfers: 0, reclaimedResources: 0, itemsConsidered: 0 };
   }
   const summary = typeof state.lastLocalSummary === "object" && state.lastLocalSummary !== null
     ? state.lastLocalSummary : {};
@@ -78,6 +79,7 @@ async function readLocalMaintenance(identityDirectory: string): Promise<Maintena
     lastCompletedAt: typeof state.lastCompletedAt === "number" ? state.lastCompletedAt : 0,
     removedTasks: Array.isArray(summary.removedTasks) ? summary.removedTasks.length : counter(summary.removedTasks),
     removedTransfers: Array.isArray(summary.removedTransfers) ? summary.removedTransfers.length : counter(summary.removedTransfers),
+    reclaimedResources: Array.isArray(summary.reclaimedResources) ? summary.reclaimedResources.length : counter(summary.reclaimedResources),
     itemsConsidered: counter(summary.itemsConsidered),
   };
 }

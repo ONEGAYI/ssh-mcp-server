@@ -2,6 +2,8 @@
 
 状态：用户确认的首版行为契约。核心链路已实现；交付限制与待人工验收项见 [usage.md](usage.md) 和 [progress.md](progress.md)。
 
+2026-09-13 票据 [#17](https://github.com/ONEGAYI/ssh-mcp-server/issues/17) 已实施过期读取凭据、旧 helper 镜像与遗留临时资源的回收（规格 7.1/7.2）：维护轮在既有期限矩阵上扩展三类——过期 readToken 记录与悬空索引按其自身 `expiresAt` 物理删除（判定与读取路径同一时钟，回收后编辑按 `READ_REQUIRED` 拒绝、重读所需片段即恢复且不复活旧已读范围）；helpers/ 镜像按「当前运行版本 + /proc 命令行仍引用的版本」保留，其余在下轮清理（非 64-hex 命名的目录不是镜像、不删）；崩溃遗留的临时资源按账本归属 + 对象身份 + 持有进程（PID+启动身份）三重证据核实回收，未知占用的登记只保留最小管理字段并计入额度，无账本归属的文件永不触碰。本机维护轮同步回收本机账本的同类遗留（持有进程死亡 + 身份匹配才删临时）。详见「生命周期与回收」与「状态与临时数据的空间额度」两节。
+
 2026-09-13 票据 [#16](https://github.com/ONEGAYI/ssh-mcp-server/issues/16) 已实施任务与传输结果到期回收：懒清理 + 每小时在线维护（互斥、游标、双预算），任务/传输结果、已确认日志与 unknown 观察记录按规格期限回收，回收后旧标识仍被拒绝；任务日志接入工作区额度（`STORAGE_LIMIT` 截断原因，不杀子进程）；本机 SpaceLedger 额度上限改为每次额度检查经 loadPolicy 重读（补齐 #8 遗留接线）。详见「任务生命周期」与「状态与临时数据的空间额度」两节。
 
 2026-09-13 票据 [#9](https://github.com/ONEGAYI/ssh-mcp-server/issues/9) 已按 [ADR 0006](../adr/0006-large-file-version-checks.md) 实施读取侧：版本改为 Linux 元数据观察（取消全文摘要），读取取消 16 MiB 体积上限并改为有界流式交付，新增 metadataOnly 与字节游标续读，readToken 引入 3 天闲置过期判定（到期记录的回收执行仍属 #17）。票据 [#10](https://github.com/ONEGAYI/ssh-mcp-server/issues/10) 已实施写侧：精确替换与整体覆盖取消 16 MiB 全文边界，改为分块匹配与流式拼接提交，整体覆盖按 [ADR 0008](../adr/0008-explicit-version-bound-overwrite.md) 走显式 `overwrite` + `expectedVersion`。删除与移动仍保留首版 16 MiB 快照边界（其调整属 #20/#13）。下文「读取与版本」「写入提交」描述当前实现。
@@ -55,7 +57,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 `remote_workspace` 增加可选参数 `includeStorage`（缺省 false，默认调用零额外开销、响应不含任何统计；不新增独立 MCP 工具）。开启时响应**仅**为两端空间汇总（不返回 capabilities），序列化后不超过 4 KiB：
 
 - **两端各报**：`storage.local` / `storage.remote` 下 `stateBytes / tempBytes / reservedBytes / usedBytes(=三者之和) / limitBytes / resourceCount / reservationCount / maintenance{lastCompletedAt, lastRunAt, 计数}`。计量与额度检查同一口径（`ledger.usage`，见「状态与临时数据的空间额度」节）：状态目录递归扫描（排除账本自身目录）+ 已登记临时资源（含目标同目录的编辑/下载/续传临时文件）+ 未消费预留；提交注销登记后正式目标移出计量；预留与已写占用不双重计数。远端统计为一次有界状态目录遍历加账本读取，不做全盘 `du`。
-- **清理摘要**：`maintenance` 报最近一轮维护的持久化时间与计数（远端自 #16 的 maintenance.json 补记 lastSummary 计数：removedJobs/purgedLogs/markedUnknown/removedTransfers/itemsConsidered；本机自 maintenance.json 的 lastLocalSummary 聚合为 removedTasks/removedTransfers/itemsConsidered 计数）。计数只描述最近一轮，预算中断的轮次在下一轮续扫，不隐含跨轮总计；从未运行过的时间与计数为 0，不猜数。本机维护记录内部保存的逐条 id 清单不会进入响应——汇总只输出聚合计数。
+- **清理摘要**：`maintenance` 报最近一轮维护的持久化时间与计数（远端自 #16 的 maintenance.json 补记 lastSummary 计数，#17 起覆盖五段：removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered；本机自 maintenance.json 的 lastLocalSummary 聚合为 removedTasks/removedTransfers/reclaimedResources/itemsConsidered 计数）。计数只描述最近一轮，预算中断的轮次在下一轮续扫，不隐含跨轮总计；从未运行过的时间与计数为 0，不猜数。本机维护记录内部保存的逐条 id 清单不会进入响应——汇总只输出聚合计数。
 - **断线语义**：远端不可达、远端统计失败或可达 helper 未返回 storage 节（升级窗口）时，`storage.remote` 为 `{status:"unknown", reason}`，不出现任何数字字段（不写零）；本机部分仍正常返回。`reason` 截断至 200 字符。
 - **4 KiB 预算与裁剪规则**：固定 schema 正常远小于预算；兜底裁剪按序省略 maintenance 计数明细、再省略 resource/reservation 计数，仅剩 usedBytes/limitBytes（或 unknown 端仅 status），保证最终不超过 4096 字节。
 - **schema/样例 token 测量（2026-09-13，近似方法）**：两个真实样例——VM 可达满配（真实远端数字与本机维护摘要）UTF-8 序列化 582 字节、断线 unknown 样例（真实 ECONNREFUSED reason）321 字节；按 `字节/4` 折算近似 146 / 80 token。此为近似测量（未运行分词器；目标模型 GLM 系列，其 token 化对 ASCII 密集 JSON 通常优于 chars/4，故实际不高于该估计），非精确值；样例 JSON 见 progress.md 票据 #19 节。维护与统计不调用模型。
@@ -143,7 +145,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 ### 读取与版本（2026-09-13 票据 #9 实施后的当前行为）
 
-2026-09-13 已确认、尚未实施的凭据期限，其判定部分已随 #9 实施：readToken 连续 3 天没有成功的相关读取或编辑即过期（`READ_TOKEN_EXPIRED`），成功的相关操作续期；查询、失败操作和其他文件的操作不续期。过期即拒绝使用，且过期后的新读取不继承旧已读范围（旧凭据不会被合并复活）；过期记录文件的物理回收仍属 #17。文件外部变化仍立即使旧凭据失效（`FILE_CONFLICT`），服务成功编辑后的合法新凭据继续按映射规则处理。详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
+readToken 的 3 天闲置过期判定随 #9 实施：连续 3 天没有成功的相关读取或编辑即过期（`READ_TOKEN_EXPIRED`），成功的相关操作续期；查询、失败操作和其他文件的操作不续期。过期即拒绝使用，且过期后的新读取不继承旧已读范围（旧凭据不会被合并复活）；过期记录文件与其会话路径索引的物理回收已随 #17 实施（见「生命周期与回收」），回收后的旧凭据按 `READ_REQUIRED`（记录不可用）拒绝，重读所需片段即恢复编辑且旧已读范围保持失效。文件外部变化仍立即使旧凭据失效（`FILE_CONFLICT`），服务成功编辑后的合法新凭据继续按映射规则处理。详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
 
 - 版本由服务从 Linux 元数据（设备号、inode、文件大小、mtime_ns、ctime_ns）生成，字符串带 `m1-` 方案前缀；不再计算全文摘要。所有版本均由服务签发与核对，绑定当前工作区与解析后的规范路径（读取前后核对描述符与路径仍指向同一对象）。读取凭据由服务签发并校验，记录工作区、文件身份、版本、实际交付范围、调用作用域与到期时间。Agent 自填哈希或仅执行一次 `stat`（含 metadataOnly 观察本身）不算已经读取。
 - 读取无文件体积上限：内容按 256 KiB 流式缓冲交付，文本输出序列化后控制在 56 KiB 内，`maxBytes`（1..1048576）是返回预算而非文件大小上限。读取不存在的路径返回 `PATH_NOT_FOUND`。
@@ -163,7 +165,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 2026-09-13 票据 #8 已实施固定锁槽（WSL Python 套件与 VM 套件实测，内网现场未验收）：远端文件协作锁使用默认 256 个固定锁槽（`<状态根>/file-locks/slot-000…255`），按目标稳定标识（解析后路径字符串）哈希映射复用；不同目标可能共享槽而排队。多目标操作（如 move）对实际槽位去重并按槽号升序统一获取；槽文件使用期间不删除重建。从旧 per-path 锁到固定槽是一次性协议切换，以 `<状态根>/file-locks/slots.json` 标记；切换前逐一探测现存旧锁文件，任何一把仍被持有时以 `LOCK_SWITCH_BLOCKED` 拒绝切换（升级流程先停旧客户端排空，探测无法发现切换瞬间新启动的旧进程，属升级步骤约束）。锁序约定：槽锁（资源锁）可先于空间账本锁获取，禁止反向；切换锁独立且仅做非阻塞探测。
 
-2026-09-13 票据 #8 已实施临时资源登记（实测范围同上）：编辑/写入的提交临时文件先在两端资源账本登记（路径、对象身份 dev:ino、归属、持有进程 PID+boot 起始身份、字节量），登记通过额度检查后才创建文件——临时文件不存在未登记即可被遗留的窗口；提交成功即注销登记，正式目标随之移出空间计量。占用核实证据由 `resource_inspect` 提供：持有进程存活（PID+启动身份，PID 重用不冒充持有者）、路径存在性与对象身份匹配；时间过旧不作为判断依据。崩溃遗留的登记与文件的回收核实属 #17，本票不做周期回收。
+2026-09-13 票据 #8 已实施临时资源登记（实测范围同上）：编辑/写入的提交临时文件先在两端资源账本登记（路径、对象身份 dev:ino、归属、持有进程 PID+boot 起始身份、字节量），登记通过额度检查后才创建文件——临时文件不存在未登记即可被遗留的窗口；提交成功即注销登记，正式目标随之移出空间计量。占用核实证据由 `resource_inspect` 提供：持有进程存活（PID+启动身份，PID 重用不冒充持有者）、路径存在性与对象身份匹配；时间过旧不作为判断依据。崩溃遗留登记与残留文件的周期回收已随 #17 实施（见「生命周期与回收」）：维护轮按账本归属、对象身份与占用证据三重核实后删除并注销；无法核实的保留最小管理信息；无账本归属的文件不触碰。
 
 2026-09-13 票据 #10 已实施流式精确替换与显式版本覆盖（WSL Python 套件、npm test 与 VM 套件实测，内网现场未验收）：
 
@@ -173,7 +175,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 - 上传（`remote_upload`）沿用同一覆盖语义：覆盖已有远端目标同样走 `overwrite` + `expectedVersion`（register 早检 + commit 锁内复核）；自 #13 起上传整体改为可续传的流式传输事务（见「大文件传输恢复」一节），16 MiB 本机读取边界已移除，任意大小受两端空间额度约束。
 - 临时文件登记量按流式输出的精确字节数（原大小减去被替换区间加新字节）计算，额度检查随登记在账本锁内完成；删除/移动仍走首版 16 MiB 快照路径。
 
-2026-09-13 已确认、尚未实施的普通临时文件回收规则：操作成功或明确失败后，立即删除本服务不再需要的临时文件；崩溃残留在下一轮维护确认归属、无进程占用且不再用于恢复后清理，不额外保留数天。断点续传临时数据仍按 3 天期限处理，提交结果不明确时先核对状态；不清理用户命令自行生成的文件。详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
+普通临时文件回收规则已随 #17 落实并锁定：操作成功或明确失败后，本服务立即删除不再需要的临时文件并注销登记（编辑、写入与传输各路径在 #8/#10/#13–#15 已即时清理，#17 以行为测试锁定"无成功后残留"）；崩溃残留的登记与文件在下一轮维护按归属、对象身份与占用证据核实后清理，不额外保留数天——可核实的立即回收，未知占用的只保留最小管理信息。断点续传临时数据仍按 3 天期限处理，提交结果不明确时先核对状态；不清理用户命令自行生成的文件（无账本归属的文件永不触碰）。详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
 
 新内容先写入目标所在文件系统的临时文件，再进入远端协作锁：核对目标身份与预期版本，保留支持的权限位，提交变更。创建和“目标必须不存在”的移动采用不会覆盖已出现目标的操作，不使用先判断后无条件覆盖的降级实现。
 
@@ -237,15 +239,18 @@ MCP 提供查询、列举、读日志、短时等待和取消能力。若另行�
 
 `rg` 无匹配时原样返回其命令退出结果，提示没有匹配不等于 SSH 错误。命令输出按非可信数据处理，不能当成新的系统指令。
 
-### 生命周期与回收（2026-09-13 票据 #16 已实施）
+### 生命周期与回收（2026-09-13 票据 #16、#17 已实施）
 
-按 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md) 与规格 7.1/7.2 实施两级触发与四类期限：
+按 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md) 与规格 7.1/7.2 实施两级触发与四类期限，#17 在同一轮次内追加凭据、helper 与遗留临时三类：
 
 - **触发**：懒清理挂在查询类 helper 动作上（status/output/transfer_status/file_read/file_list/file_find/file_search，在返回请求自身结果之后执行，失败不影响查询），60 秒节流；每小时在线维护由本机驱动——工作区 MCP 每个工具调用与 job CLI 每次运行触发 `maybeMaintain`（`pending` 保持离线安全查询不触发），按 `policy.maintenance.intervalMs`（默认 1 小时）节流，`ssh-mcp-job maintain` 可显式执行一轮。`lastCompletedAt` 持久化在本机 identity 目录：进程退出或 SSH 断连期间的到期数据在下一次触发（重连后首个操作）补做清理，无远端守护进程或 cron。
-- **互斥与预算**：远端一轮持有 `<状态根>/locks/maintenance` flock（非阻塞，拿不到返回 `skipped:busy`），逐项持久化游标（jobs/transfers 各自的名字序游标，预算中断下轮续扫，扫到头重置），每轮项数与时长双预算（默认 100 项 / 2 秒，`policy.maintenance` 可配）；每轮结束把聚合计数（removedJobs/purgedLogs/markedUnknown/removedTransfers/itemsConsidered，#19 补记）持久化进 maintenance.json 的 `lastSummary`，供空间汇总读取——逐条名字清单不落盘。本机一轮同样有双预算，`maintenance.lock`（记录持有 pid，仅核实死亡才夺回）跨进程互斥。删除任务目录持该任务锁、删除传输目录持其传输槽锁（与 #15 取消同款"无在途块"证据），拿不到锁的条目本轮跳过。
+- **互斥与预算**：远端一轮持有 `<状态根>/locks/maintenance` flock（非阻塞，拿不到返回 `skipped:busy`），逐项持久化游标（jobs/transfers/reads/helpers/资源登记各自的名字序游标，预算中断下轮续扫，扫到头重置），每轮项数与时长双预算（默认 100 项 / 2 秒，`policy.maintenance` 可配，五段共享同一预算）；每轮结束把聚合计数（removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered，#19 补记、#17 扩至五段）持久化进 maintenance.json 的 `lastSummary`，供空间汇总读取——逐条名字清单不落盘。本机一轮同样有双预算，`maintenance.lock`（记录持有 pid，仅核实死亡才夺回）跨进程互斥。删除任务目录持该任务锁、删除传输目录持其传输槽锁（与 #15 取消同款"无在途块"证据），拿不到锁的条目本轮跳过；资源登记的回收逐项持账本锁（maintenance 锁 → 账本锁方向，符合槽锁先于账本锁的锁序）。
 - **期限**（全部可经请求覆盖 > 远端 policy.json 的 retentionMs 节 > 规格默认；加速时钟 `SSH_MCP_TEST_CLOCK` 用于期限判定）：已确认任务日志自 ack 起 3 天（删 stdout/stderr/launcher.log 并写 purged.json，dedup 记录保留）；已确认任务/传输结果记录自 ack 起 30 天（整目录回收）；已结束未确认结果自 completedAt 起 30 天（整目录回收，含日志）；unknown 形态任务（starting 卡死/worker 消失的观察结论）自**首次观察**起 30 天——首次维护写入 `unknown.json` 仅记一次，查询与核实失败不续期；中断传输数据自最后实际进展（无进展则注册时刻）起 3 天。
+- **读取凭据回收（#17）**：`<状态根>/reads/` 下过期（`now > expiresAt`，与读取路径 `READ_TOKEN_EXPIRED` 判定同时钟、同语义——晚到的成功操作不复活已过期记录）的 `<32hex>.json` 凭据记录被物理删除，指向已删或已过期凭据的 `index-*.json` 会话路径索引同轮回收（名字序保证凭据先于索引处理，悬空索引不留到下轮；grant_read 对悬空索引本就按首读处理）。回收后旧凭据编辑按 `READ_REQUIRED`（记录不可用）拒绝；重读所需片段签发只覆盖新窗口的新凭据，旧已读范围不复活。
+- **helper 镜像回收（#17）**：远端 helpers/ 按「当前运行版本 + 活动依赖」保留——正在执行维护的 helper 自身所在镜像目录即当前版本；活动依赖以 /proc 命令行证据核实：运行中任务 worker（以 `<镜像>/agent.py --root … _worker` 形式 spawn）、并发 helper 调用与镜像安装进程（目标路径作为 argv）都会出现在 cmdline 中。两者之外的 64-hex 镜像目录在维护轮删除；非 64-hex 命名的目录不是本服务镜像，永不触碰。已知边界：升级窗口内仍在运行的旧版本客户端进程若此刻恰无在途调用，其镜像可能被回收，该进程后续调用将报 `HELPER_EXECUTION_FAILED`，重启进程即自愈（安装幂等重装）；按 #7/#20 的升级纪律应先停旧客户端再切换。
+- **遗留临时资源回收（#17）**：维护轮遍历两端资源账本，逐项三重核实——归属（账本登记本身）、占用（持有进程 PID+boot 启动身份；PID 重用不冒充、年龄不参与判定）、对象身份（路径现存对象与登记的 dev:ino 匹配）。持有者存活 → 保留；持有者已死且身份匹配 → 删文件并注销登记；文件已不存在或名字处已是别的对象 → 仅注销登记（外来文件不删）；持有身份从未锚定或对象身份从未附加 → 未知占用，登记与文件原样保留（登记只含路径/身份/归属/占用证据/字节量等最小管理字段，不含任何结果正文，字节量继续计入额度）。无账本归属的文件（哪怕叫 `.ssh-mcp-*`）永不触碰。
 - **回收后拒绝**：记录删除后旧标识不再落入任何创建分支——`task_start` 报 `REQUEST_EXPIRED_OR_UNKNOWN`，传输各动作经 `_load_record` 同码拒绝；登记后执行协议（#7）保证这一点，#16 的验收即覆盖"回收后重放被拒"。legacy（v1）任务记录仅在 v2 协议激活后删除：未激活工作区的 v1 记录只清日志不删记录，避免升级窗口内旧请求经 legacy start 重跑。
-- **不做**：账本遗留登记/无主临时文件的核实回收（属 #17）、readToken/helper 版本回收（#17）、prepared 任务登记（规格未设期限，不回收）。空间用量汇总已随 #19 实施（见「文件接口」节）。
+- **不做**：prepared 任务登记（规格未设期限，不回收）。账本遗留登记/无主临时文件核实回收、readToken/helper 版本回收已随 #17 实施，空间用量汇总已随 #19 实施（见「文件接口」节）。
 - **unknown 记录**：远端 unknown.json 与本机 rejected/unstarted 登记遵循上述期限；结果未知的任务或传输先查询原操作，不自动重跑或再次覆盖；到期停止自动恢复并删除结果详情、诊断与恢复记录，提示记录已过期、需人工核对实际结果；删除后旧请求仍拒绝。该期限不代表操作已失败或停止，不删除正式文件。
 
 ### 状态与临时数据的空间额度（2026-09-13 票据 #8 部分实施；#16 接入日志额度与每操作重读）
@@ -258,11 +263,11 @@ MCP 提供查询、列举、读日志、短时等待和取消能力。若另行�
 - 失败码：额度不足 `WORKSPACE_QUOTA_EXCEEDED`（拒绝新占用并说明 used/limit/requesting）；物理写满 `STORAGE_FULL`（ENOSPC 映射，含账本自身持久化失败）；本机账本被持续占用 `LEDGER_BUSY`（可重试）；`RESOURCE_NOT_FOUND`、`INVALID_POLICY`、`LEDGER_UNAVAILABLE`。
 - 远端 helper 公共动作（非 MCP 工具）：`resource_reserve / resource_release / resource_register / resource_forget / resource_inspect / resource_usage`，供 #10 提交前预留、#13 传输预留、#17 回收核实与 #19 用量汇总复用；#19 起统计另经 `file_workspace` 的 `includeStorage=true` 分支输出（同口径复用 `ledger.usage` 与维护计数，见「文件接口」节）。
 
-空间不足时先清理已过期且可安全回收的数据（#16 已实施：任务/传输记录与已确认日志按上节期限回收；账本遗留登记与无主临时文件仍待 #17 核实回收），仍不足则拒绝新增占用并报告原因，不提前删除未到期续传数据、未确认结果或正在使用的文件。任务和传输启动前检查并预留额度（已知大小的编辑/写入提交与下载已在 #8 接入；传输启动前预留属 #13）。任务日志是未知增量：worker 每写满 1 MiB 经 `ledger.usage` 复查工作区额度，耗尽后停止保存新日志、置 `outputTruncated=true` 并记 `reason=STORAGE_LIMIT`，继续排空输出管道避免阻塞子进程（不杀任务，命令照常跑完），额度工具故障时保守继续写；输出丢失不伪装完整——截断状态随状态返回。额度预留不承诺排除外部程序导致的磁盘不足或其他写入失败，详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
+空间不足时先清理已过期且可安全回收的数据（#16 已实施任务/传输记录与已确认日志按上节期限回收；#17 起账本遗留登记与核实过的崩溃残留临时文件同样在维护轮回收，未知占用的登记保留待核实），仍不足则拒绝新增占用并报告原因，不提前删除未到期续传数据、未确认结果或正在使用的文件。任务和传输启动前检查并预留额度（已知大小的编辑/写入提交与下载已在 #8 接入；传输启动前预留属 #13）。任务日志是未知增量：worker 每写满 1 MiB 经 `ledger.usage` 复查工作区额度，耗尽后停止保存新日志、置 `outputTruncated=true` 并记 `reason=STORAGE_LIMIT`，继续排空输出管道避免阻塞子进程（不杀任务，命令照常跑完），额度工具故障时保守继续写；输出丢失不伪装完整——截断状态随状态返回。额度预留不承诺排除外部程序导致的磁盘不足或其他写入失败，详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
 
 ## 完成回传与恢复
 
-2026-09-13 已确认、尚未实施的辅助程序回收规则：远端 helpers/ 仅保留当前版本及活动任务、连接仍依赖的版本，其他版本确认无依赖后在下一轮维护清理。回退需从对应本机离线包重新部署；回收不得破坏活动任务或连接的运行和恢复。详见 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md)。
+辅助程序回收规则已随 #17 实施（规格 7.1/ADR 0010）：远端 helpers/ 仅保留当前运行版本及 /proc 命令行仍引用的活动版本（运行中任务 worker、并发调用与安装进程都构成引用证据），其余镜像在下一轮维护清理；非镜像命名的目录不受影响。回退需从对应本机离线包重新部署（安装幂等，重启旧客户端进程即自愈）；回收不触碰活动任务或连接正在使用的镜像。已知边界：升级窗口内恰无在途调用的旧版本客户端进程，其镜像可能被回收并使该进程后续调用报 `HELPER_EXECUTION_FAILED`——升级纪律要求先停旧客户端再切换（#7/#20）。
 
 1. 正常连接时，本机等待程序获取远端结束记录，输出有界结果并退出，由 ZCode 原生后台机制继续原对话。
 2. SSH 中断时，程序进行有界退避重连；远端任务持续。重连后读取原任务，不重新执行命令。

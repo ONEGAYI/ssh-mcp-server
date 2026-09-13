@@ -1,31 +1,24 @@
 # 实施进展与验证证据
 
-## 2026-09-13 票据 #19：按需返回工作区空间汇总
-
-分支 `ticket/19-space-report`（基于 f6e21e0），按规格 7.2 末段实施（TDD，先红后绿）：
-
-1. **远端汇总分支**（`remote/files.py`）：`file_workspace` 接受 `includeStorage`（缺省不携带则零额外工作，非布尔值报 `INVALID_REQUEST`）；开启时返回且仅返回 `storage` 节——复用 `ledger.usage` 的计量（状态目录有界遍历 + 账本登记，绝不做全盘 du）加维护摘要，不再返回 capabilities。
-2. **维护计数持久化**（`remote/reclaim.py`）：每轮结束把聚合计数（removedJobs/purgedLogs/markedUnknown/removedTransfers/itemsConsidered）写入 maintenance.json 的 `lastSummary`（逐条名字清单不落盘）；新增公共 `last_round_summary(root)` 供汇总读取，从未运行时时间与计数为 0、不猜数。旧 maintenance.json 缺字段时 setdefault 兼容。
-3. **本机组装**（`src/services/storage-report.ts` 新文件）：本机端经 SpaceLedger.usage（loadPolicy 每次重读 limit）+ maintenance.json 聚合计数（内部逐条 id 清单聚合成计数，不进响应）；远端端经 `file_workspace includeStorage=true` 取 `storage` 节透传，失败（不可达/统计失败/旧 helper 无 storage 节）置 `{status:"unknown", reason}`（reason 截 200 字符），不出现任何数字字段、不写零，本机部分正常返回。4 KiB 预算：固定 schema 常态远低于预算，兜底裁剪按序省略 maintenance 计数 → resource/reservation 计数。
-4. **MCP 接线**（`src/core/workspace-server.ts`）：`remote_workspace` schema 增加可选 `includeStorage`，缺省路径与原实现逐字相同（零开销）；不新增 MCP 工具，维护与统计不调用模型。
-
-验证证据（2026-09-13，worktree ticket-19，profile wt19-largefile 与其他 worktree 隔离）：
-
-- WSL Ubuntu / Python 3.12：`remote-space-report.test.py` 6/6 通过（实现前 4 error + 1 fail 红转绿：默认无统计节为回归保护用例本就绿）；回归 remote-agent 13、remote-discovery 28、remote-files 44、remote-ledger 12、remote-reclaim 13、remote-transfer 51 全通过。
-- Windows Node 24.15：`npm test` 268 项（255 通过、13 门控跳过、0 失败；新增 storage-report 2 用例与离线 MCP 断线用例——离线 profile 以 127.0.0.1:1 拒绝连接模拟不可达远端，断言本机数字、远端 unknown 无数字字段、响应 ≤ 4 KiB、凭据不泄露）。
-- CentOS 7.9 VM 真实 SSH（两文件分开串行）：`workspace-mcp-remote.test.js` 5/5（#19 断言内嵌首个用例：默认调用无 storage、includeStorage 两端数字与口径恒等式、可达端无 unknown、≤ 4 KiB）；`job-cli-remote.test.js` 7/7。
-- 红→绿记录：远端红为 `KeyError: 'storage'`（helper 忽略未知参数返回 capabilities）与 includeStorage 非布尔未拒绝；本机红为 schema 无 includeStorage（zod 剥离未知参数后走默认 SSH 路径失败）与 storage-report 模块不存在。
-- **schema/样例 token 测量（近似方法，未运行分词器）**：目标模型 GLM 系列，按 `UTF-8 字节/4` 折算近似 token。VM 可达满配真实样例 582 字节 ≈ 146 token；断线 unknown 真实样例 321 字节 ≈ 80 token。两样例：
-
-```json
-{"storage":{"local":{"stateBytes":44007,"tempBytes":0,"reservedBytes":0,"usedBytes":44007,"limitBytes":10737418240,"resourceCount":0,"reservationCount":0,"maintenance":{"lastCompletedAt":1789294823939,"removedTasks":0,"removedTransfers":0,"itemsConsidered":10}},"remote":{"stateBytes":448368,"tempBytes":0,"reservedBytes":0,"usedBytes":448368,"limitBytes":10737418240,"resourceCount":0,"reservationCount":0,"maintenance":{"lastCompletedAt":1789294823.890088,"lastRunAt":1789294823.890088,"removedJobs":0,"purgedLogs":0,"markedUnknown":0,"removedTransfers":0,"itemsConsidered":21}}}}
-```
-
-```json
-{"storage":{"local":{"stateBytes":0,"tempBytes":0,"reservedBytes":0,"usedBytes":0,"limitBytes":10737418240,"resourceCount":0,"reservationCount":0,"maintenance":{"lastCompletedAt":0,"removedTasks":0,"removedTransfers":0,"itemsConsidered":0}},"remote":{"status":"unknown","reason":"connect ECONNREFUSED 127.0.0.1 port 1"}}}
-```
-
 - 已知边界：远端/本机维护摘要的计数只描述最近一轮（预算中断轮次在下一轮续扫，不隐含跨轮总计）；本机 stateBytes 扫描与额度检查同一递归遍历，规模大时的性能特征待观察（沿用 #8 记档条目）；裁剪兜底阶梯的最深两级无行为级测试（固定 schema 常态不可能触发，仅防御性实现，契约已写明规则）。
+- 本票尚未由用户人工验收；最终内网离线现场验收仍未完成。
+
+## 2026-09-13 票据 #17：回收过期读取凭据、旧 helper 与遗留临时文件
+
+分支 `ticket/17-credential-reclamation`（基于 f6e21e0），按规格 7.1/7.2 与 ADR 0010 在 #16 的维护框架上扩展三类回收（TDD，先红后绿）：
+
+1. **过期 readToken 物理回收**（`remote/reclaim.py`）：维护轮遍历 `<状态根>/reads/`，`now > expiresAt`（与读取路径 `READ_TOKEN_EXPIRED` 判定同一注入钟、同语义）的凭据记录删除；指向已删/已过期凭据的 `index-*.json` 同轮回收（名字序保证 32hex 凭据先于索引处理，grant_read 对悬空索引本就按首读处理）。回收后旧凭据编辑报 `READ_REQUIRED`；重读所需片段签发只覆盖新窗口的凭据，旧已读范围不复活（#9 判定 + #17 物理回收闭环）。
+2. **旧 helper 镜像回收**（`remote/reclaim.py`）：镜像布局为 `<状态根>/helpers/<镜像 sha256>/<模块>.py`；保留集 = 正在执行维护的 helper 自身镜像（`__file__` 父目录名）+ /proc 命令行仍引用的镜像（运行中任务 worker 以 `<镜像>/agent.py … _worker` spawn、并发 helper 调用与安装进程的目标路径都在 cmdline 中）。其余 64-hex 目录整目录删除；非 64-hex 命名目录不是镜像、永不触碰。
+3. **遗留临时资源回收**（两端）：按账本归属 + 持有进程（PID+boot 启动身份，年龄不参与判定）+ 对象身份（dev:ino）三重证据核实——持有者存活保留；死亡且身份匹配删文件并注销；文件已不存在或名字处是外来对象仅注销（不删外来文件）；持有身份或对象身份从未锚定为未知占用，登记原样保留（仅最小管理字段、字节量继续计入额度）。无账本归属的文件永不触碰。**由现存传输记录引用的 resourceId 跳过通用回收**——传输 temp 与登记跨多个短命 helper 进程存活（登记时的持有者必然已死），其回收由 #16 传输专属路径（槽锁证据 + 3 天期限）执行；本缺陷由 remote-transfer 套件回归暴露（活跃传输 temp 被懒清理误删）后修正并补锁定用例。
+4. **本机侧**（`src/services/maintenance.ts`）：维护轮新增本机账本遗留登记回收（同构判定，本机以 pid 存活为占用证据——Windows 无 boot 锚定，沿用 SpaceLedger 既有局限说明）；同样跳过本机传输记录管理的 resourceId。普通临时文件「成功/确定失败立即清理」为 #8/#10/#13–#15 既有行为，本票以锁定用例固化（编辑+创建后无 `.ssh-mcp-*` 残留、账本清零）。
+
+验证证据（2026-09-13，worktree ticket-17，profile wt17-largefile 与其他 worktree 隔离）：
+
+- WSL Ubuntu / Python 3.12：`remote-reclaim.test.py` 21/21 通过（#17 新增 8 用例实现前 6 error 红——维护摘要无 removedReadTokens/removedHelpers/reclaimedResources 键、1 用例为既有行为锁定直接绿；覆盖凭据回收+重读恢复+旧范围不复活、活动引用与当前镜像保留、非镜像目录不删、崩溃残留核实回收、活动/未知保留与最小字段断言、无归属不删、传输管理登记不被通用回收竞夺、普通临时立即清理）。回归 remote-agent 13、remote-transfer 51、remote-files 44、remote-ledger 12、remote-discovery 27 全 OK。
+- Windows Node 24.15：`npm test` 268 项（255 通过、13 门控跳过、0 失败；maintenance-service 新增 3 用例：已死持有者核实回收、活动/未锚定/外来对象/消失文件四分支、传输管理登记保护）。
+- CentOS 7.9 VM 真实 SSH（两文件分开串行）：`workspace-mcp-remote.test.js` 5/5；`job-cli-remote.test.js` 8/8（#17 新用例：真实工作区一轮 maintenance 同时回收过期凭据（夹具改 expiresAt 加速，MCP 通道无法注入测试钟）、假 digest 旧镜像与核实过的崩溃残留，断言真镜像不在删除列表、旧凭据 READ_REQUIRED、重读片段恢复编辑且尾部旧范围仍拒绝）。
+- 已知边界：升级窗口内恰无在途调用的旧版本客户端进程，其镜像可能被回收，该进程后续调用报 `HELPER_EXECUTION_FAILED`（重启自愈，安装幂等重装；升级纪律先停旧客户端，见 contracts「helper 镜像回收」）；未知占用的登记会一直保留（规格如此：继续核实，不计龄回收）。
+- **与 #19 的合并注记**：两票均改维护摘要链路，合并时取语义并集——远端 lastSummary/`last_round_summary` 与本机空间汇总的维护计数扩至五段全键（含 removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources，本机 lastLocalSummary 聚合新增 reclaimedResources），空间汇总与 #17 计数互不丢失。
 - 本票尚未由用户人工验收；最终内网离线现场验收仍未完成。
 
 ## 2026-09-13 票据 #16：任务与传输结果到期回收且拒绝旧请求
