@@ -366,6 +366,61 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertEqual(self.call('transfer_commit', {'transferId': second_id})['error']['code'],
                          'TRANSFER_STATE_UNKNOWN')
 
+    def test_reconciliation_success_releases_the_ledger_resource(self):
+        # 对账成功（rename 已发生、receipt 丢失）补 receipt 的路径同样要
+        # 释放账本资源：否则 totalBytes 量级的登记永久留在 resources 里，
+        # 配额永久泄漏（正常发布路径有 release，这里曾缺失）。
+        data = b'reconcile release'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        # 模拟崩溃窗口：rename 已发布、intent 已持久化、receipt 未写、
+        # state 停在 committing。
+        temp = self.temp_path(transfer_id)
+        info = temp.stat()
+        intent = {'schemaVersion': 1, 'targetPath': str(self.work / 'target.bin'),
+                  'expectedVersion': None, 'overwrite': False, 'create': False,
+                  'tempIdentity': '{}:{}'.format(info.st_dev, info.st_ino),
+                  'totalSha256': hashlib.sha256(data).hexdigest(), 'totalBytes': len(data),
+                  'plannedAt': time.time()}
+        directory = self.state / 'transfers' / transfer_id
+        (directory / 'intent.json').write_text(json.dumps(intent))
+        record = self.record(transfer_id)
+        record['state'] = 'committing'
+        (directory / 'record.json').write_text(json.dumps(record))
+        os.replace(str(temp), str(self.work / 'target.bin'))
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(len(resources), 1)
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual(committed['result']['state'], 'completed')
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(resources, {})
+
+    def test_commit_on_vanished_overwrite_target_records_failed(self):
+        # 发布段的 OSError（如 overwrite 目标被外部删除）必须落 failed
+        # 留痕并转成 FILE_CONFLICT，而不是裸抛 HELPER_ERROR 把 state 卡死
+        # 在 committing（重试永远 TRANSFER_STATE_UNKNOWN）。
+        target = self.work / 'vanish.bin'
+        target.write_bytes(b'original')
+        observed = self.call('file_read', {'path': 'vanish.bin', 'metadataOnly': True})['result']['version']
+        data = b'replacement'
+        transfer_id = self.register(data, target='vanish.bin', overwrite=True,
+                                    expectedVersion=observed)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        target.unlink()  # commit 前目标被外部删除
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(committed['error']['code'], 'FILE_CONFLICT')
+        record = self.record(transfer_id)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['error']['code'], 'FILE_CONFLICT')
+        # failed 留痕后重试得到明确的 INVALID_STATE，不再无限循环。
+        again = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(again['error']['code'], 'INVALID_STATE')
+
     def test_commit_is_idempotent_after_completion(self):
         data = b'idempotent'
         transfer_id, first = self.deliver(data)

@@ -514,6 +514,10 @@ def commit(root, request):
                                  'Commit outcome cannot be reconciled with the persisted intent; inspect the target manually')
             receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': intent['totalBytes'],
                        'targetIdentity': intent['tempIdentity']}
+            if record['resourceId']:
+                # Same cleanup as the regular publish path: the committed
+                # target must leave space measurement.
+                ledger.release(root, record['resourceId'])
             atomic_json(receipt_path, receipt)
             record.update(state='completed', completedAt=receipt['committedAt'])
             _save_record(root, transfer_id, record)
@@ -571,6 +575,18 @@ def commit(root, request):
             record.update(state='failed', error={'code': error.code, 'message': str(error)}, completedAt=_now())
             _save_record(root, transfer_id, record)
             raise
+        except OSError as error:
+            # Publication-stage OS failures (vanished overwrite target, a
+            # create target appearing concurrently, permission errors, ...)
+            # must leave the same failed trail instead of stranding the state
+            # in committing with a raw HELPER_ERROR on every retry.
+            record.update(state='failed',
+                          error={'code': 'FILE_CONFLICT',
+                                 'message': 'Commit publish failed before the target took effect: {}'.format(error)},
+                          completedAt=_now())
+            _save_record(root, transfer_id, record)
+            raise AgentError('FILE_CONFLICT',
+                             'Commit publish failed before the target took effect: {}'.format(error))
         if record['resourceId']:
             ledger.release(root, record['resourceId'])
         receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': record['totalBytes'],
