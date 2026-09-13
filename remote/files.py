@@ -1,4 +1,9 @@
-"""Workspace file operations with server-issued read records and version checks."""
+"""Workspace file operations with server-issued read records and version checks.
+
+Internal boundaries (issue #6), each replaceable without rewriting callers:
+version observation, content reading (whole-file today, streaming in #9),
+replacement planning (in-memory today, chunked in #10), and commit.
+"""
 from contextlib import contextmanager
 import base64
 import fcntl
@@ -17,26 +22,134 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 BOM = b'\xef\xbb\xbf'
 
 
+# --- Version observation ------------------------------------------------------
+# Observes the file identity and derives the version string. Callers compare
+# the string opaquely, so #9 can swap the content hash for metadata-only
+# observation inside this boundary alone.
+
 def metadata(info):
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink]
 
 
-def snapshot(path):
-    before = path.stat()
-    if not stat.S_ISREG(before.st_mode):
+def require_guarded_file(info):
+    """Snapshot gate: only regular files within the guarded size."""
+    if not stat.S_ISREG(info.st_mode):
         raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
-    if before.st_size > MAX_FILE_BYTES:
+    if info.st_size > MAX_FILE_BYTES:
         raise AgentError('FILE_TOO_LARGE', 'Guarded file operations currently support files up to 16 MiB')
-    with path.open('rb') as stream:
-        if metadata(os.fstat(stream.fileno())) != metadata(before):
-            raise AgentError('FILE_CONFLICT', 'File identity changed while reading')
-        data = stream.read(MAX_FILE_BYTES + 1)
-        after = os.fstat(stream.fileno())
+
+
+def content_version(info, data):
+    """Version string binding stat metadata to the full content hash."""
+    return hashlib.sha256(json.dumps(metadata(info)).encode() + data).hexdigest()
+
+
+def current_version(path):
+    """Version observed right now. Still a full snapshot; #9 swaps the
+    internals for metadata-only observation without touching callers."""
+    return snapshot(path)[2]
+
+
+def verify_stable_read(before, after, data, path):
+    """Post-read stability check across the three observed stats."""
     if len(data) > MAX_FILE_BYTES or metadata(before) != metadata(after) or metadata(after) != metadata(path.stat()):
         raise AgentError('FILE_CONFLICT', 'File changed while reading')
-    version = hashlib.sha256(json.dumps(metadata(after)).encode() + data).hexdigest()
-    return data, after, version
 
+
+# --- Content reading ------------------------------------------------------------
+# Turns the file into delivered windows. Today that means buffering the whole
+# file; #9 replaces it with bounded streaming behind the same contracts.
+
+def read_whole_file(stream, expected):
+    """Read the entire file between two descriptor identity checks."""
+    if metadata(os.fstat(stream.fileno())) != metadata(expected):
+        raise AgentError('FILE_CONFLICT', 'File identity changed while reading')
+    data = stream.read(MAX_FILE_BYTES + 1)
+    return data, os.fstat(stream.fileno())
+
+
+def snapshot(path):
+    """Observe the version and read the whole current content.
+
+    Couples version observation with a whole-file read under three-way stat
+    identity checks; #9 splits the observation from streamed content while
+    keeping this contract for callers that still need both.
+    """
+    before = path.stat()
+    require_guarded_file(before)
+    with path.open('rb') as stream:
+        data, after = read_whole_file(stream, before)
+    verify_stable_read(before, after, data, path)
+    return data, after, content_version(after, data)
+
+
+def require_utf8(data):
+    """Whole-content UTF-8 gate for text reads."""
+    try:
+        data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise AgentError('UNSUPPORTED_ENCODING', 'Text reads require UTF-8; use base64 for binary')
+
+
+def decode_edit_text(data):
+    """Decode an edit target as UTF-8, keeping the BOM out of the text."""
+    try:
+        return data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise AgentError('UNSUPPORTED_ENCODING', 'Text edits require UTF-8')
+
+
+def delivery_window(data, request, binary):
+    """Compute the byte window one read request delivers.
+
+    Owns the maxBytes gate, byte-offset and line positioning (BOM-aware),
+    the serialized-output budget and the no-progress guard. Returns
+    (start, end, shown, delivered_end, bom_size).
+    """
+    limit = request.get('maxBytes', 65536)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1048576:
+        raise AgentError('INVALID_LIMIT', 'maxBytes must be between 1 and 1048576')
+    bom_size = len(BOM) if not binary and data.startswith(BOM) else 0
+    if 'offset' in request or binary:
+        offset = request.get('offset', 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(data):
+            raise AgentError('INVALID_OFFSET', 'Byte offset is outside the file')
+        start, end = max(bom_size, offset), len(data)
+        if not binary and start < len(data) and data[start] & 0xc0 == 0x80:
+            raise AgentError('INVALID_OFFSET', 'Offset must be at a UTF-8 character boundary')
+    else:
+        lines = data[bom_size:].splitlines(keepends=True)
+        first, last = request.get('fromLine', 1), request.get('toLine', max(1, len(lines)))
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in (first, last)) or last < first:
+            raise AgentError('INVALID_LINE_RANGE', 'Line ranges are one-based and inclusive')
+        start = bom_size + sum(len(line) for line in lines[:first - 1])
+        end = bom_size + sum(len(line) for line in lines[:last])
+    chunk = data[start:min(end, start + limit)]
+    shown = base64.b64encode(chunk).decode('ascii') if binary else chunk.decode('utf8', errors='ignore')
+    if request.get('grantRead', True) is not False:
+        # Budget serialized tool content, not just source bytes. Reserve
+        # room for paths, version and cursor metadata before granting reads.
+        budget = 65536 - 8192
+        if len(json.dumps(shown, ensure_ascii=False).encode('utf8')) > budget:
+            low, high = 0, len(shown)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if len(json.dumps(shown[:middle], ensure_ascii=False).encode('utf8')) <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            if binary:
+                chunk = chunk[:(low // 4) * 3]
+                shown = base64.b64encode(chunk).decode('ascii')
+            else:
+                shown = shown[:low]
+    delivered_end = start + (len(chunk) if binary else len(shown.encode('utf8')))
+    if delivered_end == start and start < end:
+        raise AgentError('INVALID_LIMIT', 'maxBytes is too small for the next UTF-8 character')
+    return start, end, shown, delivered_end, bom_size
+
+
+# --- Byte-range and content helpers ------------------------------------------------
 
 def merge_ranges(ranges):
     merged = []
@@ -77,6 +190,104 @@ def preserve_newlines(text, original):
 def replaceable(info):
     if info.st_nlink != 1 or info.st_uid != os.getuid():
         raise AgentError('UNSUPPORTED_METADATA', 'Mutation requires an owned file with a single link')
+
+
+# --- Replacement planning -----------------------------------------------------
+# Decides what to replace and where. Matching is whole-text in memory today;
+# #10 swaps it for chunked matching without changing these contracts.
+
+def locate_replacements(text, data, edits, ranges):
+    """Validate an edit list and locate every uniquely matching span.
+
+    Returns (replacements, byte_edits): sorted character spans ready to
+    apply, plus byte-coordinate facts credential renewal needs.
+    """
+    if not isinstance(edits, list) or not edits or len(edits) > 100:
+        raise AgentError('INVALID_EDIT', 'Provide between 1 and 100 exact replacements')
+    replacements = []
+    byte_edits = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            raise AgentError('INVALID_EDIT', 'Each edit must be an object')
+        old, new = edit.get('oldText'), edit.get('newText')
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise AgentError('INVALID_EDIT', 'Replacement text must be strings with a nonempty oldText')
+        start = text.find(old)
+        if start < 0 or text.find(old, start + 1) >= 0:
+            raise AgentError('EDIT_MATCH_ERROR', 'oldText must match exactly once')
+        byte_start = (len(BOM) if data.startswith(BOM) else 0) + len(text[:start].encode('utf8'))
+        if not covers(ranges, byte_start, byte_start + len(old.encode('utf8'))):
+            raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
+        normalized_new = preserve_newlines(new, data)
+        replacements.append((start, start + len(old), normalized_new))
+        byte_edits.append((byte_start, byte_start + len(old.encode('utf8')), len(normalized_new.encode('utf8'))))
+    replacements.sort()
+    return replacements, byte_edits
+
+
+def apply_replacements(data, text, replacements):
+    """Reject overlapping spans and apply the sorted replacements
+    back-to-front, re-encoding with the original BOM kept."""
+    if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
+        raise AgentError('INVALID_EDIT', 'Replacement ranges must not overlap')
+    for start, end, new in reversed(replacements):
+        text = text[:start] + new + text[end:]
+    return (BOM if data.startswith(BOM) else b'') + text.encode('utf8')
+
+
+def compose_content(request, old):
+    """Build full replacement bytes from exactly one of text or base64
+    data, preserving the prior BOM and newline style."""
+    if ('text' in request) == ('data' in request):
+        raise AgentError('INVALID_CONTENT', 'Provide exactly one of UTF-8 text or base64 data')
+    if 'text' in request:
+        if not isinstance(request['text'], str):
+            raise AgentError('INVALID_CONTENT', 'text must be a string')
+        try:
+            old.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            raise AgentError('UNSUPPORTED_ENCODING', 'Use base64 to replace a binary file')
+        text = preserve_newlines(request['text'], old)
+        return (BOM if old.startswith(BOM) and not text.startswith('\ufeff') else b'') + text.encode('utf8')
+    try:
+        return base64.b64decode(request['data'], validate=True)
+    except (ValueError, TypeError):
+        raise AgentError('INVALID_CONTENT', 'data must be valid base64')
+
+
+# --- Commit ---------------------------------------------------------------------
+# Materializes and atomically publishes new content. Today one buffered write;
+# #10 swaps it for streamed splicing into the same flow.
+
+def write_temporary(directory, data, info):
+    """Materialize content through a same-directory temp file.
+
+    Preserves group and mode, fsyncs, and reports the written identity.
+    Removes the temp file on failure; publication stays with commit.
+    """
+    fd, temporary = tempfile.mkstemp(prefix='.ssh-mcp-', dir=str(directory))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            if info is not None:
+                os.fchown(stream.fileno(), -1, info.st_gid)
+                os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
+            stream.flush()
+            os.fsync(stream.fileno())
+            written_info = os.fstat(stream.fileno())
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+    return temporary, written_info
+
+
+def verify_committed_image(observed, observed_info, updated, written_info):
+    """Confirm our exact post-image, not arbitrary bytes seen after an
+    external replacement. ctime may legitimately change on rename."""
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink', 'st_uid', 'st_gid')
+    if observed != updated or any(getattr(observed_info, field) != getattr(written_info, field) for field in fields):
+        raise AgentError('FILE_CONFLICT', 'File changed after the edit was committed')
 
 
 class FileService:
@@ -146,6 +357,18 @@ class FileService:
         atomic_json(self.read_index(path), {'readToken': key})
         return {'readToken': key, 'version': version, 'size': size, 'complete': covers(ranges, 0, size)}
 
+    def grant_read(self, path, version, size, bom_size, start, delivered_end):
+        """Merge the delivered window into the session's read credential."""
+        index_path = self.read_index(path)
+        key, previous = None, []
+        if index_path.exists():
+            candidate = read_json(index_path)['readToken']
+            old = read_json(self.reads / (candidate + '.json'))
+            if old['session'] == self.session and old['path'] == str(path) and old['version'] == version:
+                key, previous = candidate, old['ranges']
+        ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
+        return self.save_read(path, version, size, ranges, key)
+
     def read(self, request):
         path = self.path(request.get('path'))
         with self.lock(path):
@@ -154,65 +377,15 @@ class FileService:
             if request.get('encoding', 'utf8') not in ('base64', 'utf8'):
                 raise AgentError('UNSUPPORTED_ENCODING', 'Choose utf8 or base64')
             if not binary:
-                try:
-                    data.decode('utf-8-sig')
-                except UnicodeDecodeError:
-                    raise AgentError('UNSUPPORTED_ENCODING', 'Text reads require UTF-8; use base64 for binary')
-            limit = request.get('maxBytes', 65536)
-            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1048576:
-                raise AgentError('INVALID_LIMIT', 'maxBytes must be between 1 and 1048576')
-            bom_size = len(BOM) if not binary and data.startswith(BOM) else 0
-            if 'offset' in request or binary:
-                offset = request.get('offset', 0)
-                if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(data):
-                    raise AgentError('INVALID_OFFSET', 'Byte offset is outside the file')
-                start, end = max(bom_size, offset), len(data)
-                if not binary and start < len(data) and data[start] & 0xc0 == 0x80:
-                    raise AgentError('INVALID_OFFSET', 'Offset must be at a UTF-8 character boundary')
-            else:
-                lines = data[bom_size:].splitlines(keepends=True)
-                first, last = request.get('fromLine', 1), request.get('toLine', max(1, len(lines)))
-                if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in (first, last)) or last < first:
-                    raise AgentError('INVALID_LINE_RANGE', 'Line ranges are one-based and inclusive')
-                start = bom_size + sum(len(line) for line in lines[:first - 1])
-                end = bom_size + sum(len(line) for line in lines[:last])
-            chunk = data[start:min(end, start + limit)]
-            shown = base64.b64encode(chunk).decode('ascii') if binary else chunk.decode('utf8', errors='ignore')
-            if request.get('grantRead', True) is not False:
-                # Budget serialized tool content, not just source bytes. Reserve
-                # room for paths, version and cursor metadata before granting reads.
-                budget = 65536 - 8192
-                if len(json.dumps(shown, ensure_ascii=False).encode('utf8')) > budget:
-                    low, high = 0, len(shown)
-                    while low < high:
-                        middle = (low + high + 1) // 2
-                        if len(json.dumps(shown[:middle], ensure_ascii=False).encode('utf8')) <= budget:
-                            low = middle
-                        else:
-                            high = middle - 1
-                    if binary:
-                        chunk = chunk[:(low // 4) * 3]
-                        shown = base64.b64encode(chunk).decode('ascii')
-                    else:
-                        shown = shown[:low]
-            delivered_end = start + (len(chunk) if binary else len(shown.encode('utf8')))
-            if delivered_end == start and start < end:
-                raise AgentError('INVALID_LIMIT', 'maxBytes is too small for the next UTF-8 character')
+                require_utf8(data)
+            start, end, shown, delivered_end, bom_size = delivery_window(data, request, binary)
             result = {'path': str(path), 'data' if binary else 'text': shown, 'encoding': 'base64' if binary else 'utf8',
                       'newline': None if binary else newline_kind(data), 'version': version,
                       'size': len(data), 'bom': data.startswith(BOM), 'startOffset': start, 'endOffset': delivered_end,
                       'nextOffset': delivered_end if delivered_end < end else None, 'truncated': delivered_end < end}
             if request.get('grantRead', True) is False:
                 return result
-            index_path = self.read_index(path)
-            key, previous = None, []
-            if index_path.exists():
-                candidate = read_json(index_path)['readToken']
-                old = read_json(self.reads / (candidate + '.json'))
-                if old['session'] == self.session and old['path'] == str(path) and old['version'] == version:
-                    key, previous = candidate, old['ranges']
-            ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
-            return dict(result, **self.save_read(path, version, len(data), ranges, key))
+            return dict(result, **self.grant_read(path, version, len(data), bom_size, start, delivered_end))
 
     def edit(self, request):
         path = self.path(request.get('path'), writing=True)
@@ -220,71 +393,44 @@ class FileService:
             data, info, version = snapshot(path)
             token = self.token(request.get('readToken'), path, version)
             replaceable(info)
-            try:
-                text = data.decode('utf-8-sig')
-            except UnicodeDecodeError:
-                raise AgentError('UNSUPPORTED_ENCODING', 'Text edits require UTF-8')
-            edits = request.get('edits')
-            if not isinstance(edits, list) or not edits or len(edits) > 100:
-                raise AgentError('INVALID_EDIT', 'Provide between 1 and 100 exact replacements')
-            replacements = []
-            byte_edits = []
-            for edit in edits:
-                if not isinstance(edit, dict):
-                    raise AgentError('INVALID_EDIT', 'Each edit must be an object')
-                old, new = edit.get('oldText'), edit.get('newText')
-                if not isinstance(old, str) or not old or not isinstance(new, str):
-                    raise AgentError('INVALID_EDIT', 'Replacement text must be strings with a nonempty oldText')
-                start = text.find(old)
-                if start < 0 or text.find(old, start + 1) >= 0:
-                    raise AgentError('EDIT_MATCH_ERROR', 'oldText must match exactly once')
-                byte_start = (len(BOM) if data.startswith(BOM) else 0) + len(text[:start].encode('utf8'))
-                if not covers(token['ranges'], byte_start, byte_start + len(old.encode('utf8'))):
-                    raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
-                normalized_new = preserve_newlines(new, data)
-                replacements.append((start, start + len(old), normalized_new))
-                byte_edits.append((byte_start, byte_start + len(old.encode('utf8')), len(normalized_new.encode('utf8'))))
-            replacements.sort()
-            if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
-                raise AgentError('INVALID_EDIT', 'Replacement ranges must not overlap')
-            for start, end, new in reversed(replacements):
-                text = text[:start] + new + text[end:]
-            updated = (BOM if data.startswith(BOM) else b'') + text.encode('utf8')
+            text = decode_edit_text(data)
+            replacements, byte_edits = locate_replacements(text, data, request.get('edits'), token['ranges'])
+            updated = apply_replacements(data, text, replacements)
             written_info = self.commit(path, updated, info, version)
             result = {'path': str(path), 'written': True, 'bytesWritten': len(updated), 'editsApplied': len(replacements)}
-            try:
-                observed, observed_info, new_version = snapshot(path)
-                # Confirm our exact post-image, not arbitrary bytes seen after an
-                # external replacement. ctime may legitimately change on rename.
-                fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink', 'st_uid', 'st_gid')
-                if observed != updated or any(getattr(observed_info, field) != getattr(written_info, field) for field in fields):
-                    raise AgentError('FILE_CONFLICT', 'File changed after the edit was committed')
-                ranges = remap_read_ranges(token['ranges'], byte_edits)
-                result.update(self.save_read(path, new_version, len(updated), ranges))
-                result['rereadRequired'] = False
-            except (OSError, AgentError) as error:
-                # The write already happened. Do not report it as a failed edit
-                # or give a credential authorizing unverified external content.
-                result.update(readToken=None, rereadRequired=True, readTokenError=getattr(error, 'code', 'READ_RECORD_UNAVAILABLE'),
-                              message='Edit committed, but read-token renewal could not be confirmed. Read the current file before further editing.')
-            return result
+            return self.renew_after_edit(path, token, byte_edits, updated, written_info, result)
+
+    def renew_after_edit(self, path, token, byte_edits, updated, written_info, result):
+        """Verify the committed image and renew the read credential.
+
+        The write already happened: verification failures never turn the
+        edit into a reported failure, they only invalidate the credential
+        and require a fresh read.
+        """
+        try:
+            observed, observed_info, new_version = snapshot(path)
+            verify_committed_image(observed, observed_info, updated, written_info)
+            ranges = remap_read_ranges(token['ranges'], byte_edits)
+            result.update(self.save_read(path, new_version, len(updated), ranges))
+            result['rereadRequired'] = False
+        except (OSError, AgentError) as error:
+            result.update(readToken=None, rereadRequired=True, readTokenError=getattr(error, 'code', 'READ_RECORD_UNAVAILABLE'),
+                          message='Edit committed, but read-token renewal could not be confirmed. Read the current file before further editing.')
+        return result
 
     def commit(self, path, data, info=None, version=None):
+        """Atomically install data at path through a same-directory temp file.
+
+        Owns the output size gate, the pre-replace version re-check and
+        replace-versus-link publication.
+        """
         if len(data) > MAX_FILE_BYTES:
             raise AgentError('FILE_TOO_LARGE', 'Content exceeds 16 MiB')
-        fd, temporary = tempfile.mkstemp(prefix='.ssh-mcp-', dir=str(path.parent))
+        temporary, written_info = write_temporary(path.parent, data, info)
         try:
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(data)
-                if info is not None:
-                    os.fchown(stream.fileno(), -1, info.st_gid)
-                    os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
-                stream.flush()
-                os.fsync(stream.fileno())
-                written_info = os.fstat(stream.fileno())
             self.path(str(path), writing=True)
             if version is not None:
-                if snapshot(path)[2] != version:
+                if current_version(path) != version:
                     raise AgentError('FILE_CONFLICT', 'File changed before committing the write')
                 os.replace(temporary, str(path))
             else:
@@ -316,22 +462,7 @@ class FileService:
                 old, info, version = snapshot(path)
                 self.full_read(request, path, version, len(old))
                 replaceable(info)
-            if ('text' in request) == ('data' in request):
-                raise AgentError('INVALID_CONTENT', 'Provide exactly one of UTF-8 text or base64 data')
-            if 'text' in request:
-                if not isinstance(request['text'], str):
-                    raise AgentError('INVALID_CONTENT', 'text must be a string')
-                try:
-                    old.decode('utf-8-sig')
-                except UnicodeDecodeError:
-                    raise AgentError('UNSUPPORTED_ENCODING', 'Use base64 to replace a binary file')
-                text = preserve_newlines(request['text'], old)
-                data = (BOM if old.startswith(BOM) and not text.startswith('\ufeff') else b'') + text.encode('utf8')
-            else:
-                try:
-                    data = base64.b64decode(request['data'], validate=True)
-                except (ValueError, TypeError):
-                    raise AgentError('INVALID_CONTENT', 'data must be valid base64')
+            data = compose_content(request, old)
             self.commit(path, data, info, version)
             return {'path': str(path), 'written': True, 'created': creating, 'bytesWritten': len(data)}
 
@@ -341,7 +472,7 @@ class FileService:
             data, info, version = snapshot(path)
             self.full_read(request, path, version, len(data))
             replaceable(info)
-            if snapshot(path)[2] != version:
+            if current_version(path) != version:
                 raise AgentError('FILE_CONFLICT', 'File changed before deletion')
             path.unlink()
             return {'path': str(path), 'deleted': True}
@@ -365,10 +496,10 @@ class FileService:
                 target_data, target_info, target_version = snapshot(target)
                 self.full_read(request, target, target_version, len(target_data), 'targetReadToken')
                 replaceable(target_info)
-            if snapshot(source)[2] != version:
+            if current_version(source) != version:
                 raise AgentError('FILE_CONFLICT', 'Source changed before move')
             if target_version is not None:
-                if snapshot(target)[2] != target_version:
+                if current_version(target) != target_version:
                     raise AgentError('FILE_CONFLICT', 'Destination changed before move')
                 os.replace(str(source), str(target))
             else:

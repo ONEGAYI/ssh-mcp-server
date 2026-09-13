@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -318,6 +319,123 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertTrue(result['rereadRequired'])
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
+
+    def test_size_gate_rejects_directories_oversized_reads_and_oversized_commits(self):
+        directory = self.call('file_read', {'path': '.'})
+        self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
+        oversized = self.work / 'oversized.bin'
+        oversized.write_bytes(b'0' * (16 * 1024 * 1024 + 1))
+        too_large = self.call('file_read', {'path': 'oversized.bin'})
+        self.assertEqual(too_large['error']['code'], 'FILE_TOO_LARGE')
+        # The commit-side output gate applies even to creations with no prior read.
+        payload = base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')
+        rejected = self.call('file_write', {'path': 'created.bin', 'data': payload, 'create': True})
+        self.assertEqual(rejected['error']['code'], 'FILE_TOO_LARGE')
+        self.assertFalse((self.work / 'created.bin').exists())
+
+    def test_version_string_joins_metadata_and_full_content(self):
+        sys.path.insert(0, str(HELPER.parent))
+        import files
+        path = self.work / 'versioned.txt'
+        path.write_bytes(b'stable content\n')
+        first = files.snapshot(path)
+        second = files.snapshot(path)
+        self.assertEqual(first[0], b'stable content\n')
+        self.assertEqual(first[2], second[2])
+        # Same bytes, moved metadata: the version string must still change.
+        stats = path.stat()
+        os.utime(str(path), (stats.st_atime + 90, stats.st_mtime + 90))
+        self.assertNotEqual(files.snapshot(path)[2], first[2])
+        path.write_bytes(b'changed content\n')
+        self.assertNotEqual(files.snapshot(path)[2], first[2])
+        # A metadata-only touch must also invalidate a previously granted token.
+        stale = self.call('file_read', {'path': 'versioned.txt'})['result']['readToken']
+        stats = path.stat()
+        os.utime(str(path), (stats.st_atime + 90, stats.st_mtime + 90))
+        conflict = self.call('file_edit', {'path': 'versioned.txt', 'readToken': stale,
+                                           'edits': [{'oldText': 'changed', 'newText': 'lost'}]})
+        self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_bytes(), b'changed content\n')
+
+    def test_read_window_validates_offsets_lines_limits_and_encodings(self):
+        path = self.work / 'window.txt'
+        path.write_bytes('中文 text\n'.encode('utf8'))
+        for request, code in [
+            ({'path': 'window.txt', 'maxBytes': 0}, 'INVALID_LIMIT'),
+            ({'path': 'window.txt', 'maxBytes': 1048577}, 'INVALID_LIMIT'),
+            ({'path': 'window.txt', 'maxBytes': 'eight'}, 'INVALID_LIMIT'),
+            ({'path': 'window.txt', 'maxBytes': 1}, 'INVALID_LIMIT'),
+            ({'path': 'window.txt', 'offset': 99}, 'INVALID_OFFSET'),
+            ({'path': 'window.txt', 'offset': 1}, 'INVALID_OFFSET'),
+            ({'path': 'window.txt', 'fromLine': 0}, 'INVALID_LINE_RANGE'),
+            ({'path': 'window.txt', 'fromLine': 5, 'toLine': 2}, 'INVALID_LINE_RANGE'),
+            ({'path': 'window.txt', 'fromLine': '2'}, 'INVALID_LINE_RANGE'),
+            ({'path': 'window.txt', 'encoding': 'latin1'}, 'UNSUPPORTED_ENCODING'),
+        ]:
+            result = self.call('file_read', request)
+            self.assertFalse(result['ok'], request)
+            self.assertEqual(result['error']['code'], code, request)
+        (self.work / 'raw.bin').write_bytes(b'\xff\xfe\x00')
+        refused = self.call('file_read', {'path': 'raw.bin'})
+        self.assertEqual(refused['error']['code'], 'UNSUPPORTED_ENCODING')
+
+    def test_read_window_paginates_by_byte_cursor_and_merges_coverage(self):
+        (self.work / 'cursor.txt').write_bytes(b'hello cursor world')
+        first = self.call('file_read', {'path': 'cursor.txt', 'offset': 0, 'maxBytes': 4})['result']
+        self.assertEqual((first['text'], first['startOffset'], first['endOffset'], first['nextOffset'], first['truncated']),
+                         ('hell', 0, 4, 4, True))
+        second = self.call('file_read', {'path': 'cursor.txt', 'offset': first['nextOffset'], 'maxBytes': 8})['result']
+        self.assertEqual((second['text'], second['startOffset'], second['nextOffset'], second['truncated']),
+                         ('o cursor', 4, 12, True))
+        third = self.call('file_read', {'path': 'cursor.txt', 'offset': second['nextOffset'], 'maxBytes': 8})['result']
+        self.assertEqual(third['text'], ' world')
+        self.assertIsNone(third['nextOffset'])
+        self.assertFalse(third['truncated'])
+        self.assertTrue(third['complete'])
+        self.assertEqual(third['readToken'], first['readToken'])
+
+    def test_read_window_skips_bom_bytes_but_counts_them_as_read(self):
+        (self.work / 'bom.txt').write_bytes(b'\xef\xbb\xbfcontent')
+        read = self.call('file_read', {'path': 'bom.txt'})['result']
+        self.assertEqual((read['text'], read['bom'], read['startOffset'], read['truncated']),
+                         ('content', True, 3, False))
+        self.assertTrue(read['complete'])
+        jumped = self.call('file_read', {'path': 'bom.txt', 'offset': 0})['result']
+        self.assertEqual(jumped['startOffset'], 3)
+        self.assertTrue(jumped['complete'])
+        self.assertEqual(jumped['readToken'], read['readToken'])
+
+    def test_edit_input_validation_rejects_malformed_requests_and_binary_targets(self):
+        (self.work / 'edit-target.txt').write_text('value\n')
+        token = self.call('file_read', {'path': 'edit-target.txt'})['result']['readToken']
+        base = {'path': 'edit-target.txt', 'readToken': token}
+        for edits, code in [
+            ([], 'INVALID_EDIT'),
+            ([{'oldText': 'value', 'newText': 'x'}] * 101, 'INVALID_EDIT'),
+            (['value'], 'INVALID_EDIT'),
+            ([{'oldText': '', 'newText': 'x'}], 'INVALID_EDIT'),
+            ([{'oldText': 7, 'newText': 'x'}], 'INVALID_EDIT'),
+        ]:
+            result = self.call('file_edit', dict(base, edits=edits))
+            self.assertFalse(result['ok'], repr(edits[:1]))
+            self.assertEqual(result['error']['code'], code, repr(edits[:1]))
+        self.assertEqual((self.work / 'edit-target.txt').read_text(), 'value\n')
+        (self.work / 'binary-edit').write_bytes(b'\xff\xfe raw')
+        raw_token = self.call('file_read', {'path': 'binary-edit', 'encoding': 'base64'})['result']['readToken']
+        refused = self.call('file_edit', {'path': 'binary-edit', 'readToken': raw_token,
+                                          'edits': [{'oldText': 'raw', 'newText': 'cooked'}]})
+        self.assertEqual(refused['error']['code'], 'UNSUPPORTED_ENCODING')
+        self.assertEqual((self.work / 'binary-edit').read_bytes(), b'\xff\xfe raw')
+
+    def test_mutations_require_a_single_owned_link(self):
+        path = self.work / 'linked.txt'
+        path.write_text('content\n')
+        os.link(str(path), str(self.work / 'second-link.txt'))
+        token = self.call('file_read', {'path': 'linked.txt'})['result']['readToken']
+        refused = self.call('file_edit', {'path': 'linked.txt', 'readToken': token,
+                                          'edits': [{'oldText': 'content', 'newText': 'changed'}]})
+        self.assertEqual(refused['error']['code'], 'UNSUPPORTED_METADATA')
+        self.assertEqual(path.read_text(), 'content\n')
 
 
 if __name__ == '__main__':
