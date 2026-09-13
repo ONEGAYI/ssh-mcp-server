@@ -148,7 +148,7 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 - `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。文件本身无体积上限（#9 起流式交付）。
 - `truncated` 表示本次请求区间是否因上限未返回完整；`nextOffset` 给出可继续读取的字节位置，`startOffset` / `endOffset` 标出本次实际范围。
 - `complete` 表示当前凭据的已知范围覆盖整个文件（来自实际读取及自身编辑后的继承）。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
-- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖与上传覆盖绑定 metadataOnly 观察版本（#10/#13），无需完整已读；删除或移动仍须具有完整已知范围。同一文件版本变化后旧凭据失效。
+- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖与上传覆盖绑定 metadataOnly 观察版本（#10/#13），无需完整已读；下载覆盖绑定本机目标观察版本（#14，见下）；删除或移动仍须具有完整已知范围。同一文件版本变化后旧凭据失效。
 
 传入 `offset` 后按该位置读取至文件尾（再受单次上限限制），不再使用 fromLine/toLine 作为区间终点；它不是绑定原区间的游标。文本 offset 必须位于 UTF-8 字符边界，使用返回的 nextOffset 可避免手算。二进制使用 `encoding: "base64"` 与字节 offset。
 
@@ -169,6 +169,19 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 - 传输中出错（断线、超时）时错误响应携带 `transferId`，同样以 resume 接回；本机源文件在传输期间变化则拒绝续传，需重新 start。
 - `action=status` 只读查询进度，无副作用。
 - 覆盖已有远端目标须先 `remote_read metadataOnly` 拿版本，再带 `overwrite=true` 与 `expectedVersion`；默认目标必须不存在。
+- 主动取消与完成确认（cancel/ack）尚未提供（#15）。
+
+### 下载大文件（可续传传输事务）
+
+`remote_download` 自 #14 起与上传对称：远端源绑定其 `m1-` 观察版本，默认 1 MiB 分块、每块摘要校验后确认，两端各自流式 SHA-256；文件字节不经模型，**不签发 readToken**（下载不授予已读范围）。默认 `action=start` 在单次调用预算（`budgetMs`，默认 55 秒）内驱动：
+
+- 正常完成返回 `state=completed` 与 `transferId`、`sha256`、`bytesWritten`、`blocksFetched`。
+- 预算耗尽未传完时返回 `state=transferring`、`confirmedOffset` 与 `budgetExhausted=true`；用 `action=resume` 加同一 `transferId` 继续，只补未确认数据（接收临时文件与块清单持久化在本机状态目录，恢复时先重校验再续传）。
+- 断线或本机进程退出后，同样以 resume 接回；错误响应携带 `transferId`。
+- 远端源文件在传输期间变化（`m1-` 版本不符）则拒绝原传输并置 `failed`（`TRANSFER_SOURCE_CHANGED`），需重新 start。
+- 本机目标默认必须不存在；覆盖须带 `overwrite=true` 与本机目标观察版本 `l1-<size>:<mtimeMs>`（首次拒绝的 `FILE_CONFLICT` 消息会给出该值），提交前复核，目标变化拒绝覆盖。
+- 本机磁盘写满（`STORAGE_FULL`）时清理接收临时文件后可重试，续传从零开始。
+- `action=status` 只读查询进度，无副作用。
 - 主动取消与完成确认（cancel/ack）尚未提供（#15）。
 
 ### 后台任务
@@ -201,7 +214,7 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 | 项目 | 首版行为 |
 |---|---|
 | 目录边界 | 默认限制在 remoteRoot 内；仅用户显式选择 unrestricted 后文件工具可按绝对路径访问远端任意位置，其余文件保护不变 |
-| 文件大小 | 读取与编辑无上限（流式，#9/#10）；上传无上限走可续传传输事务（#13）；下载单文件仍限 16 MiB（#14 改造） |
+| 文件大小 | 读取与编辑无上限（流式，#9/#10）；上传与下载均无上限，走可续传传输事务（#13/#14） |
 | 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖、删除、移动需要完整已知范围 |
 | 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期 |
 | 编码 | 文本 UTF-8/BOM，保留原 CRLF 约定、权限与组；混合换行不整体重排。其他编码按 base64 传输 |
