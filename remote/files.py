@@ -3,10 +3,12 @@
 Internal boundaries (issue #6), each replaceable without rewriting callers:
 version observation (metadata-only since issue #9, spec 4.1), content reading
 (bounded streaming windows since issue #9, spec 4.2), replacement planning
-(in-memory today, chunked in #10), and commit.
+(chunked whole-file matching since issue #10, spec 4.3), and commit (streamed
+same-directory splicing with directory fsync since issue #10).
 """
 from contextlib import contextmanager
 import base64
+import codecs
 import errno
 import hashlib
 import json
@@ -57,8 +59,8 @@ def require_regular_file(info):
 def require_snapshot_size(info):
     """Whole-file gate for the mutation paths that still buffer full content.
 
-    Streaming replacement lands with issue #10; until then guarded mutations
-    keep the first-version 16 MiB bound. Content reads have no size cap.
+    Since issue #10 edit and whole-file write stream instead; the bound now
+    only guards delete/move, which keep their first-version snapshot planning.
     """
     if info.st_size > MAX_FILE_BYTES:
         raise AgentError('FILE_TOO_LARGE', 'Guarded mutations currently support files up to 16 MiB')
@@ -113,8 +115,8 @@ def snapshot(path):
     """Observe the metadata version and read the whole current content.
 
     Couples version observation with a whole-file read under three-way stat
-    identity checks. #10 replaces the in-memory planning of its callers; the
-    size gate and full read stay so mutation behaviour is unchanged here.
+    identity checks. Edit and whole-file write moved to their streaming paths
+    in issue #10; delete and move still plan through this boundary.
     """
     before = path.stat()
     require_regular_file(before)
@@ -209,12 +211,45 @@ def decode_utf8_prefix(chunk):
     raise AgentError('UNSUPPORTED_ENCODING', 'Text reads require UTF-8; use base64 for binary')
 
 
-def decode_edit_text(data):
-    """Decode an edit target as UTF-8, keeping the BOM out of the text."""
-    try:
-        return data.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        raise AgentError('UNSUPPORTED_ENCODING', 'Text edits require UTF-8')
+def utf8_stream_validator():
+    """Incremental strict UTF-8 decoder used as a streaming text gate.
+
+    Feeding every chunk (then flush) proves the whole file decodes without
+    ever holding the decoded text: text edits and text whole-file writes keep
+    refusing binary targets, but no longer need the file in memory.
+    """
+    decoder = codecs.getincrementaldecoder('utf8')()
+
+    def feed(chunk, final=False):
+        try:
+            decoder.decode(chunk, final)
+        except UnicodeDecodeError:
+            raise AgentError('UNSUPPORTED_ENCODING', 'Text edits require UTF-8; use base64 for binary')
+        return chunk
+    return feed
+
+
+class NewlineCensus(object):
+    """Global CRLF/LF census over streamed chunks (replaces whole-text
+    newline_kind for the streaming paths). Correct across chunk boundaries:
+    a CR at the tail of one chunk followed by a LF at the head of the next
+    still counts as one CRLF."""
+
+    def __init__(self):
+        self.crlf = 0
+        self.lf = 0
+        self._pending_cr = False
+
+    def feed(self, chunk):
+        self.lf += chunk.count(b'\n')
+        self.crlf += chunk.count(b'\r\n')
+        if self._pending_cr and chunk.startswith(b'\n'):
+            self.crlf += 1
+        self._pending_cr = chunk.endswith(b'\r')
+        return chunk
+
+    def kind(self):
+        return 'mixed' if self.crlf and self.lf - self.crlf else 'CRLF' if self.crlf else 'LF'
 
 
 def validate_read_request(request):
@@ -294,8 +329,9 @@ def newline_kind(data):
     return 'mixed' if crlf and lf else 'CRLF' if crlf else 'LF'
 
 
-def preserve_newlines(text, original):
-    return text.replace('\r\n', '\n').replace('\n', '\r\n') if newline_kind(original) == 'CRLF' else text
+def preserve_newlines_census(text, census):
+    """CRLF preservation driven by the streamed census (issue #10)."""
+    return text.replace('\r\n', '\n').replace('\n', '\r\n') if census.kind() == 'CRLF' else text
 
 
 def replaceable(info):
@@ -304,62 +340,124 @@ def replaceable(info):
 
 
 # --- Replacement planning -----------------------------------------------------
-# Decides what to replace and where. Matching is whole-text in memory today;
-# #10 swaps it for chunked matching without changing these contracts.
+# Decides what to replace and where. Since issue #10 the plan is built by one
+# chunked pass over the file (spec 4.3): nothing buffers the whole text.
 
-def locate_replacements(text, data, edits, ranges):
-    """Validate an edit list and locate every uniquely matching span.
-
-    Returns (replacements, byte_edits): sorted character spans ready to
-    apply, plus byte-coordinate facts credential renewal needs.
-    """
+def validate_edits(edits):
+    """Validate an edit list; returns [(oldText, newText)] pairs."""
     if not isinstance(edits, list) or not edits or len(edits) > 100:
         raise AgentError('INVALID_EDIT', 'Provide between 1 and 100 exact replacements')
-    replacements = []
-    byte_edits = []
+    pairs = []
     for edit in edits:
         if not isinstance(edit, dict):
             raise AgentError('INVALID_EDIT', 'Each edit must be an object')
         old, new = edit.get('oldText'), edit.get('newText')
         if not isinstance(old, str) or not old or not isinstance(new, str):
             raise AgentError('INVALID_EDIT', 'Replacement text must be strings with a nonempty oldText')
-        start = text.find(old)
-        if start < 0 or text.find(old, start + 1) >= 0:
-            raise AgentError('EDIT_MATCH_ERROR', 'oldText must match exactly once')
-        byte_start = (len(BOM) if data.startswith(BOM) else 0) + len(text[:start].encode('utf8'))
-        if not covers(ranges, byte_start, byte_start + len(old.encode('utf8'))):
+        pairs.append((old, new))
+    return pairs
+
+
+def locate_replacements(stream, pairs, ranges, chunk_size=MAX_STREAM_CHUNK):
+    """Plan replacements by streaming the whole file once (spec 4.3).
+
+    Byte-level matching over chunked reads with an overlap carry reproduces
+    the first-version whole-text semantics: UTF-8 is self-synchronizing, so
+    the byte spans of oldText.encode('utf8') are exactly the whole-text spans,
+    and each edit must match exactly once with the whole span inside ranges
+    granted by reads. The same pass validates the file is UTF-8 (text edits
+    keep refusing binary targets) and takes the newline census that CRLF
+    preservation needs. Nothing but the carry tail is held between chunks.
+
+    Returns (replacements, byte_edits): sorted (start, end, new_bytes) byte
+    spans ready to splice, plus the original-coordinate facts credential
+    renewal needs.
+    """
+    patterns = [old.encode('utf8') for old, new in pairs]
+    carry = max(max(len(pattern) for pattern in patterns) - 1, 1)
+    validate_chunk = utf8_stream_validator()
+    census = NewlineCensus()
+    found = [[] for _ in patterns]  # first two absolute starts per pattern
+    search_from = [0] * len(patterns)
+    stream.seek(0)
+    tail = b''
+    position = 0  # absolute offset of the bytes consumed from previous buffers
+    while True:
+        block = stream.read(chunk_size)
+        if not block:
+            break
+        buffer = tail + block if tail else block
+        buffer_start = position - len(tail)
+        validate_chunk(census.feed(block))
+        for index, pattern in enumerate(patterns):
+            matches = found[index]
+            relative = max(0, search_from[index] - buffer_start)
+            while len(matches) < 2:
+                at = buffer.find(pattern, relative)
+                if at < 0:
+                    break
+                matches.append(buffer_start + at)
+                search_from[index] = buffer_start + at + 1
+                relative = at + 1
+        position += len(block)
+        tail = buffer[-carry:] if carry else b''
+    validate_chunk(b'', True)
+    replacements = []
+    for index, (old, new) in enumerate(pairs):
+        matches = found[index]
+        if not matches:
+            raise AgentError('EDIT_MATCH_ERROR', 'oldText was not found; read the current file around the target and retry')
+        if len(matches) > 1:
+            raise AgentError('EDIT_MATCH_ERROR', 'oldText matches more than once; widen it with surrounding context until it is unique')
+        start = matches[0]
+        end = start + len(patterns[index])
+        if not covers(ranges, start, end):
             raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
-        normalized_new = preserve_newlines(new, data)
-        replacements.append((start, start + len(old), normalized_new))
-        byte_edits.append((byte_start, byte_start + len(old.encode('utf8')), len(normalized_new.encode('utf8'))))
+        replacements.append((start, end, preserve_newlines_census(new, census).encode('utf8')))
     replacements.sort()
-    return replacements, byte_edits
-
-
-def apply_replacements(data, text, replacements):
-    """Reject overlapping spans and apply the sorted replacements
-    back-to-front, re-encoding with the original BOM kept."""
     if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
         raise AgentError('INVALID_EDIT', 'Replacement ranges must not overlap')
-    for start, end, new in reversed(replacements):
-        text = text[:start] + new + text[end:]
-    return (BOM if data.startswith(BOM) else b'') + text.encode('utf8')
+    return replacements, [(start, end, len(new_bytes)) for start, end, new_bytes in replacements]
 
 
-def compose_content(request, old):
+def splice_stream(source, replacements, sink, chunk_size=MAX_STREAM_CHUNK):
+    """Copy source into sink, splicing the sorted replacement spans in order.
+
+    A length-changing rewrite of a whole file stays bounded in memory: only
+    chunk-sized copies and the replacement bytes themselves pass through, so
+    the cost of a variable-length edit is disk I/O, never a whole-file
+    network transfer or buffer (spec 4.3).
+    """
+    position = 0
+    for start, end, new_bytes in replacements:
+        source.seek(position)
+        remaining = start - position
+        while remaining > 0:
+            block = source.read(min(chunk_size, remaining))
+            if not block:
+                raise AgentError('FILE_CONFLICT', 'File shrank while splicing the replacement')
+            sink.write(block)
+            remaining -= len(block)
+        sink.write(new_bytes)
+        position = end
+    source.seek(position)
+    while True:
+        block = source.read(chunk_size)
+        if not block:
+            break
+        sink.write(block)
+
+
+def compose_content(request, has_bom, census):
     """Build full replacement bytes from exactly one of text or base64
-    data, preserving the prior BOM and newline style."""
+    data, preserving the prior BOM and newline style (streamed census)."""
     if ('text' in request) == ('data' in request):
         raise AgentError('INVALID_CONTENT', 'Provide exactly one of UTF-8 text or base64 data')
     if 'text' in request:
         if not isinstance(request['text'], str):
             raise AgentError('INVALID_CONTENT', 'text must be a string')
-        try:
-            old.decode('utf-8-sig')
-        except UnicodeDecodeError:
-            raise AgentError('UNSUPPORTED_ENCODING', 'Use base64 to replace a binary file')
-        text = preserve_newlines(request['text'], old)
-        return (BOM if old.startswith(BOM) and not text.startswith('\ufeff') else b'') + text.encode('utf8')
+        text = preserve_newlines_census(request['text'], census) if census else request['text']
+        return (BOM if has_bom and not text.startswith('\ufeff') else b'') + text.encode('utf8')
     try:
         return base64.b64decode(request['data'], validate=True)
     except (ValueError, TypeError):
@@ -367,21 +465,25 @@ def compose_content(request, old):
 
 
 # --- Commit ---------------------------------------------------------------------
-# Materializes and atomically publishes new content. Today one buffered write;
-# #10 swaps it for streamed splicing into the same flow.
+# Materializes and atomically publishes new content. Since issue #10 the
+# content reaches the temp file through a producer callback that streams it
+# (whole-buffer writes and spliced rewrites share one flow) and publication
+# flushes the directory entry, closing the #6 durability gap.
 
-def write_temporary(path, data, info):
+def write_temporary(path, info, produce):
     """Materialize content at a pre-registered same-directory temp path.
 
     The caller registers the exact path in the resource ledger before calling
-    (issue #8), so a crash can never leave an untracked temp file behind. This
-    creates the file exclusively, preserves group and mode, fsyncs, and
-    reports the written identity; publication stays with commit.
+    (issue #8), so a crash can never leave an untracked temp file behind, and
+    hands a producer that streams the bytes into the sink (issue #10), so no
+    whole-file buffer is needed on either path. This creates the file
+    exclusively, preserves group and mode, fsyncs, and reports the written
+    identity; publication stays with commit.
     """
     descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, 'wb') as stream:
-            stream.write(data)
+            produce(stream)
             if info is not None:
                 os.fchown(stream.fileno(), -1, info.st_gid)
                 os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
@@ -395,11 +497,29 @@ def write_temporary(path, data, info):
     return written_info
 
 
-def verify_committed_image(observed, observed_info, updated, written_info):
-    """Confirm our exact post-image, not arbitrary bytes seen after an
-    external replacement. ctime may legitimately change on rename."""
+def sync_directory(directory):
+    """Flush a directory entry change to disk (spec 4.3, the #6 gap).
+
+    fsync on the file only persists its bytes. The rename/link that publishes
+    it changes the parent directory, and without an explicit directory fsync
+    a crash could lose the publication (or resurrect the replaced target);
+    after this call the committed name is durable.
+    """
+    descriptor = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def verify_committed_image(observed_info, written_info):
+    """Confirm our exact post-image identity, not arbitrary bytes seen after
+    an external replacement. ctime may legitimately change on rename; the
+    streamed paths verify identity plus size instead of comparing whole
+    contents (issue #10), which still detects any external replacement
+    because it necessarily changes the object identity or size."""
     fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_mode', 'st_nlink', 'st_uid', 'st_gid')
-    if observed != updated or any(getattr(observed_info, field) != getattr(written_info, field) for field in fields):
+    if any(getattr(observed_info, field) != getattr(written_info, field) for field in fields):
         raise AgentError('FILE_CONFLICT', 'File changed after the edit was committed')
 
 
@@ -621,18 +741,25 @@ class FileService:
 
     def edit(self, request):
         path = self.path(request.get('path'), writing=True)
+        pairs = validate_edits(request.get('edits'))
         with self.lock(path):
-            data, info, version = snapshot(path)
-            token = self.token(request.get('readToken'), path, version)
-            replaceable(info)
-            text = decode_edit_text(data)
-            replacements, byte_edits = locate_replacements(text, data, request.get('edits'), token['ranges'])
-            updated = apply_replacements(data, text, replacements)
-            written_info = self.commit(path, updated, info, version, origin='file-edit')
-            result = {'path': str(path), 'written': True, 'bytesWritten': len(updated), 'editsApplied': len(replacements)}
-            return self.renew_after_edit(path, token, byte_edits, updated, written_info, result)
+            with path.open('rb') as stream:
+                info = os.fstat(stream.fileno())
+                require_regular_file(info)
+                if not same_object(info, path):
+                    raise AgentError('FILE_CONFLICT', 'File identity changed while observing')
+                version = content_version(info)
+                token = self.token(request.get('readToken'), path, version)
+                replaceable(info)
+                replacements, byte_edits = locate_replacements(stream, pairs, token['ranges'])
+                if metadata(os.fstat(stream.fileno())) != metadata(info) or not same_object(info, path):
+                    raise AgentError('FILE_CONFLICT', 'File changed while locating replacements')
+            output_size = info.st_size + sum(len(new_bytes) - (end - start) for start, end, new_bytes in replacements)
+            written_info = self.commit_spliced(path, replacements, info, version, output_size, origin='file-edit')
+            result = {'path': str(path), 'written': True, 'bytesWritten': output_size, 'editsApplied': len(replacements)}
+            return self.renew_after_edit(path, token, byte_edits, output_size, written_info, result)
 
-    def renew_after_edit(self, path, token, byte_edits, updated, written_info, result):
+    def renew_after_edit(self, path, token, byte_edits, output_size, written_info, result):
         """Verify the committed image and renew the read credential.
 
         The write already happened: verification failures never turn the
@@ -640,31 +767,35 @@ class FileService:
         and require a fresh read.
         """
         try:
-            observed, observed_info, new_version = snapshot(path)
-            verify_committed_image(observed, observed_info, updated, written_info)
+            with path.open('rb') as stream:
+                observed_info = os.fstat(stream.fileno())
+                if not same_object(observed_info, path):
+                    raise AgentError('FILE_CONFLICT', 'File identity changed after the edit')
+                new_version = content_version(observed_info)
+            verify_committed_image(observed_info, written_info)
             ranges = remap_read_ranges(token['ranges'], byte_edits)
-            result.update(self.save_read(path, new_version, len(updated), ranges))
+            result.update(self.save_read(path, new_version, output_size, ranges))
             result['rereadRequired'] = False
         except (OSError, AgentError) as error:
             result.update(readToken=None, rereadRequired=True, readTokenError=getattr(error, 'code', 'READ_RECORD_UNAVAILABLE'),
                           message='Edit committed, but read-token renewal could not be confirmed. Read the current file before further editing.')
         return result
 
-    def commit(self, path, data, info=None, version=None, origin='file'):
-        """Atomically install data at path through a same-directory temp file.
+    def publish(self, path, info, version, origin, produce, output_size):
+        """Atomically install produced content at path through a same-directory
+        temp file (streamed since issue #10; no output size gate anymore).
 
-        Owns the output size gate, the workspace quota gate, the pre-replace
-        version re-check and replace-versus-link publication. The temp file is
-        registered in the resource ledger (and quota-checked) before it can
-        exist; a successful publication releases the registration so the
-        committed target leaves the space measurement (issue #8).
+        Owns the workspace quota gate, the in-lock pre-replace version
+        re-check, replace-versus-link publication and the directory fsync that
+        makes the published name durable. The temp file is registered in the
+        resource ledger (and quota-checked) before it can exist; a successful
+        publication releases the registration so the committed target leaves
+        the space measurement (issue #8).
         """
-        if len(data) > MAX_FILE_BYTES:
-            raise AgentError('FILE_TOO_LARGE', 'Content exceeds 16 MiB')
         temporary = path.parent / ('.ssh-mcp-' + uuid.uuid4().hex)
-        resource_id = ledger.register_temp(self.root, str(temporary), len(data), self.session, origin)
+        resource_id = ledger.register_temp(self.root, str(temporary), output_size, self.session, origin)
         try:
-            written_info = write_temporary(temporary, data, info)
+            written_info = write_temporary(temporary, info, produce)
             ledger.attach_identity(self.root, resource_id, '{}:{}'.format(written_info.st_dev, written_info.st_ino))
             self.path(str(path), writing=True)
             if version is not None:
@@ -676,6 +807,8 @@ class FileService:
                     os.link(str(temporary), str(path))
                 except FileExistsError:
                     raise AgentError('FILE_CONFLICT', 'Creation target already exists')
+            sync_directory(path.parent)
+            return written_info
         except OSError as error:
             if error.errno == errno.ENOSPC:
                 raise AgentError('STORAGE_FULL', 'Remote filesystem reported ENOSPC while committing the write')
@@ -684,7 +817,18 @@ class FileService:
             if os.path.exists(str(temporary)):
                 os.unlink(str(temporary))
             ledger.release(self.root, resource_id)
-        return written_info
+
+    def commit(self, path, data, info=None, version=None, origin='file'):
+        """Publish buffered content (whole-file writes)."""
+        return self.publish(path, info, version, origin, lambda sink: sink.write(data), len(data))
+
+    def commit_spliced(self, path, replacements, info, version, output_size, origin='file-edit'):
+        """Publish a spliced rewrite: re-reads the current source in bounded
+        chunks and never buffers or transfers the whole file (spec 4.3)."""
+        def produce(sink):
+            with path.open('rb') as source:
+                splice_stream(source, replacements, sink)
+        return self.publish(path, info, version, origin, produce, output_size)
 
     def full_read(self, request, path, version, size, field='readToken'):
         token = self.token(request.get(field), path, version)
@@ -693,21 +837,67 @@ class FileService:
 
     def write(self, request):
         path = self.path(request.get('path'), writing=True)
+        if 'readToken' in request:
+            raise AgentError('INVALID_REQUEST',
+                             'Whole-file writes no longer take readToken; observe the target with a metadataOnly read '
+                             'and pass overwrite=true with that expectedVersion to replace it')
+        creating = request.get('create', False)
+        overwriting = request.get('overwrite', False)
+        if not isinstance(creating, bool) or not isinstance(overwriting, bool):
+            raise AgentError('INVALID_REQUEST', 'create and overwrite must be boolean')
+        if creating and overwriting:
+            raise AgentError('INVALID_REQUEST', 'Choose create (target must be absent) or overwrite (bound to its observed version), not both')
+        expected = request.get('expectedVersion')
+        if overwriting and not isinstance(expected, str):
+            raise AgentError('INVALID_REQUEST', 'overwrite requires the expectedVersion observed through a metadataOnly read')
+        if not overwriting and expected is not None:
+            raise AgentError('INVALID_REQUEST', 'expectedVersion only pairs with overwrite=true')
         with self.lock(path):
-            creating = request.get('create', False)
-            if not isinstance(creating, bool):
-                raise AgentError('INVALID_REQUEST', 'create must be boolean')
-            info, version, old = None, None, b''
-            if creating:
-                if path.exists():
-                    raise AgentError('FILE_CONFLICT', 'Creation target already exists')
-            else:
-                old, info, version = snapshot(path)
-                self.full_read(request, path, version, len(old))
-                replaceable(info)
-            data = compose_content(request, old)
+            info = None
+            version = None
+            has_bom = False
+            census = None
+            if overwriting:
+                # Explicit whole-file replacement (ADR 0008): the observed
+                # metadata version is the guard; no prior read of the old
+                # content is required or sufficient.
+                try:
+                    stream = path.open('rb')
+                except FileNotFoundError:
+                    raise AgentError('FILE_CONFLICT', 'Overwrite target does not exist; keep overwrite bound to an existing observed version or create instead')
+                with stream:
+                    info = os.fstat(stream.fileno())
+                    require_regular_file(info)
+                    if not same_object(info, path):
+                        raise AgentError('FILE_CONFLICT', 'File identity changed while observing')
+                    version = content_version(info)
+                    replaceable(info)
+                    if version != expected:
+                        raise AgentError('FILE_CONFLICT', 'File changed since the observed version; read the metadata again and re-issue the overwrite')
+                    if 'text' in request:
+                        # Text replacement keeps refusing binary targets and
+                        # keeps BOM/CRLF style: one streamed pass collects both.
+                        census = NewlineCensus()
+                        validate_chunk = utf8_stream_validator()
+                        stream.seek(0)
+                        head = stream.read(len(BOM))
+                        has_bom = head == BOM
+                        if head:
+                            validate_chunk(census.feed(head))
+                        while True:
+                            block = stream.read(MAX_STREAM_CHUNK)
+                            if not block:
+                                break
+                            validate_chunk(census.feed(block))
+                        validate_chunk(b'', True)
+            elif path.exists():
+                raise AgentError('FILE_CONFLICT',
+                                 'Target already exists; whole-file writes default to create-only. To replace it, '
+                                 'observe the version with a metadataOnly read and re-issue with overwrite=true and that expectedVersion')
+            data = compose_content(request, has_bom, census)
             self.commit(path, data, info, version, origin='file-write')
-            return {'path': str(path), 'written': True, 'created': creating, 'bytesWritten': len(data)}
+            return {'path': str(path), 'written': True, 'created': creating, 'overwritten': overwriting,
+                    'bytesWritten': len(data)}
 
     def delete(self, request):
         path = self.path(request.get('path'), writing=True)
@@ -766,8 +956,7 @@ class FileService:
                                   [self.workspace / 'AGENTS.md', self.workspace / 'CLAUDE.md'] if path.is_file()],
                     'instructions': 'Read applicable root and nested AGENTS.md/CLAUDE.md with file_read before editing.',
                     'capabilities': {'interactiveInput': False, 'pty': False, 'reattachTerminal': False,
-                                     'persistentTasks': True, 'streamedRead': True,
-                                     'maxCommitBytes': MAX_FILE_BYTES,
+                                     'persistentTasks': True, 'streamedRead': True, 'streamedWrite': True,
                                      'readTokenTtlDays': READ_TOKEN_TTL_SECONDS // 86400,
                                      'searchEngine': 'python-literal', 'gitignoreSearch': False, 'rgPath': shutil.which('rg')}}
         if action in ('file_list', 'file_find', 'file_search'):

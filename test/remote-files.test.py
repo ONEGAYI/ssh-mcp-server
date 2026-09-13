@@ -188,7 +188,7 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(result['error']['code'], 'FILE_CONFLICT')
         self.assertEqual(path.read_text(), 'external')
         (self.work / 'link').symlink_to(path)
-        result = self.call('file_write', {'path': 'link', 'text': 'lost', 'readToken': token})
+        result = self.call('file_write', {'path': 'link', 'text': 'lost'})
         self.assertEqual(result['error']['code'], 'UNSUPPORTED_LINK')
         outside = self.call('file_read', {'path': '../outside'})
         self.assertEqual(outside['error']['code'], 'PATH_NOT_ALLOWED')
@@ -817,8 +817,8 @@ class RemoteFilesTest(unittest.TestCase):
             self.assertEqual(content[:start], filler[:start])
             self.assertTrue(content[start:].startswith(b'PATCHED-OK'))
             self.assertEqual(edited['result']['bytesWritten'], 2 * boundary - len(tag) + len('PATCHED-OK'))
-        # Zero matches still demand a reread, ambiguity still demands a wider
-        # oldText, and a match outside the delivered range stays protected.
+        # Zero matches still demand a reread and ambiguity still demands a
+        # wider oldText.
         path = self.work / 'counts.txt'
         path.write_bytes(b'prefix needle suffix\n' * 3 + b'padding')
         partial = self.call('file_read', {'path': 'counts.txt', 'fromLine': 1, 'toLine': 1})['result']
@@ -830,12 +830,17 @@ class RemoteFilesTest(unittest.TestCase):
                                        'edits': [{'oldText': 'needle', 'newText': 'x'}]})
         self.assertEqual(many['error']['code'], 'EDIT_MATCH_ERROR')
         self.assertIn('widen', many['error']['message'])
-        unread = self.call('file_read', {'path': 'counts.txt', 'fromLine': 1, 'toLine': 1},
-                           session='session-two')['result']
-        blocked = self.call('file_edit', {'path': 'counts.txt', 'readToken': unread['readToken'],
-                                          'edits': [{'oldText': 'suffix', 'newText': 'x'}]}, session='session-two')
-        self.assertEqual(blocked['error']['code'], 'READ_REQUIRED')
         self.assertEqual(path.read_bytes(), b'prefix needle suffix\n' * 3 + b'padding')
+        # A unique match outside the delivered range stays protected even
+        # though it is the only occurrence in the file.
+        unique = self.work / 'unique.txt'
+        unique.write_bytes(b'first line marker-A\nsecond line marker-B\nthird line marker-C\n')
+        first_line = self.call('file_read', {'path': 'unique.txt', 'fromLine': 1, 'toLine': 1})['result']
+        blocked = self.call('file_edit', {'path': 'unique.txt', 'readToken': first_line['readToken'],
+                                          'edits': [{'oldText': 'marker-B', 'newText': 'x'}]})
+        self.assertEqual(blocked['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(unique.read_bytes(),
+                         b'first line marker-A\nsecond line marker-B\nthird line marker-C\n')
 
     def test_large_edit_splices_streaming_and_keeps_memory_bounded(self):
         size = 20 * 1024 * 1024
@@ -866,10 +871,12 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(head, line_of(1).encode('ascii'))
         self.assertEqual(patched, new_line.encode('ascii'))
         self.assertEqual(after, line_of(target + 1).encode('ascii'))
-        # The known range was remapped: the very next line stays editable
-        # without a reread, and a couple more streamed edits keep memory flat.
+        # The known range was remapped onto the replacement: editing the
+        # patched line again needs no reread, and a couple more streamed
+        # edits keep memory flat. (The following line was never read, so the
+        # remapped credential must still refuse it -- checked below.)
         followup = service.edit({'path': 'splice.txt', 'readToken': edited['readToken'],
-                                 'edits': [{'oldText': line_of(target + 1).rstrip('\n'), 'newText': 'next'}]})
+                                 'edits': [{'oldText': new_line.rstrip('\n'), 'newText': 'next'}]})
         peak = max(peak, self.vm_rss_kb())
         service.edit({'path': 'splice.txt', 'readToken': followup['readToken'],
                       'edits': [{'oldText': 'next', 'newText': 'n'}]})

@@ -49,7 +49,7 @@ export class FileService {
     throw new RemoteAgentError("PATH_NOT_ALLOWED", "Local transfer path is outside the workspace and configured allowed roots");
   }
 
-  async upload(sessionId: string, request: { localPath: string; path: string; create?: boolean; readToken?: string }) {
+  async upload(sessionId: string, request: { localPath: string; path: string; create?: boolean; overwrite?: boolean; expectedVersion?: string }) {
     const path = await this.localPath(request.localPath, false);
     const handle = await open(path, "r");
     try {
@@ -66,7 +66,10 @@ export class FileService {
       if (size !== before.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.size !== after.size) {
         throw new RemoteAgentError("FILE_CONFLICT", "Local upload source changed while reading");
       }
-      return this.call("file_write", sessionId, { path: request.path, create: request.create, readToken: request.readToken, data: data.subarray(0, size).toString("base64") });
+      // Issue #10: replacing an existing remote target is explicit and bound to
+      // the metadataOnly-observed version; the readToken path is gone.
+      return this.call("file_write", sessionId, { path: request.path, create: request.create,
+        overwrite: request.overwrite, expectedVersion: request.expectedVersion, data: data.subarray(0, size).toString("base64") });
     } finally { await handle.close(); }
   }
 

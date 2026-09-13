@@ -41,11 +41,13 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));
     assert.equal(await readFile(downloaded, 'utf8'), 'hello\nworld\n');
     const hiddenRead = await call('remote_write', { path, text: 'lost', readToken: partial.data.readToken });
-    assert.equal(hiddenRead.data.code, 'INVALID_REQUEST');
+    // The write schema strips the legacy readToken; the create-only default
+    // then refuses the existing target with guidance toward the overwrite path.
+    assert.equal(hiddenRead.data.code, 'FILE_CONFLICT');
     const binary = Buffer.from([0, 255, 1, 128]);
     await writeFile(localPath, binary);
-    const blocked = await call('remote_upload', { path, localPath });
-    assert.equal(blocked.data.code, 'READ_REQUIRED');
+    // Edit chain: full read, first edit, then a follow-up edit with the
+    // renewed token and no reread.
     const full = await call('remote_read', { path });
     const edited = await call('remote_edit', { path, readToken: full.data.readToken,
       edits: [{ oldText: 'hello', newText: 'hello 中文' }] });
@@ -57,7 +59,13 @@ it('real workspace MCP protects uploads and transfers binary data without granti
       edits: [{ oldText: 'hello 中文', newText: 'second edit without read' }] });
     assert.equal(repeated.error, undefined, JSON.stringify(repeated));
     assert.equal(repeated.data.rereadRequired, false);
-    const upload = await call('remote_upload', { path, localPath, readToken: repeated.data.readToken });
+    // Uploading over an existing target without an explicit overwrite is
+    // refused by the create-only default (issue #10 / ADR 0008).
+    const blocked = await call('remote_upload', { path, localPath });
+    assert.equal(blocked.data.code, 'FILE_CONFLICT');
+    const uploadMeta = await call('remote_read', { path, metadataOnly: true });
+    const upload = await call('remote_upload', { path, localPath,
+      overwrite: true, expectedVersion: uploadMeta.data.version });
     assert.equal(upload.error, undefined, JSON.stringify(upload));
     const binaryRead = await call('remote_read', { path, encoding: 'base64' });
     assert.deepEqual(Buffer.from(binaryRead.data.data, 'base64'), binary);
@@ -100,6 +108,7 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
       const state = await runtime.remote.call('status', { jobId: registration.jobId });
       if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
         assert.equal(state.state, 'exited', JSON.stringify(state));
+        assert.equal(state.exitCode, 0, JSON.stringify(state));
         return state;
       }
       if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
@@ -111,8 +120,8 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
     // Generate the 200 MiB fixture on the remote side itself: fixed 64-byte
     // lines ('L<n> ' head + x padding + newline), matching lineOf exactly.
-    await runTask(`python3 -c "f = open('${remoteName}', 'wb');\\n` +
-      `[f.write(('L%d ' % i).encode('ascii') + b'x' * (64 - len('L%d ' % i) - 1) + b'\\n') for i in range(1, ${lineCount + 1})];\\n` +
+    await runTask(`python3 -c "f = open('${remoteName}', 'wb'); ` +
+      `[f.write(('L%d ' % i).encode('ascii') + b'x' * (64 - len('L%d ' % i) - 1) + b'\\n') for i in range(1, ${lineCount + 1})]; ` +
       `f.close()"`);
     const meta = await call('remote_read', { path: remoteName, metadataOnly: true });
     assert.equal(meta.data.size, 200 * 1024 * 1024, JSON.stringify(meta));
