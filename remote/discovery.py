@@ -421,7 +421,13 @@ def external_scan(binary, needle_text, feeder, sink, units, current, budget):
     output line so a giant match line cannot grow memory without bound. The
     process exits 0/1 normally; higher codes or signals raise BackendFailure.
     """
-    argv = [binary, '-F', '-a', '-n', '--color=never', '--', needle_text, '-']
+    # bytes argv: a C-locale remote (no LANG/LC_* from sshd) runs Python 3.6
+    # with an ascii filesystem encoding, and str argv would raise
+    # UnicodeEncodeError in Popen for any non-ASCII pattern. The explicit
+    # utf8 + surrogateescape round-trips both JSON-sourced text and
+    # surrogate-escaped filesystem paths without consulting the locale.
+    argv = [binary.encode('utf8', 'surrogateescape'), b'-F', b'-a', b'-n', b'--color=never', b'--',
+            needle_text.encode('utf8'), b'-']
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, close_fds=True)
     selector = selectors.DefaultSelector()
@@ -878,7 +884,10 @@ def rg_list(binary, root, budget):
     Path objects. Raises BackendFailure on abnormal exits; BudgetStop and the
     candidate-cap error propagate to the caller.
     """
-    argv = [binary, '--files', '--hidden', '--no-ignore', '--no-messages', '-0', '--', str(root)]
+    # bytes argv for the same C-locale reason as external_scan: the root may
+    # carry non-ASCII text (Chinese workspace paths) or surrogate escapes.
+    argv = [binary.encode('utf8', 'surrogateescape'), b'--files', b'--hidden', b'--no-ignore',
+            b'--no-messages', b'-0', b'--', str(root).encode('utf8', 'surrogateescape')]
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, close_fds=True)
     chunks = []

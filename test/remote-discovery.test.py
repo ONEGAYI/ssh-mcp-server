@@ -220,6 +220,26 @@ class RemoteDiscoveryTest(unittest.TestCase):
         baseline = self.call('file_search', {'path': 'large.log', 'pattern': NEEDLE}, backends='none')['result']
         self.assertEqual(result['matches'], baseline['matches'])
 
+    def test_non_ascii_pattern_survives_c_locale_argv_encoding(self):
+        # 远端 sshd 不传 LANG/LC_* 时 Python 3.6 的 filesystem encoding 是
+        # ascii（PEP 538 locale 强制是 3.7+）：str argv 经 Popen 编码抛
+        # UnicodeEncodeError，中文 pattern 让 file_search 整体崩成
+        # HELPER_ERROR。argv 改为 bytes 后不再依赖 locale。PYTHONUTF8=0
+        # 同时禁掉 PEP 540，让本地新 Python 同样退化到 ascii 复现 3.6 行为。
+        # 路径保持 ASCII：非 ASCII 路径在 C locale 下会先在 resolve 阶段
+        # 失败（files.py 的既有行为，超出本缺陷范围）。
+        env = dict(os.environ)
+        env['PATH'] = str(self.bin_rg_and_grep)
+        env['LC_ALL'] = 'C'
+        env['PYTHONCOERCECLOCALE'] = '0'
+        env['PYTHONUTF8'] = '0'
+        # 大文件把 file_search 推上 external rg 后端（>= EXTERNAL_THRESHOLD_BYTES）。
+        self.big_file('large.log', 2 * 1024 * 1024, {5})
+        search = self.call_env('file_search', {'path': 'large.log', 'pattern': NEEDLE}, env)
+        self.assertTrue(search['ok'], search)
+        self.assertEqual(self.hits(search['result']), [('large.log', 5)])
+        self.assertEqual(search['result']['engine'], 'ripgrep')
+
     # --- pagination and cursors ------------------------------------------------
 
     def test_pagination_returns_all_hits_in_order_without_rescanning_finished_files(self):
