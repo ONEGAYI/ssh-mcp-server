@@ -201,7 +201,9 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(search['matches'][0]['line'], 1)
         self.assertTrue(search['truncated'])
         self.assertNotIn('readToken', search)
-        self.assertEqual(search['engine'], 'python-literal')
+        # The engine is the fastest available backend (issue #11): python-literal
+        # remains the floor, but ripgrep/grep win when present on the host.
+        self.assertIn(search['engine'], ('ripgrep', 'gnu-grep', 'python-literal'))
         self.assertFalse(self.call('file_rmdir', {'path': 'nested'})['ok'])
 
     def test_overlapping_matches_rejected_and_serialized_read_is_bounded(self):
