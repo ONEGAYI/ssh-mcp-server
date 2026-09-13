@@ -318,6 +318,95 @@ it('the CLI maintain entry runs a real both-ends round and the persisted timesta
   assert.ok(state.lastCompletedAt > 0);
   // Within the interval the next trigger is throttled away.
   const second = invoke('maintain');
-  assert.equal(second.status, 0, second.stdout + second.stderr);
+  assert.equal(second.status, 0, second.stdout + '\n' + second.stderr);
   assert.equal(JSON.parse(second.stdout).skipped, 'interval');
+});
+
+// --- issue #17: credential, helper and leftover-temp reclamation on a real workspace
+
+/** Run one registered shell command to its terminal state (fixture changes). */
+async function runFixtureTask(runtime, command, cwd) {
+  const registration = await runtime.remote.call('task_register', { protocol: 2, cwd, command });
+  await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+  const state = await waitTerminal16(runtime, registration.jobId);
+  assert.equal(state.exitCode, 0, JSON.stringify(state));
+  return state;
+}
+
+it('maintenance reclaims expired read credentials, stale helper images and verified crash leftovers (#17)', { skip: !profile, timeout: 180000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const config = await loadWorkspaceConfig(profile);
+  const session = 'test17-' + randomUUID();
+  const runtime = await createWorkspaceRuntime(profile);
+  const fileName = 'credential17-' + session + '.txt';
+  const fileBody = 'alpha fragment text\n' + 'padding '.repeat(30) + '\ntail secret line\n';
+  const helpers = `${config.remoteStateDir}/helpers`;
+  const fakeDigest = 'f'.repeat(64);
+  const leftover = `${config.remoteRoot}/.ssh-mcp-t17-${session}`;
+  const runFixture = command => runFixtureTask(runtime, command, config.remoteRoot);
+  try {
+    // A small target file and a read credential covering all of it.
+    const created = await runtime.remote.call('file_write', { path: fileName, text: fileBody,
+      create: true, workspaceRoot: config.remoteRoot, sessionId: session });
+    assert.equal(created.written, true, JSON.stringify(created));
+    const read = await runtime.remote.call('file_read', { path: fileName, offset: 0, maxBytes: 4096,
+      workspaceRoot: config.remoteRoot, sessionId: session });
+    const token = read.readToken;
+    assert.ok(token, JSON.stringify(read));
+    // The MCP transport cannot inject the test clock, so the fixture ages the
+    // credential out the same way the accelerated clock would: expiresAt to 0.
+    const expire = Buffer.from([
+      'import json, pathlib',
+      `p = pathlib.Path(${JSON.stringify(`${config.remoteStateDir}/reads/${token}.json`)})`,
+      'd = json.loads(p.read_text())',
+      "d['expiresAt'] = 0",
+      'p.write_text(json.dumps(d))',
+    ].join('\n')).toString('base64');
+    await runFixture(`echo ${expire} | base64 -d | python3 -`);
+    // A stale helper image nobody references (a copy of the live one under a
+    // fake content digest) and a crash-leftover temp: registered through the
+    // public ledger action (its holder -- that helper process -- is gone the
+    // moment the call returns), file materialized and identity attached by
+    // the same fixture task.
+    const registered = await runtime.remote.call('resource_register',
+      { path: leftover, bytes: 15, origin: 'file-edit' });
+    const plant = Buffer.from([
+      'import json, os, pathlib',
+      `pathlib.Path(${JSON.stringify(leftover)}).write_bytes(b'crash leftover')`,
+      `l = pathlib.Path(${JSON.stringify(`${config.remoteStateDir}/ledger/ledger.json`)})`,
+      'd = json.loads(l.read_text())',
+      `r = d['resources'][${JSON.stringify(registered.resourceId)}]`,
+      `s = os.stat(${JSON.stringify(leftover)})`,
+      "r['identity'] = '%d:%d' % (s.st_dev, s.st_ino)",
+      'l.write_text(json.dumps(d))',
+    ].join('\n')).toString('base64');
+    const helperSeed = `d=$(ls ${helpers} | grep -E '^[0-9a-f]{64}$' | head -1) && cp -r ${helpers}/$d ${helpers}/${fakeDigest}`;
+    await runFixture(`echo ${plant} | base64 -d | python3 -; ${helperSeed}`);
+    // One maintenance round reclaims all three classes at once.
+    const round = await runtime.remote.call('maintenance', {});
+    assert.ok(round.removedReadTokens.includes(token), JSON.stringify(round));
+    assert.ok(round.reclaimedResources.includes(registered.resourceId), JSON.stringify(round));
+    assert.deepEqual(round.removedHelpers, [fakeDigest], JSON.stringify(round));
+    assert.equal((await runFixture(`test ! -e ${leftover} && echo gone`)).exitCode, 0);
+    // The reclaimed credential no longer authorizes edits; one fresh read of
+    // the needed fragment restores editing for exactly that window.
+    await assert.rejects(() => runtime.remote.call('file_edit', { path: fileName, readToken: token,
+      workspaceRoot: config.remoteRoot, sessionId: session,
+      edits: [{ oldText: 'alpha', newText: 'beta' }] }),
+      error => { assert.equal(error.code, 'READ_REQUIRED'); return true; });
+    const fresh = await runtime.remote.call('file_read', { path: fileName, offset: 0, maxBytes: 16,
+      workspaceRoot: config.remoteRoot, sessionId: session });
+    const edited = await runtime.remote.call('file_edit', { path: fileName, readToken: fresh.readToken,
+      workspaceRoot: config.remoteRoot, sessionId: session,
+      edits: [{ oldText: 'alpha', newText: 'beta' }] });
+    assert.equal(edited.written, true, JSON.stringify(edited));
+    await assert.rejects(() => runtime.remote.call('file_edit', { path: fileName, readToken: edited.readToken,
+      workspaceRoot: config.remoteRoot, sessionId: session,
+      edits: [{ oldText: 'tail secret line', newText: 'x' }] }),
+      error => { assert.equal(error.code, 'READ_REQUIRED'); return true; });
+  } finally {
+    await runFixture(`rm -f ${config.remoteRoot}/${fileName} ${leftover}; rm -rf ${helpers}/${fakeDigest}`)
+      .catch(() => undefined);
+    runtime.close();
+  }
 });
