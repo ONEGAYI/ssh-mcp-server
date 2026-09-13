@@ -162,8 +162,9 @@ export class MaintenanceService {
         // The file was exclusively created by this attempt: a failed content
         // write (ENOSPC/EIO) must remove it again. Leaving a zero-byte lock
         // behind would parse as no holder on every later read and look busy
-        // forever (review R8).
-        await handle.close();
+        // forever (review R8). close() must not shadow the unlink: a handle
+        // that fails to close still leaves the path removable (review N3).
+        await handle.close().catch(() => undefined);
         await unlink(this.lockPath).catch(() => undefined);
         throw error;
       }

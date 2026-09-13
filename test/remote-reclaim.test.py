@@ -564,6 +564,49 @@ class RemoteReclaimTest(unittest.TestCase):
         # Nothing outside reads/ was touched through the forged key.
         self.assertFalse((self.root / 'evil.json').exists())
 
+    def test_malformed_timestamp_fields_skip_entries_without_aborting_the_round(self):
+        # Review round 2 N1: timestamps read via record.get(...) feed numeric
+        # comparisons; a syntactically valid JSON object whose timestamp is a
+        # string raises TypeError, which escapes every (OSError, ValueError,
+        # AgentError) guard and kills the whole round with the cursor stuck.
+        # Type-invalid means undecidable, and undecidable entries are skipped
+        # and KEPT -- corruption must never trigger a destructive branch.
+        now = time.time()
+        # reads: an expired-shape credential whose expiresAt is a string.
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        token = 'd' * 32
+        (reads / (token + '.json')).write_text(json.dumps(
+            {'session': 'session-one', 'path': str(self.work / 'x'), 'version': 1,
+             'ranges': [[0, 1]], 'size': 1, 'lastSuccessAt': now,
+             'expiresAt': '2026-01-01T00:00:00Z'}))
+        # jobs: a stuck-starting task whose unknown.json marker carries a
+        # string firstObservedAt.
+        job_id = 'stuck-malformed'
+        self._plant_stuck_starting_task(job_id)
+        self.call('status', {'jobId': job_id})
+        marker = self.job_dir(job_id) / 'unknown.json'
+        marker.write_text(json.dumps({'schemaVersion': 1, 'firstObservedAt': 'soon'}))
+        # jobs: an acknowledged task whose ack.json carries a string timestamp.
+        acked, _ = self.run_task("printf 'log'")
+        self.assertTrue(self.call('ack', {'jobId': acked})['ok'])
+        (self.job_dir(acked) / 'ack.json').write_text(
+            json.dumps({'jobId': acked, 'acknowledgedAt': 'yesterday'}))
+        result = self.maintenance(clock=now + 40 * DAY)
+        self.assertTrue(result['ok'], result)  # the round must survive all three
+        summary = result['result']
+        self.assertNotIn(token, summary['removedReadTokens'], summary)
+        self.assertTrue((reads / (token + '.json')).is_file())
+        self.assertNotIn(job_id, summary['removedJobs'], summary)
+        self.assertTrue(self.job_dir(job_id).exists())
+        self.assertEqual(summary['purgedLogs'], [], summary)
+        self.assertTrue((self.job_dir(acked) / 'stdout').exists())
+        # The next healthy entry still gets processed (the round continued).
+        healthy, _ = self.run_task('printf healthy')
+        self.assertTrue(self.call('ack', {'jobId': healthy})['ok'])
+        again = self.maintenance(clock=now + 80 * DAY)['result']
+        self.assertEqual(again['removedJobs'], [healthy], again)
+
     # --- issue #17: stale helper images ----------------------------------------
 
     def test_stale_helper_images_are_reclaimed_but_live_references_and_the_current_image_survive(self):

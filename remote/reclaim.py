@@ -246,9 +246,12 @@ def _process_job(root, name, periods, now, summary):
             summary['markedUnknown'].append(name)
             return
         try:
-            first_observed = read_json(marker).get('firstObservedAt', 0)
+            marker = read_json(path / 'unknown.json')
         except (OSError, ValueError):
             return
+        if not isinstance(marker, dict) or not _numeric(marker.get('firstObservedAt')):
+            return
+        first_observed = marker['firstObservedAt']
         if now - first_observed >= periods['unknownRecordMs'] and _record_deletion_allowed(root, path):
             # Legacy (v1) records wait for protocol activation like terminal
             # ones (issue #20): removing one earlier would let its replayed
@@ -257,13 +260,24 @@ def _process_job(root, name, periods, now, summary):
             summary['removedJobs'].append(name)
 
 
+def _numeric(value):
+    """Timestamp guards: type-invalid means undecidable, and an undecidable
+    entry must be skipped and kept -- corruption never triggers deletion."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _process_terminal_job(root, path, state, periods, now, summary):
     ack = path / 'ack.json'
     name = path.name
     if ack.is_file():
         try:
-            acknowledged = read_json(ack).get('acknowledgedAt', 0)
+            record = read_json(ack)
         except (OSError, ValueError):
+            return
+        if not isinstance(record, dict):
+            return
+        acknowledged = record.get('acknowledgedAt', 0)
+        if not _numeric(acknowledged):
             return
         if now - acknowledged >= periods['confirmedTaskLogMs'] and not (path / 'purged.json').exists():
             _purge_job_logs(path, now)
@@ -273,7 +287,7 @@ def _process_terminal_job(root, path, state, periods, now, summary):
             summary['removedJobs'].append(name)
         return
     completed = state.get('completedAt')
-    if isinstance(completed, (int, float)) and not isinstance(completed, bool):
+    if _numeric(completed):
         if now - completed >= periods['unconfirmedResultMs'] and _record_deletion_allowed(root, path):
             _remove_tree(path)
             summary['removedJobs'].append(name)
@@ -405,7 +419,8 @@ def _process_read_entry(root, name, now, summary):
                 return
             if not isinstance(record, dict):
                 return
-            if now <= record.get('expiresAt', 0):
+            expires = record.get('expiresAt')
+            if _numeric(expires) and now <= expires:
                 return  # live credential: its index stays
         try:
             path.unlink()
@@ -421,7 +436,8 @@ def _process_read_entry(root, name, now, summary):
         # Valid JSON but not an object is corrupt (jobs/transfers rule):
         # skipped, never fatal for the round.
         return
-    if now > record.get('expiresAt', 0):
+    expires = record.get('expiresAt')
+    if _numeric(expires) and now > expires:
         try:
             path.unlink()
         except FileNotFoundError:

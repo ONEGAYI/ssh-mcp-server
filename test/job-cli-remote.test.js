@@ -251,7 +251,7 @@ it('expiry reclamation purges logs then records and refuses replayed old request
     for (let attempt = 0; attempt < 3; attempt++) {
       recordRounds.push(await runtime.remote.call('maintenance', {
         retentionMs: { confirmedTaskLogMs: 0, confirmedResultMs: 0 } }));
-      if (recordRounds.some(round => Array.isArray(round.removedJobs) && round.removedJobs.length > 0)) break;
+      if (recordRounds.some(round => Array.isArray(round.removedJobs) && round.removedJobs.includes(registration.jobId))) break;
     }
     assert.ok(recordRounds.flatMap(round => round.removedJobs ?? []).includes(registration.jobId),
       JSON.stringify(recordRounds));
@@ -302,7 +302,7 @@ it('an interrupted transfer expires after its TTL and its identifier is refused 
     let rounds = [];
     for (let attempt = 0; attempt < 3; attempt++) {
       rounds.push(await runtime.remote.call('maintenance', { retentionMs: { interruptedTransferDataMs: 0 } }));
-      if (rounds.some(round => Array.isArray(round.removedTransfers) && round.removedTransfers.length > 0)) break;
+      if (rounds.some(round => Array.isArray(round.removedTransfers) && round.removedTransfers.includes(registered.transferId))) break;
     }
     assert.ok(rounds.flatMap(round => round.removedTransfers ?? []).includes(registered.transferId),
       JSON.stringify(rounds));
@@ -408,7 +408,10 @@ it('maintenance reclaims expired read credentials, stale helper images and verif
     let rounds = [];
     for (let attempt = 0; attempt < 3; attempt++) {
       rounds.push(await runtime.remote.call('maintenance', {}));
-      const seen = id => rounds.some(round => Array.isArray(round[id]) && round[id].length > 0);
+      const seen = id => rounds.some(round => Array.isArray(round[id]) && (
+        id === 'removedReadTokens' ? round[id].includes(token)
+        : id === 'reclaimedResources' ? round[id].includes(registered.resourceId)
+        : id === 'removedHelpers' ? round[id].includes(fakeDigest) : false));
       if (seen('removedReadTokens') && seen('reclaimedResources') && seen('removedHelpers')) break;
     }
     const flat = key => rounds.flatMap(round => round[key] ?? []);
