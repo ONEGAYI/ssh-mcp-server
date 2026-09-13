@@ -604,11 +604,17 @@ class FileService:
         index_path = self.read_index(path)
         key, previous = None, []
         if index_path.exists():
-            candidate = read_json(index_path)['readToken']
-            old = read_json(self.reads / (candidate + '.json'))
-            if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
-                    and _now() <= old.get('expiresAt', 0)):
-                key, previous = candidate, old['ranges']
+            # A dangling or corrupt index must not kill the read (contrast
+            # token(), which refuses unknown credentials): issue a fresh
+            # credential from this window alone, like a first read.
+            try:
+                candidate = read_json(index_path)['readToken']
+                old = read_json(self.reads / (candidate + '.json'))
+                if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
+                        and _now() <= old.get('expiresAt', 0)):
+                    key, previous = candidate, old['ranges']
+            except (OSError, ValueError):
+                key, previous = None, []
         ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
         return self.save_read(path, version, size, ranges, key)
 
@@ -649,7 +655,8 @@ class FileService:
         if not isinstance(metadata_only, bool):
             raise AgentError('INVALID_REQUEST', 'metadataOnly must be boolean')
         if metadata_only:
-            if any(key in request for key in ('offset', 'fromLine', 'toLine', 'maxBytes')) or 'encoding' in request:
+            if any(key in request for key in ('offset', 'fromLine', 'toLine', 'maxBytes',
+                                              'expectedVersion', 'readToken')) or 'encoding' in request:
                 raise AgentError('INVALID_REQUEST', 'metadataOnly observes the version; drop the content selectors')
             return self.observe_metadata(path)
         limit = validate_read_request(request)
@@ -794,10 +801,15 @@ class FileService:
         """
         temporary = path.parent / ('.ssh-mcp-' + uuid.uuid4().hex)
         resource_id = ledger.register_temp(self.root, str(temporary), output_size, self.session, origin)
+        committed = False
         try:
+            # Re-check the symlink rules before any byte reaches the temp
+            # file: if the parent turned into an outside symlink after the
+            # entry check, the data must never be written through it, not
+            # even briefly before the rejection deletes it again.
+            self.path(str(path), writing=True)
             written_info = write_temporary(temporary, info, produce)
             ledger.attach_identity(self.root, resource_id, '{}:{}'.format(written_info.st_dev, written_info.st_ino))
-            self.path(str(path), writing=True)
             if version is not None:
                 if current_version(path) != version:
                     raise AgentError('FILE_CONFLICT', 'File changed before committing the write')
@@ -807,16 +819,41 @@ class FileService:
                     os.link(str(temporary), str(path))
                 except FileExistsError:
                     raise AgentError('FILE_CONFLICT', 'Creation target already exists')
+            committed = True
             sync_directory(path.parent)
             return written_info
         except OSError as error:
+            if committed:
+                # The name is already published: the write happened, and the
+                # caller must neither retry it as new nor read it as failed.
+                raise AgentError('COMMITTED_UNCONFIRMED',
+                                 'The write was committed at {}; post-commit bookkeeping failed ({}). '
+                                 'Do not retry as a new write; re-read the current file first.'.format(path, error))
             if error.errno == errno.ENOSPC:
                 raise AgentError('STORAGE_FULL', 'Remote filesystem reported ENOSPC while committing the write')
             raise
         finally:
-            if os.path.exists(str(temporary)):
-                os.unlink(str(temporary))
-            ledger.release(self.root, resource_id)
+            # Cleanup failures after the commit are bookkeeping problems, not
+            # write problems: report them as committed-unconfirmed. Before the
+            # commit they keep the bare OSError semantics; an exception already
+            # in flight (the sys.exc_info check) is never masked by them.
+            failure = None
+            try:
+                if os.path.exists(str(temporary)):
+                    os.unlink(str(temporary))
+            except OSError as error:
+                failure = error
+            try:
+                ledger.release(self.root, resource_id)
+            except OSError as error:
+                failure = failure or error
+            if failure is not None:
+                if committed:
+                    raise AgentError('COMMITTED_UNCONFIRMED',
+                                     'The write was committed at {}; post-commit bookkeeping failed ({}). '
+                                     'Do not retry as a new write; re-read the current file first.'.format(path, failure))
+                if sys.exc_info()[0] is None:
+                    raise failure
 
     def commit(self, path, data, info=None, version=None, origin='file'):
         """Publish buffered content (whole-file writes)."""
@@ -841,6 +878,20 @@ class FileService:
             raise AgentError('INVALID_REQUEST',
                              'Whole-file writes no longer take readToken; observe the target with a metadataOnly read '
                              'and pass overwrite=true with that expectedVersion to replace it')
+        # Inline content stays bounded by the 16 MiB request budget (spec
+        # 4.3, large-file extension); larger payloads go through uploads.
+        # base64 is estimated by length formula without decoding -- malformed
+        # input stays with compose_content's own validation.
+        if 'text' in request and isinstance(request['text'], str):
+            inline_bytes = len(request['text'].encode('utf8'))
+        elif 'data' in request and isinstance(request['data'], str):
+            payload = request['data']
+            inline_bytes = len(payload) // 4 * 3 - (len(payload) - len(payload.rstrip('=')))
+        else:
+            inline_bytes = None
+        if inline_bytes is not None and inline_bytes > MAX_FILE_BYTES:
+            raise AgentError('FILE_TOO_LARGE',
+                             'Inline writes are bounded by the 16 MiB request budget; use remote_upload for larger content')
         creating = request.get('create', False)
         overwriting = request.get('overwrite', False)
         if not isinstance(creating, bool) or not isinstance(overwriting, bool):
@@ -865,6 +916,8 @@ class FileService:
                     stream = path.open('rb')
                 except FileNotFoundError:
                     raise AgentError('FILE_CONFLICT', 'Overwrite target does not exist; keep overwrite bound to an existing observed version or create instead')
+                except IsADirectoryError:
+                    raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
                 with stream:
                     info = os.fstat(stream.fileno())
                     require_regular_file(info)

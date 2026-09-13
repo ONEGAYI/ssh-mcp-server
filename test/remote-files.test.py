@@ -1,4 +1,5 @@
 import base64
+import errno
 import json
 import os
 from pathlib import Path
@@ -334,6 +335,29 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
+    def test_grant_read_survives_missing_stale_credential_records(self):
+        # index-*.json 存在但指向的 token 文件被删/损坏：签发新凭据继续
+        # 服务（对比 token() 同场景防护并报 READ_REQUIRED），而不是
+        # read_json 裸抛 OSError 让整个读取 HELPER_ERROR。
+        path = self.work / 'stale-index.txt'
+        path.write_text('first\nsecond\n')
+        first = self.call('file_read', {'path': 'stale-index.txt', 'fromLine': 1, 'toLine': 1})['result']
+        reads = self.root / 'state' / 'reads'
+        token_files = [item for item in reads.iterdir() if not item.name.startswith('index-')]
+        self.assertEqual(len(token_files), 1)
+        token_files[0].unlink()  # index 现在指向缺失文件
+        second = self.call('file_read', {'path': 'stale-index.txt', 'fromLine': 2, 'toLine': 2})
+        self.assertTrue(second['ok'], second)
+        self.assertNotEqual(second['result']['readToken'], first['readToken'])
+        # 新凭据只覆盖第二行：第一行回到未读状态，第二行可直接编辑。
+        denied = self.call('file_edit', {'path': 'stale-index.txt', 'readToken': second['result']['readToken'],
+                                         'edits': [{'oldText': 'first', 'newText': 'unread'}]})
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        allowed = self.call('file_edit', {'path': 'stale-index.txt', 'readToken': second['result']['readToken'],
+                                          'edits': [{'oldText': 'second', 'newText': 'edited'}]})
+        self.assertTrue(allowed['ok'], allowed)
+        self.assertEqual(path.read_text(), 'first\nedited\n')
+
     def test_size_gate_rejects_directories_but_streams_oversized_reads_and_edits(self):
         directory = self.call('file_read', {'path': '.'})
         self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
@@ -347,15 +371,97 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(streamed['result']['endOffset'], 100)
         self.assertFalse(streamed['result']['complete'])
         # Since issue #10 the mutation paths stream too: editing a >16 MiB
-        # file works, and inline writes no longer stop at the old 16 MiB gate.
+        # file works. Inline writes stay bounded by the 16 MiB request
+        # budget (spec 4.3): exactly 16 MiB passes, one byte over is refused
+        # with FILE_TOO_LARGE pointing at remote_upload.
         edit = self.call('file_edit', {'path': 'oversized.bin', 'readToken': streamed['result']['readToken'],
                                        'edits': [{'oldText': 'UNIQUE-MARKER-12345678', 'newText': 'zero-block'}]})
-        self.assertTrue(edit['ok'], edit)
+        self.assertTrue(edit['ok'])
         self.assertEqual(edit['result']['bytesWritten'], 16 * 1024 * 1024 + 1 - len('UNIQUE-MARKER-12345678') + len('zero-block'))
         service = self.service()
+        files = self.helper_module()
         service.write({'path': 'created.bin', 'create': True,
-                       'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')})
-        self.assertEqual((self.work / 'created.bin').stat().st_size, 16 * 1024 * 1024 + 1)
+                       'data': base64.b64encode(b'0' * (16 * 1024 * 1024)).decode('ascii')})
+        self.assertEqual((self.work / 'created.bin').stat().st_size, 16 * 1024 * 1024)
+        with self.assertRaises(files.AgentError) as refused:
+            service.write({'path': 'too-big.bin', 'create': True,
+                           'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')})
+        self.assertEqual(refused.exception.code, 'FILE_TOO_LARGE')
+        self.assertIn('remote_upload', str(refused.exception))
+        self.assertFalse((self.work / 'too-big.bin').exists())
+
+    def test_inline_write_request_budget_bounds_text_and_base64_paths(self):
+        # 规格大文件扩展 4.3：inline text/base64 仍受 16 MiB 请求预算限制，
+        # 大内容走上传。门按请求内容长度估算（base64 用长度公式，不解码），
+        # 恰好 16 MiB 允许，超出即 FILE_TOO_LARGE；file_edit 不受此门。
+        files = self.helper_module()
+        service = self.service()
+        exact = service.write({'path': 'exact-text.bin', 'create': True, 'text': 'x' * (16 * 1024 * 1024)})
+        self.assertTrue(exact['written'])
+        self.assertEqual((self.work / 'exact-text.bin').stat().st_size, 16 * 1024 * 1024)
+        for request in ({'path': 'over-text.txt', 'create': True, 'text': 'x' * (16 * 1024 * 1024 + 1)},
+                        {'path': 'over-data.bin', 'create': True,
+                         'data': base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')}):
+            with self.assertRaises(files.AgentError) as refused:
+                service.write(request)
+            self.assertEqual(refused.exception.code, 'FILE_TOO_LARGE', request['path'])
+            self.assertIn('remote_upload', str(refused.exception))
+            self.assertFalse((self.work / request['path']).exists())
+
+    def test_overwrite_target_became_a_directory_reports_unsupported_file(self):
+        # 目标在观察与写入之间变成目录时，IsADirectoryError 归一为
+        # UNSUPPORTED_FILE（与 read/observe 一致），而非 HELPER_ERROR。
+        # 直调 write handler 绕过 metadataOnly 观察侧对目录的拦截。
+        files = self.helper_module()
+        service = self.service()
+        with self.assertRaises(files.AgentError) as caught:
+            service.write({'path': '.', 'text': 'x', 'overwrite': True, 'expectedVersion': 'm1-anything'})
+        self.assertEqual(caught.exception.code, 'UNSUPPORTED_FILE')
+        self.assertEqual(str(caught.exception), 'Only regular files are supported')
+
+    def test_publish_rechecks_symlink_parent_before_writing_the_temp_file(self):
+        # 入口检查与临时文件写入之间父目录被换成指向外部的 symlink：
+        # publish 的复查必须发生在 write_temporary 之前，数据不得短暂
+        # 写入外部目录（随后拒绝+删除的窗口仍是泄漏）。注入点选
+        # compose_content（write() 入口检查后、publish 前的最后一步），
+        # 模拟复查前的目录替换；现有 symlink 用例只覆盖入口检查。
+        files = self.helper_module()
+        service = self.service()
+        realdir = self.work / 'realdir'
+        realdir.mkdir()
+        # 外部目标仍在 workspace 内：复查要命中 symlink 检查而不是
+        # 更早的 workspace 边界检查。
+        outside = self.work / 'outside-leak'
+        outside.mkdir()
+        seen_leak = []
+        original_compose = files.compose_content
+
+        def swap_then_compose(request, has_bom, census):
+            # 在 publish 之前制造 TOCTOU 窗口：父目录换成外部 symlink。
+            realdir.rename(self.work / 'moveddir')
+            (self.work / 'realdir').symlink_to(outside)
+            return original_compose(request, has_bom, census)
+        files.compose_content = swap_then_compose
+        original_write_temporary = files.write_temporary
+
+        def observing_write_temporary(path, info, produce):
+            result = original_write_temporary(path, info, produce)
+            if any(outside.iterdir()):  # publish 的 finally 删除前观测
+                seen_leak.append('temp file written through the symlink')
+            return result
+        files.write_temporary = observing_write_temporary
+        try:
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'realdir/new.txt', 'text': 'payload', 'create': True})
+        finally:
+            files.compose_content = original_compose
+            files.write_temporary = original_write_temporary
+        self.assertEqual(caught.exception.code, 'UNSUPPORTED_LINK')
+        self.assertEqual(seen_leak, [])
+        # 核心断言：外部目录自始至终未收到任何字节（目录替换本身是
+        # 注入的既成事实，与写入无关），目标名也未发布。
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((outside / 'new.txt').exists())
 
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
@@ -424,6 +530,11 @@ class RemoteFilesTest(unittest.TestCase):
         # Content selectors are meaningless without content: reject mixing.
         mixed = self.call('file_read', {'path': 'meta.txt', 'metadataOnly': True, 'offset': 0})
         self.assertEqual(mixed['error']['code'], 'INVALID_REQUEST')
+        # expectedVersion / readToken contradict observing metadata alone.
+        for request in ({'path': 'meta.txt', 'metadataOnly': True, 'expectedVersion': 'm1-anything'},
+                        {'path': 'meta.txt', 'metadataOnly': True, 'readToken': '0' * 32}):
+            refused = self.call('file_read', request)
+            self.assertEqual(refused['error']['code'], 'INVALID_REQUEST', request)
 
     def test_capabilities_report_streamed_read_and_streamed_write(self):
         capabilities = self.call('file_workspace', {})['result']['capabilities']
@@ -1022,6 +1133,45 @@ class RemoteFilesTest(unittest.TestCase):
         finally:
             files.sync_directory = original
         self.assertEqual(synced, [str(self.work)] * 3)
+
+    def test_post_commit_failure_reports_committed_unconfirmed_not_storage_full(self):
+        # 契约：写入已完成时不得把它当成未写入。replace/link 已完成后，
+        # 目录 fsync 或收尾簿记失败必须报 COMMITTED_UNCONFIRMED（已提交、
+        # 别按新写重试），而不是 STORAGE_FULL 掩盖已提交的事实。
+        files = self.helper_module()
+        service = self.service()
+        (self.work / 'committed.txt').write_text('before')
+        original = files.sync_directory
+
+        def enospc(directory):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        files.sync_directory = enospc
+        try:
+            observed = service.read({'path': 'committed.txt', 'metadataOnly': True})
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'committed.txt', 'text': 'after',
+                               'overwrite': True, 'expectedVersion': observed['version']})
+        finally:
+            files.sync_directory = original
+        self.assertEqual(caught.exception.code, 'COMMITTED_UNCONFIRMED')
+        self.assertIn(str(self.work / 'committed.txt'), str(caught.exception))
+        # 目标文件已是新内容：写入确实发生了，未被误报掩盖。
+        self.assertEqual((self.work / 'committed.txt').read_text(), 'after')
+        # 收尾簿记（ledger.release）失败同样不得把已提交的写当失败。
+        original_release = files.ledger.release
+
+        def broken_release(*args, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        files.ledger.release = broken_release
+        try:
+            observed = service.read({'path': 'committed.txt', 'metadataOnly': True})
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'committed.txt', 'text': 'again',
+                               'overwrite': True, 'expectedVersion': observed['version']})
+        finally:
+            files.ledger.release = original_release
+        self.assertEqual(caught.exception.code, 'COMMITTED_UNCONFIRMED')
+        self.assertEqual((self.work / 'committed.txt').read_text(), 'again')
 
 
 if __name__ == '__main__':

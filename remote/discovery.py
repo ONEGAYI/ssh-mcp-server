@@ -421,7 +421,13 @@ def external_scan(binary, needle_text, feeder, sink, units, current, budget):
     output line so a giant match line cannot grow memory without bound. The
     process exits 0/1 normally; higher codes or signals raise BackendFailure.
     """
-    argv = [binary, '-F', '-a', '-n', '--color=never', '--', needle_text, '-']
+    # bytes argv: a C-locale remote (no LANG/LC_* from sshd) runs Python 3.6
+    # with an ascii filesystem encoding, and str argv would raise
+    # UnicodeEncodeError in Popen for any non-ASCII pattern. The explicit
+    # utf8 + surrogateescape round-trips both JSON-sourced text and
+    # surrogate-escaped filesystem paths without consulting the locale.
+    argv = [binary.encode('utf8', 'surrogateescape'), b'-F', b'-a', b'-n', b'--color=never', b'--',
+            needle_text.encode('utf8'), b'-']
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, close_fds=True)
     selector = selectors.DefaultSelector()
@@ -878,7 +884,10 @@ def rg_list(binary, root, budget):
     Path objects. Raises BackendFailure on abnormal exits; BudgetStop and the
     candidate-cap error propagate to the caller.
     """
-    argv = [binary, '--files', '--hidden', '--no-ignore', '--no-messages', '-0', '--', str(root)]
+    # bytes argv for the same C-locale reason as external_scan: the root may
+    # carry non-ASCII text (Chinese workspace paths) or surrogate escapes.
+    argv = [binary.encode('utf8', 'surrogateescape'), b'--files', b'--hidden', b'--no-ignore',
+            b'--no-messages', b'-0', b'--', str(root).encode('utf8', 'surrogateescape')]
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, close_fds=True)
     chunks = []
@@ -1034,14 +1043,24 @@ def file_find(service, root, request):
         try:
             files = filter_rg_lines(root, rg_list(rg_binary, root, budget),
                                     include_hidden, respect_gitignore)
-            skeleton = stream_paths(root, include_hidden, respect_gitignore,
-                                    skip_files=True, budget=budget)
-            stream = dedupe_merge(files, skeleton)
-            engine = 'ripgrep-files'
+        except BudgetStop:
+            # rg --files enumeration is eager and shares the page's time
+            # budget: exhausting it before any candidate was considered is a
+            # normal budget stop (empty partial page, cursor unchanged from
+            # the request), not a helper error. It must not reach the
+            # BackendFailure fallback either -- a timeout is not a crash.
+            return {'entries': [], 'nextCursor': encode_cursor({'v': 2, 'q': query, 'after': after}),
+                    'truncated': True, 'totalEntries': None, 'engine': 'ripgrep-files',
+                    'reason': 'SCAN_TIME_LIMIT'}
         except (BackendFailure, OSError):
             # A crashed or unspawnable rg must not look like an empty tree:
             # fall back to the plain Python walk for this page.
             stream = None
+        else:
+            skeleton = stream_paths(root, include_hidden, respect_gitignore,
+                                    skip_files=True, budget=budget)
+            stream = dedupe_merge(files, skeleton)
+            engine = 'ripgrep-files'
     if stream is None:
         stream = stream_paths(root, include_hidden, respect_gitignore, budget=budget)
 
@@ -1074,7 +1093,14 @@ def file_find(service, root, request):
                 budget.ensure_within()
                 last = current
                 continue
-            info = path.lstat()
+            try:
+                info = path.lstat()
+            except OSError:
+                # The entry vanished between enumeration and this stat: it
+                # can no longer appear, so advance the cursor past it and
+                # skip it -- consistent with file_search's silent exclusion.
+                last = current
+                continue
             kind = 'symlink' if stat.S_ISLNK(info.st_mode) else \
                 'directory' if stat.S_ISDIR(info.st_mode) else \
                 'file' if stat.S_ISREG(info.st_mode) else 'other'
@@ -1090,6 +1116,15 @@ def file_find(service, root, request):
         else:
             exhausted = True
     except BudgetStop as stop:
+        # A continuation page that spent its whole budget skipping already
+        # returned candidates would hand back the request cursor unchanged:
+        # every retry re-enumerates and times out the same way, so the query
+        # could never finish. Fail explicitly instead. First pages (no
+        # cursor) keep the plain partial semantics.
+        if last == after and after is not None:
+            raise AgentError('SCAN_TIME_LIMIT',
+                             'Time budget exhausted before advancing past already returned '
+                             'entries; narrow the search directory')
         reason = {'bytes': 'SCAN_BYTE_LIMIT', 'time': 'SCAN_TIME_LIMIT'}[stop.reason]
     # A stop always leaves a continuable cursor: `after` anchors the resume
     # point (None restarts the enumeration, e.g. a time stop before any

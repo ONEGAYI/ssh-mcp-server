@@ -220,6 +220,26 @@ class RemoteDiscoveryTest(unittest.TestCase):
         baseline = self.call('file_search', {'path': 'large.log', 'pattern': NEEDLE}, backends='none')['result']
         self.assertEqual(result['matches'], baseline['matches'])
 
+    def test_non_ascii_pattern_survives_c_locale_argv_encoding(self):
+        # 远端 sshd 不传 LANG/LC_* 时 Python 3.6 的 filesystem encoding 是
+        # ascii（PEP 538 locale 强制是 3.7+）：str argv 经 Popen 编码抛
+        # UnicodeEncodeError，中文 pattern 让 file_search 整体崩成
+        # HELPER_ERROR。argv 改为 bytes 后不再依赖 locale。PYTHONUTF8=0
+        # 同时禁掉 PEP 540，让本地新 Python 同样退化到 ascii 复现 3.6 行为。
+        # 路径保持 ASCII：非 ASCII 路径在 C locale 下会先在 resolve 阶段
+        # 失败（files.py 的既有行为，超出本缺陷范围）。
+        env = dict(os.environ)
+        env['PATH'] = str(self.bin_rg_and_grep)
+        env['LC_ALL'] = 'C'
+        env['PYTHONCOERCECLOCALE'] = '0'
+        env['PYTHONUTF8'] = '0'
+        # 大文件把 file_search 推上 external rg 后端（>= EXTERNAL_THRESHOLD_BYTES）。
+        self.big_file('large.log', 2 * 1024 * 1024, {5})
+        search = self.call_env('file_search', {'path': 'large.log', 'pattern': NEEDLE}, env)
+        self.assertTrue(search['ok'], search)
+        self.assertEqual(self.hits(search['result']), [('large.log', 5)])
+        self.assertEqual(search['result']['engine'], 'ripgrep')
+
     # --- pagination and cursors ------------------------------------------------
 
     def test_pagination_returns_all_hits_in_order_without_rescanning_finished_files(self):
@@ -645,6 +665,101 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertTrue(result['truncated'])
         self.assertEqual(result['reason'], 'SCAN_TIME_LIMIT')
         self.assertIsNotNone(result['nextCursor'])
+
+    def test_find_rg_enumeration_time_budget_returns_partial_not_helper_error(self):
+        # rg --files enumeration is eager: its BudgetStop must surface as a
+        # normal time-budget partial page (empty entries, resumable cursor),
+        # never escape to the agent fallback as HELPER_ERROR.
+        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        saved_which = discovery.shutil.which
+        saved_list = discovery.rg_list
+        discovery.shutil.which = lambda name: '/usr/bin/rg' if name == 'rg' else saved_which(name)
+
+        def exhausted(*args, **kwargs):
+            raise discovery.BudgetStop('time')
+        try:
+            discovery.rg_list = exhausted
+            result = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*'})
+        finally:
+            discovery.shutil.which = saved_which
+            discovery.rg_list = saved_list
+        self.assertEqual(result['entries'], [])
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['reason'], 'SCAN_TIME_LIMIT')
+        self.assertEqual(result['engine'], 'ripgrep-files')
+        self.assertIsNotNone(result['nextCursor'])
+        cursor = json.loads(base64.b64decode(result['nextCursor']).decode('utf8'))
+        self.assertEqual(cursor['v'], 2)
+        # 首页的游标保持 after=None：重启枚举而不是声称完成。
+        self.assertIsNone(cursor['after'])
+
+    def test_find_second_page_zero_advance_raises_instead_of_repeating_cursor(self):
+        # 续页把整个时间预算耗在跳过已返回候选上时，返回同游标的
+        # partial 会让每页重新全量枚举又同样超时，查询永久不可完成：
+        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from common import AgentError
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        self.write('b.txt', 'b\n')
+        self.write('c.txt', 'c\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        saved_which = discovery.shutil.which
+        discovery.shutil.which = lambda name: None  # 确定性走 python-walk
+        try:
+            first = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*', 'limit': 1})
+            self.assertTrue(first['truncated'])
+            cursor = first['nextCursor']
+            original = discovery.time.monotonic
+            ticks = [0]
+
+            def fast_clock():
+                ticks[0] += 10.0
+                return ticks[0]
+            try:
+                discovery.time.monotonic = fast_clock
+                with self.assertRaises(AgentError) as caught:
+                    discovery.discover(service, 'file_find',
+                                       {'path': '.', 'pattern': '*', 'limit': 1, 'cursor': cursor})
+            finally:
+                discovery.time.monotonic = original
+        finally:
+            discovery.shutil.which = saved_which
+        self.assertEqual(caught.exception.code, 'SCAN_TIME_LIMIT')
+        self.assertIn('narrow the search directory', str(caught.exception))
+
+    def test_find_skips_candidates_deleted_between_enumeration_and_lstat(self):
+        # 枚举与 lstat 之间条目被外部删除：该候选已不再出现，游标推进
+        # 过它并跳过，查询整体成功且其余结果完整（与 file_search 的
+        # 静默排除一致），而不是 FileNotFoundError 崩成 HELPER_ERROR。
+        sys.path.insert(0, str(HELPER.parent))
+        from pathlib import Path
+        import discovery
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        self.write('vanishing.txt', 'gone soon\n')
+        self.write('z.txt', 'z\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        original_lstat = Path.lstat
+
+        def flaky_lstat(self):
+            if self.name == 'vanishing.txt':
+                raise FileNotFoundError(2, 'No such file or directory')
+            return original_lstat(self)
+        Path.lstat = flaky_lstat
+        try:
+            result = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*', 'limit': 10})
+        finally:
+            Path.lstat = original_lstat
+        self.assertFalse(result['truncated'])
+        self.assertEqual([entry['path'] for entry in result['entries']], ['a.txt', 'z.txt'])
 
     def test_find_cursor_rejects_changed_query(self):
         self.write('a.txt', 'a\n')
