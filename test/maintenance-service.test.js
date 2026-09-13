@@ -203,3 +203,106 @@ it('a failed remote round keeps the timestamp unset so the next trigger retries 
     assert.ok(state.lastCompletedAt > 0);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
+
+it('leaves local resources to living transfer records even when their holder is gone', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const tempPath = join(fixture.root, 'managed.part');
+  await writeFile(tempPath, 'receiver bytes');
+  const { dev, ino } = await stat(tempPath);
+  const transferId = hex32();
+  const resourceId = hex32();
+  try {
+    // A living (non-terminal, within TTL) transfer record still manages its
+    // receiver temp, even though the registering helper process is dead.
+    await writeTransfer(fixture.identityDir, transferId, {
+      schemaVersion: 1, transferId, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'download', state: 'transferring', tempPath, resourceId,
+      registeredAt: Date.now(), expiresAt: Date.now() + 3 * DAY,
+    });
+    await writeLedger(fixture.identityDir, {
+      [resourceId]: { kind: 'temp-file', path: tempPath, bytes: 13, identity: `${dev}:${ino}`,
+        holderPid: 300000, origin: 'file-download', reservationId: null, createdAt: Date.now() },
+    });
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.deepEqual(result.local.reclaimedResources, [], JSON.stringify(result.local));
+    assert.equal(await stat(tempPath).then(() => true, () => false), true, 'transfer temp must stay');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+// --- issue #17: crash-leftover local ledger resources ---------------------------
+
+async function writeLedger(identityDir, resources) {
+  await mkdir(join(identityDir, 'ledger'), { recursive: true });
+  await writeFile(join(identityDir, 'ledger', 'ledger.json'),
+    JSON.stringify({ schemaVersion: 1, resources, reservations: {} }));
+}
+
+async function readLedgerResources(identityDir) {
+  try { return JSON.parse(await readFile(join(identityDir, 'ledger', 'ledger.json'), 'utf8')).resources; }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+}
+
+it('reclaims crash-leftover local resources whose holder is proven dead, verifying the object identity', async () => {
+  assert.ok(MaintenanceService, 'MaintenanceService is not implemented');
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const tempPath = join(fixture.root, 'stalled-download.part');
+  await writeFile(tempPath, 'leftover receiver bytes');
+  const { dev, ino } = await stat(tempPath);
+  const deadId = hex32();
+  try {
+    await writeLedger(fixture.identityDir, {
+      [deadId]: { kind: 'temp-file', path: tempPath, bytes: 23, identity: `${dev}:${ino}`,
+        holderPid: 300000, origin: 'file-download', reservationId: null, createdAt: Date.now() - 86400000 },
+    });
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(result.skipped, undefined, JSON.stringify(result));
+    assert.deepEqual(result.local.reclaimedResources, [deadId], JSON.stringify(result.local));
+    assert.equal(await stat(tempPath).then(() => true, () => false), false, 'verified leftover temp must be deleted');
+    assert.deepEqual(await readLedgerResources(fixture.identityDir), {});
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+it('keeps live and unverifiable local ledger resources and releases entries whose object vanished', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const livePath = join(fixture.root, 'live.part');
+  const unverifiedPath = join(fixture.root, 'unverified.part');
+  const replacedPath = join(fixture.root, 'replaced.part');
+  await writeFile(livePath, 'live');
+  await writeFile(unverifiedPath, 'unverified');
+  await writeFile(replacedPath, 'now a foreign object');
+  const { dev, ino } = await stat(replacedPath);
+  const liveId = hex32(), unverifiedId = hex32(), replacedId = hex32(), vanishedId = hex32();
+  try {
+    await writeLedger(fixture.identityDir, {
+      [liveId]: { kind: 'temp-file', path: livePath, bytes: 4, identity: '9:9',
+        holderPid: process.pid, origin: 'file-download', reservationId: null, createdAt: Date.now() },
+      [unverifiedId]: { kind: 'temp-file', path: unverifiedPath, bytes: 10, identity: null,
+        holderPid: 300000, origin: 'file-download', reservationId: null, createdAt: Date.now() },
+      [replacedId]: { kind: 'temp-file', path: replacedPath, bytes: 6, identity: `${dev}:${ino}x`,
+        holderPid: 300000, origin: 'file-download', reservationId: null, createdAt: Date.now() },
+      [vanishedId]: { kind: 'temp-file', path: join(fixture.root, 'gone.part'), bytes: 6, identity: '5:5',
+        holderPid: 300000, origin: 'file-download', reservationId: null, createdAt: Date.now() },
+    });
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    const kept = await readLedgerResources(fixture.identityDir);
+    // The live holder's registration and temp stay untouched.
+    assert.ok(kept[liveId], 'live registration must stay');
+    assert.equal(await stat(livePath).then(() => true, () => false), true);
+    // An object that was never identity-anchored stays unknown: management
+    // fields only, no result body, and its bytes keep counting.
+    assert.ok(kept[unverifiedId], 'unverifiable registration must stay');
+    assert.deepEqual(Object.keys(kept[unverifiedId]).sort(),
+      ['bytes', 'createdAt', 'holderPid', 'identity', 'kind', 'origin', 'path', 'reservationId']);
+    assert.equal(await stat(unverifiedPath).then(() => true, () => false), true);
+    // A path naming a different object than the registration recorded is no
+    // longer ours: release the entry, never delete the foreign file.
+    assert.equal(kept[replacedId], undefined);
+    assert.equal(await stat(replacedPath).then(() => true, () => false), true);
+    // A registration whose file is already gone just leaves the ledger.
+    assert.equal(kept[vanishedId], undefined);
+    assert.deepEqual(result.local.reclaimedResources.sort(), [replacedId, vanishedId].sort());
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});

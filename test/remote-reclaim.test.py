@@ -2,13 +2,17 @@
 results with lazy cleanup and bounded maintenance, driven through the
 helper's public CLI. The accelerated clock is SSH_MCP_TEST_CLOCK; record
 timestamps stay real so only the reclamation verdicts move. Runs on Linux
-(fcntl) with Python 3.6+."""
+(fcntl) with Python 3.6+.
+
+Ticket #17 adds the same-driven reclamation of expired read credentials,
+stale helper images and crash-leftover temp resources (spec 7.1/7.2)."""
 import base64
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,11 +42,14 @@ class RemoteReclaimTest(unittest.TestCase):
         return self.root / 'state'
 
     def call(self, action, request, session='session-one', clock=None):
+        return self.call_via(HELPER, action, request, session=session, clock=clock)
+
+    def call_via(self, helper, action, request, session='session-one', clock=None):
         data = dict(request, workspaceRoot=str(self.work), sessionId=session)
         env = dict(os.environ)
         if clock is not None:
             env['SSH_MCP_TEST_CLOCK'] = repr(clock)
-        run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.state), action],
+        run = subprocess.run([sys.executable, str(helper), '--root', str(self.state), action],
                              input=json.dumps(data).encode('utf8'), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              timeout=60, env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -306,6 +313,202 @@ class RemoteReclaimTest(unittest.TestCase):
         stdout = self.job_dir(job_id) / 'stdout'
         self.assertLessEqual(stdout.stat().st_size, 2 * 1024 * 1024)
         self.assertGreater(stdout.stat().st_size, 0)
+
+    # --- issue #17: expired read credentials -----------------------------------
+
+    def test_expired_read_tokens_and_indexes_are_reclaimed_and_rereading_restores_only_the_new_window(self):
+        source = self.work / 'credential.txt'
+        source.write_text('alpha window text\n' + 'padding line ' * 20 + '\ntail target line\n')
+        first = self.call('file_read', {'path': 'credential.txt', 'offset': 0, 'maxBytes': 4096})['result']
+        token = first['readToken']
+        self.assertTrue(token)
+        reads = self.state / 'reads'
+        self.assertTrue((reads / (token + '.json')).is_file())
+        indexes = [path.name for path in reads.iterdir() if path.name.startswith('index-')]
+        self.assertTrue(indexes)
+        # Three idle days later the maintenance round reclaims the credential
+        # records physically, together with the dangling session-path index.
+        result = self.maintenance(clock=time.time() + 3.1 * DAY)['result']
+        self.assertEqual(result['removedReadTokens'], [token], result)
+        self.assertFalse((reads / (token + '.json')).exists())
+        self.assertEqual(result['removedReadIndexes'], indexes, result)
+        self.assertFalse((reads / indexes[0]).exists())
+        # The reclaimed credential no longer authorizes an edit.
+        rejected = self.call('file_edit', {'path': 'credential.txt', 'readToken': token,
+                                           'edits': [{'oldText': 'alpha', 'newText': 'beta'}]})
+        self.assertFalse(rejected['ok'])
+        self.assertIn(rejected['error']['code'], ('READ_REQUIRED', 'READ_TOKEN_EXPIRED'))
+        # Recovery is one fresh read of just the needed fragment.
+        second = self.call('file_read', {'path': 'credential.txt', 'offset': 0, 'maxBytes': 24})['result']
+        edited = self.call('file_edit', {'path': 'credential.txt', 'readToken': second['readToken'],
+                                         'edits': [{'oldText': 'alpha', 'newText': 'beta'}]})
+        self.assertTrue(edited['ok'], edited)
+        # The dead credential's old ranges are not revived: the tail that the
+        # expired token once covered is still unauthorized for the new one.
+        denied = self.call('file_edit', {'path': 'credential.txt',
+                                         'readToken': edited['result']['readToken'],
+                                         'edits': [{'oldText': 'tail target line', 'newText': 'x'}]})
+        self.assertFalse(denied['ok'])
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+
+    def test_active_read_tokens_within_ttl_survive_maintenance(self):
+        source = self.work / 'fresh.txt'
+        source.write_text('fresh window\n')
+        read = self.call('file_read', {'path': 'fresh.txt'})['result']
+        result = self.maintenance(clock=time.time() + DAY)['result']
+        self.assertEqual(result['removedReadTokens'], [], result)
+        self.assertTrue((self.state / 'reads' / (read['readToken'] + '.json')).is_file())
+        edited = self.call('file_edit', {'path': 'fresh.txt', 'readToken': read['readToken'],
+                                         'edits': [{'oldText': 'fresh', 'newText': 'cooled'}]})
+        self.assertTrue(edited['ok'], edited)
+
+    # --- issue #17: stale helper images ----------------------------------------
+
+    def test_stale_helper_images_are_reclaimed_but_live_references_and_the_current_image_survive(self):
+        helpers = self.state / 'helpers'
+        stale = helpers / ('a' * 64)
+        active = helpers / ('b' * 64)
+        current = helpers / ('c' * 64)
+        for directory in (stale, active, current):
+            shutil.copytree(str(HELPER.parent), str(directory))
+        # A name that is not a content-addressed image digest is never ours.
+        (helpers / 'not-a-digest').mkdir()
+        # A live process whose command line references the "active" image --
+        # the same evidence a running task worker provides (it is spawned as
+        # <image>/agent.py --root ... _worker ...).
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)',
+                                   str(active / 'agent.py')])
+        try:
+            # The maintenance round itself runs from the "current" image.
+            result = self.call_via(current / 'agent.py', 'maintenance', {}, clock=time.time())['result']
+            self.assertEqual(result['removedHelpers'], ['a' * 64], result)
+            self.assertFalse(stale.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue(current.exists())
+            self.assertTrue((helpers / 'not-a-digest').is_dir())
+        finally:
+            holder.terminate()
+            holder.wait()
+
+    # --- issue #17: crash-leftover temp resources -------------------------------
+
+    def test_crash_leftover_temp_with_dead_holder_is_reclaimed_after_verification(self):
+        temp = self.work / '.ssh-mcp-crash'
+        temp.write_bytes(b'crash leftover')
+        registered = self.call('resource_register', {'path': str(temp), 'bytes': 15,
+                                                     'origin': 'file-edit'})['result']
+        resource_id = registered['resourceId']
+        # Complete the crash picture: the object identity was attached before
+        # the holder died (the public actions do not expose attach itself).
+        ledger_path = self.state / 'ledger' / 'ledger.json'
+        data = json.loads(ledger_path.read_text())
+        info = temp.stat()
+        data['resources'][resource_id]['identity'] = '{}:{}'.format(info.st_dev, info.st_ino)
+        ledger_path.write_text(json.dumps(data))
+        # The registering helper subprocess has exited, so the holder is dead;
+        # ownership, object identity and occupancy all verify -> reclaim.
+        result = self.maintenance(clock=time.time())['result']
+        self.assertIn(resource_id, result['reclaimedResources'], result)
+        self.assertFalse(temp.exists())
+        usage = self.call('resource_usage', {})['result']
+        self.assertEqual(usage['resourceCount'], 0, usage)
+
+    def test_live_and_unverifiable_temp_registrations_are_kept(self):
+        sys.path.insert(0, str(HELPER.parent))
+        try:
+            import ledger as ledger_module
+        finally:
+            sys.path.remove(str(HELPER.parent))
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+        live_temp = self.work / '.ssh-mcp-live'
+        live_temp.write_bytes(b'live')
+        unverifiable_temp = self.work / '.ssh-mcp-unverified'
+        unverifiable_temp.write_bytes(b'unverified')
+        live_identity = '9:9'  # never compared while the holder is alive
+        live_id, unknown_id = '1' * 32, '2' * 32
+        ledger_path = self.state / 'ledger' / 'ledger.json'
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({'schemaVersion': 1, 'reservations': {}, 'resources': {
+            live_id: {'kind': 'temp-file', 'path': str(live_temp), 'bytes': 4, 'identity': live_identity,
+                      'holderPid': holder.pid, 'holderIdentity': ledger_module.process_identity(holder.pid),
+                      'session': None, 'origin': 'file-edit', 'reservationId': None,
+                      'createdAt': time.time()},
+            unknown_id: {'kind': 'temp-file', 'path': str(unverifiable_temp), 'bytes': 11, 'identity': None,
+                         'holderPid': 4194303, 'holderIdentity': 'boot:41', 'session': None,
+                         'origin': 'file-edit', 'reservationId': None, 'createdAt': time.time()},
+        }}))
+        try:
+            result = self.maintenance(clock=time.time())['result']
+            self.assertEqual(result['reclaimedResources'], [], result)
+            self.assertIn(unknown_id, result['unknownResources'], result)
+            # The live holder and the unverifiable object both stay untouched.
+            self.assertTrue(live_temp.exists())
+            self.assertTrue(unverifiable_temp.exists())
+            after = json.loads(ledger_path.read_text())['resources']
+            self.assertIn(live_id, after)
+            self.assertIn(unknown_id, after)
+            # Unknown occupancy keeps management fields only: no result body
+            # may hide inside the resource ledger.
+            self.assertLessEqual(set(after[unknown_id].keys()),
+                                 {'kind', 'path', 'bytes', 'identity', 'holderPid', 'holderIdentity',
+                                  'session', 'origin', 'reservationId', 'createdAt'})
+            # ...and the kept bytes still count against the workspace quota.
+            usage = self.call('resource_usage', {})['result']
+            self.assertGreaterEqual(usage['tempBytes'], 15, usage)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+    def test_transfer_managed_resources_are_left_to_the_transfer_records(self):
+        # A living transfer record manages its temp and ledger entry with
+        # transfer-specific evidence (slot lock plus its own TTL); the generic
+        # resource pass must never race it, even though the registering helper
+        # process (the recorded holder) is long gone.
+        registered = self.register_upload(CHUNK)
+        transfer_id = registered['result']['transferId']
+        started = self.call('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                               'sourceIdentity': {'size': CHUNK, 'mtimeMs': 1.0}})
+        self.assertTrue(started['ok'], started)
+        record = json.loads((self.state / 'transfers' / transfer_id / 'record.json').read_text())
+        temp = Path(record['tempPath'])
+        block = b'z' * CHUNK
+        payload = (json.dumps({'transferId': transfer_id, 'index': 0, 'offset': 0,
+                               'sha256': hashlib.sha256(block).hexdigest(),
+                               'sessionId': 'session-one', 'size': len(block)}) + '\n').encode('utf8') + block
+        run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.state), 'transfer_block'],
+                             input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertTrue(run.stdout.startswith(b'SSH_MCP_V1 '), run.stderr)
+        result = self.maintenance(clock=time.time())['result']
+        self.assertEqual(result['reclaimedResources'], [], result)
+        self.assertTrue(temp.exists())
+        usage = self.call('resource_usage', {})['result']
+        self.assertGreaterEqual(usage['resourceCount'], 1, usage)
+        # The transfer itself stays resumable.
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': {'size': CHUNK, 'mtimeMs': 1.0}})
+        self.assertTrue(resumed['ok'], resumed)
+
+    def test_files_without_a_ledger_registration_are_never_deleted(self):
+        stray = self.work / '.ssh-mcp-not-in-ledger'
+        stray.write_bytes(b'owned by nobody we know')
+        result = self.maintenance(clock=time.time())['result']
+        self.assertTrue(stray.exists())
+        self.assertEqual(result['reclaimedResources'], [], result)
+
+    def test_regular_operation_temps_are_cleaned_up_immediately(self):
+        source = self.work / 'clean.txt'
+        source.write_text('to be edited\n')
+        read = self.call('file_read', {'path': 'clean.txt'})['result']
+        edited = self.call('file_edit', {'path': 'clean.txt', 'readToken': read['readToken'],
+                                         'edits': [{'oldText': 'edited', 'newText': 'replaced'}]})
+        self.assertTrue(edited['ok'], edited)
+        written = self.call('file_write', {'path': 'created.txt', 'text': 'created\n', 'create': True})
+        self.assertTrue(written['ok'], written)
+        # Successful operations leave no temp behind and no ledger entry -- no
+        # three-day wait applies to temps the operation itself owns.
+        self.assertEqual(list(self.work.glob('.ssh-mcp-*')), [])
+        usage = self.call('resource_usage', {})['result']
+        self.assertEqual(usage['resourceCount'], 0, usage)
 
 
 if __name__ == '__main__':
