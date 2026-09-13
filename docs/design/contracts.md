@@ -104,8 +104,18 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
   - **大小文件路径**：≥1 MiB 的文件走外部后端；更小的文件直接用内建扫描（避免每文件 fork 开销）。`engine` 字段报告本页实际使用的后端；外部后端全部失败时如实报告 `python-literal`。
   - **崩溃不当无匹配**：外部进程退出码 >1 或被信号杀死时，撤销该文件已产出命中、当页计数 `fallbackFiles+1`、文件改用内建扫描重扫；连续 3 个文件失败后本页剩余文件全部内建。
   - **跳过摘要**：NUL 字节或 UTF-8 解码失败的文件计入 `skippedFiles`（`skippedDetail` 分 binary/encoding/io），不静默消失。超过 8 MiB 无换行的超长行按 1 MiB 片段加 `len(pattern)-1` 字节重叠报告，跨片段匹配不遗漏（重叠区命中极罕见地可能重复报告，行标记 `lineTruncated`）。
-- 能力上报：`file_workspace` 的 `capabilities.searchEngine` 报最高可用后端，`searchBackends` 报有序可用列表（`python-literal` 恒在），`gitignoreSearch: true`，并附默认扫描预算字段。
-- 文件名查找（find）复用同一候选筛选器，其后端适配在 #12。
+- 能力上报：`file_workspace` 的 `capabilities.searchEngine` 报最高可用后端，`searchBackends` 报有序可用列表（`python-literal` 恒在），`findEngine`/`findBackends` 报文件名查找后端（见下节），`gitignoreSearch: true`，并附默认扫描预算字段。
+
+### 文件名查找后端与过滤（2026-09-13 已实施，票据 #12）
+
+- **后端选择**：`remote_find` 的枚举按可用性取 rg → Python 遍历；**grep 不用于文件名枚举**（仅有 grep 的主机走 `python-walk` 且不调用 grep）。rg 存在时以 argv 列表执行 `rg --files --hidden --no-ignore --no-messages -0 -- <root>`：`--hidden`/`--no-ignore` 关闭 rg 自身的隐藏与忽略默认行为（公共筛选器是唯一裁决者），根路径作为单个参数传递、NUL 分隔增量读取，扫描时限与候选硬顶约束该进程。
+- **结果不依赖后端**：rg 只提供文件条目；目录、符号链接等条目由 Python 骨架遍历（同一筛选规则、跳过普通文件）补齐，两路归并为一条全局按路径排序的流并去重。rg 崩溃或无法启动时本页回退纯 Python 遍历（不能冒充空树），`engine` 如实报本页实际使用的 `ripgrep-files` 或 `python-walk`。骨架遍历惰性产出（每目录排序的 k 路归并），预算中断留下的必然是真排序前缀。
+- **glob 契约保持**：模式继续按 basename 或相对路径 `fnmatch` 匹配，条目仍为 `{path, type, size}`，顺序仍为全局路径排序；`file_list` 既有行为不变（非递归、摘要游标、无 engine 字段）。
+- **过滤对齐 search**：`includeHidden` 默认 true、`respectGitignore` 默认 false，语义与 `remote_search` 完全同一（层级 .gitignore、被忽略父目录不能复活子文件、嵌套否定）；`.git` 内部始终排除，显式指定 `.git` 内路径拒绝 `PATH_NOT_ALLOWED`。
+- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），`scanBudgetSeconds` 约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
+- **游标**：绑定工作区、会话、根路径、模式、隐藏/忽略开关与预算参数；查询变化返回 `STALE_CURSOR`。目录枚举是尽力快照（规格 5.2），翻页期间目录增删不触发检测，需要新查询。
+
+**未实测边界**：上述行为已在 WSL（假 rg 枚举后端 + 真实 Python 遍历）自动化验证；CentOS 7 VM 无 rg，仅实测 `python-walk` 路径。真实 ripgrep 二进制的 `--files` 输出顺序与旗标行为未经自动化覆盖（实现按路径排序后消费，不依赖其输出顺序）；最终内网离线现场验收仍未完成，见 usage/progress。
 
 ### 搜索分页与预算（2026-09-13 已实施，票据 #11）
 

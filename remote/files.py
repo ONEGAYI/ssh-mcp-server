@@ -957,15 +957,17 @@ class FileService:
                     'ruleFiles': [str(path.relative_to(self.workspace)) for path in
                                   [self.workspace / 'AGENTS.md', self.workspace / 'CLAUDE.md'] if path.is_file()],
                     'instructions': 'Read applicable root and nested AGENTS.md/CLAUDE.md with file_read before editing.',
-                    'capabilities': {'interactiveInput': False, 'pty': False, 'reattachTerminal': False,
-                                     'persistentTasks': True, 'streamedRead': True, 'streamedWrite': True,
-                                     'readTokenTtlDays': READ_TOKEN_TTL_SECONDS // 86400,
-                                     'searchEngine': capabilities['searchEngine'],
-                                     'searchBackends': capabilities['searchBackends'],
-                                     'gitignoreSearch': True,
-                                     'searchScanBudgetBytes': DEFAULT_SCAN_BUDGET_BYTES,
-                                     'searchScanBudgetSeconds': DEFAULT_SCAN_BUDGET_SECONDS,
-                                     'rgPath': shutil.which('rg'), 'grepPath': shutil.which('grep')}}
+                  'capabilities': {'interactiveInput': False, 'pty': False, 'reattachTerminal': False,
+                                 'persistentTasks': True, 'streamedRead': True, 'streamedWrite': True,
+                                 'readTokenTtlDays': READ_TOKEN_TTL_SECONDS // 86400,
+                                 'searchEngine': capabilities['searchEngine'],
+                                 'searchBackends': capabilities['searchBackends'],
+                                 'findEngine': capabilities['findEngine'],
+                                 'findBackends': capabilities['findBackends'],
+                                 'gitignoreSearch': True,
+                                 'searchScanBudgetBytes': DEFAULT_SCAN_BUDGET_BYTES,
+                                 'searchScanBudgetSeconds': DEFAULT_SCAN_BUDGET_SECONDS,
+                                 'rgPath': shutil.which('rg'), 'grepPath': shutil.which('grep')}}
         if action in ('file_list', 'file_find', 'file_search'):
             from discovery import discover
             return discover(self, action, request)

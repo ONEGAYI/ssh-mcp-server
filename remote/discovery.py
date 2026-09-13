@@ -1,4 +1,4 @@
-"""Bounded stdlib discovery with pluggable literal-search backends (issue #11).
+"""Bounded stdlib discovery with pluggable literal-search backends (issues #11/#12).
 
 Content search picks ripgrep > GNU grep > a built-in chunked scanner by remote
 availability. All backends share one candidate filter (workspace boundary,
@@ -7,11 +7,18 @@ hidden files, .gitignore) and one line semantics (byte-level literal matching,
 receives line-aligned chunks through a controlled stdin stream, so the engine
 choice cannot change results. Paths never enter shell text; the backend argv
 list passes the pattern as one argument and reads data from stdin.
+
+Filename find (issue #12) enumerates through `rg --files` (implicit filtering
+disabled) plus a Python skeleton walk for directories and other entry kinds,
+or a plain Python walk when rg is absent or fails; grep is never used for
+filename enumeration. Both routes share the candidate filter and produce one
+globally sorted stream, so results do not depend on installed backends.
 """
 import base64
 import bisect
 import fnmatch
 import hashlib
+import heapq
 import json
 import os
 from pathlib import Path
@@ -52,8 +59,12 @@ def available_search_backends():
 
 def search_capabilities():
     names = [name for name, _ in available_search_backends()]
+    find_engine = 'ripgrep-files' if 'ripgrep' in names else 'python-walk'
     return {'searchEngine': names[0] if names else 'python-literal',
-            'searchBackends': names + ['python-literal']}
+            'searchBackends': names + ['python-literal'],
+            'findEngine': find_engine,
+            'findBackends': (['ripgrep-files'] if find_engine == 'ripgrep-files' else [])
+                            + ['python-walk']}
 
 
 # --- gitignore subset -----------------------------------------------------------
@@ -188,6 +199,66 @@ def iter_paths(root, recursive, include_hidden=True, respect_gitignore=False):
 def candidates(service, root, recursive):
     """Legacy enumeration for file_list/file_find (behavior unchanged)."""
     return iter_paths(root, recursive)
+
+
+def stream_paths(root, include_hidden=True, respect_gitignore=False,
+                 skip_files=False, budget=None):
+    """Lazily yield filtered candidates in globally sorted order (issue #12).
+
+    A k-way merge over per-directory sorted listings: the output equals
+    sorted(iter_paths(...), key=str) item for item without materializing the
+    tree, so a budget stop always leaves a true sorted prefix behind and the
+    cursor can resume by position without rescanning results. The exclusion
+    rules match iter_paths exactly (.git prune, hidden toggle, layered
+    .gitignore applied when entering each directory). skip_files drops
+    regular files: used when rg already enumerated the files, so only
+    directories and other entry kinds come from the walk.
+    """
+    if not root.is_dir():
+        yield root
+        return
+    ignore = IgnoreLayers() if respect_gitignore else None
+    heap = []  # (path string, path, is_dir, layer snapshot, relative chain)
+
+    def push_children(directory, relative, layers):
+        try:
+            with os.scandir(str(directory)) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError:
+            return
+        for entry in entries:
+            name = entry.name
+            if name == '.git' or (name.startswith('.') and not include_hidden):
+                continue
+            child = relative + [name]
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if skip_files and not is_dir and entry.is_file(follow_symlinks=False):
+                continue
+            if ignore is not None and ignore.ignored(child, is_dir):
+                continue
+            path = Path(entry.path)
+            heapq.heappush(heap, (str(path), path, is_dir, layers, child))
+
+    if ignore is not None:
+        ignore.enter(root, [])
+        push_children(root, [], list(ignore.layers))
+    else:
+        push_children(root, [], None)
+    while heap:
+        if budget is not None:
+            budget.check_time()
+        _, path, is_dir, layers, relative = heapq.heappop(heap)
+        yield path
+        if is_dir:
+            if ignore is not None:
+                ignore.layers = list(layers)
+                ignore.enter(path, relative)
+                push_children(path, relative, list(ignore.layers))
+            else:
+                push_children(path, relative, None)
 
 
 def display(service, path):
@@ -794,22 +865,259 @@ def file_search(service, root, request):
                           counters['scanned'], budget.consumed, skipped, counters['fallback'])
 
 
+# --- filename find (issue #12) -----------------------------------------------------
+
+def rg_list(binary, root, budget):
+    """Enumerate files through `rg --files` with rg's implicit filtering off.
+
+    The argv list passes the root as one argument (never shell text) and asks
+    for NUL-separated output; --hidden and --no-ignore neutralize rg's own
+    hidden/gitignore defaults so the common filter stays the only authority.
+    Output is drained incrementally with the scan budget as the deadline and
+    the candidate cap as the memory bound. Returns the sorted list of absolute
+    Path objects. Raises BackendFailure on abnormal exits; BudgetStop and the
+    candidate-cap error propagate to the caller.
+    """
+    argv = [binary, '--files', '--hidden', '--no-ignore', '--no-messages', '-0', '--', str(root)]
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, close_fds=True)
+    chunks = []
+    tail = b''
+    found = 0
+    exceeded = False
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        os.set_blocking(process.stdout.fileno(), False)
+        while selector.get_map():
+            budget.check_time()
+            for key, _ in selector.select(0.05):
+                try:
+                    data = os.read(key.fileobj.fileno(), 65536)
+                except (BlockingIOError, OSError):
+                    continue
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                tail += data
+                cut = tail.rfind(b'\0')
+                if cut >= 0:
+                    complete, tail = tail[:cut], tail[cut + 1:]
+                    found += complete.count(b'\0') + 1
+                    chunks.append(complete)
+            if found > MAX_CANDIDATES:
+                exceeded = True
+                break
+        if not exceeded and tail:
+            chunks.append(tail)
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+        returncode = process.wait()
+    if exceeded:
+        raise AgentError('SCAN_LIMIT', 'More than {} entries; narrow the search directory'.format(MAX_CANDIDATES))
+    if returncode > 1 or returncode < 0:
+        raise BackendFailure('rg --files exited with {}'.format(returncode))
+    lines = [line for line in (b'\0'.join(chunks).split(b'\0') if chunks else []) if line]
+    return sorted((Path(line.decode('utf8', 'surrogateescape')) for line in lines), key=str)
+
+
+def filter_rg_lines(root, lines, include_hidden, respect_gitignore):
+    """Apply the shared candidate filter to sorted `rg --files` paths.
+
+    rg enumerated with its implicit filtering disabled, so hidden and ignored
+    entries arrive here; the same rules as iter_paths decide: any .git
+    segment drops the path, dot-prefixed segments drop it without hidden
+    files, and layered .gitignore state advances along the sorted directory
+    chains (a file under an ignored directory stays excluded, a deeper
+    .gitignore can negate a shallower rule).
+    """
+    kept = []
+    ignore = IgnoreLayers() if respect_gitignore else None
+    stack = []  # directory names whose ignore layers are currently loaded
+    if ignore is not None:
+        ignore.enter(root, [])
+    for line in lines:
+        try:
+            parts = line.relative_to(root).parts
+        except ValueError:
+            continue
+        if any(part == '.git' for part in parts):
+            continue
+        if not include_hidden and any(part.startswith('.') for part in parts):
+            continue
+        if ignore is not None:
+            directories = parts[:-1]
+            common = 0
+            while common < len(stack) and common < len(directories) \
+                    and stack[common] == directories[common]:
+                common += 1
+            del stack[common:]
+            ignore.layers = ignore.layers[:common + 1]
+            excluded = False
+            for depth in range(common, len(directories)):
+                chain = directories[:depth + 1]
+                if ignore.ignored(chain, True):
+                    excluded = True
+                    break
+                ignore.enter(root.joinpath(*chain), chain)
+                stack.append(directories[depth])
+            if excluded or ignore.ignored(parts, False):
+                continue
+        kept.append(line)
+    return kept
+
+
+def dedupe_merge(first, second):
+    """Merge two str-sorted path iterables, dropping adjacent duplicates."""
+    previous = None
+    for path in heapq.merge(first, second, key=str):
+        current = str(path)
+        if current == previous:
+            continue
+        previous = current
+        yield path
+
+
+def file_find(service, root, request):
+    """Filename lookup with backend selection, shared filters and budgets.
+
+    Enumeration runs rg --files for the file entries plus a Python skeleton
+    walk for directories and other entry kinds, or a plain Python walk when
+    rg is unavailable or fails; grep is never used for filename enumeration.
+    Both routes feed one globally sorted, filtered stream, so the glob
+    contract (basename or relative-path matching, entry shape) never depends
+    on which backends exist. Pages reuse the search budget machinery: limit
+    plus the 64 KiB page cap, byte budget charged by the path bytes of each
+    candidate newly considered this page, time budget bounding enumeration;
+    partial pages carry a reason and a cursor that resumes after the last
+    considered candidate without rescanning returned entries.
+    """
+    limit = limits(request)
+    pattern = request.get('pattern', '*')
+    if not isinstance(pattern, str) or not pattern or len(pattern) > 4096:
+        raise AgentError('INVALID_PATTERN', 'Provide a nonempty pattern up to 4096 characters')
+    include_hidden = optional_bool(request, 'includeHidden', True)
+    respect_gitignore = optional_bool(request, 'respectGitignore', False)
+    budget_bytes = bounded_number(request, 'scanBudgetBytes', DEFAULT_SCAN_BUDGET_BYTES,
+                                  64 * 1024, 2 * 1024 * 1024 * 1024)
+    budget_seconds = bounded_number(request, 'scanBudgetSeconds', DEFAULT_SCAN_BUDGET_SECONDS, 1, 60)
+    if any(part == '.git' for part in root.parts):
+        raise AgentError('PATH_NOT_ALLOWED', 'The .git directory is always excluded from search')
+
+    binding = [str(service.workspace), service.session, str(root), 'file_find', pattern,
+               include_hidden, respect_gitignore, budget_bytes, budget_seconds]
+    query = hashlib.sha256(json.dumps(binding, sort_keys=True).encode('utf8')).hexdigest()
+    after = None
+    incoming = request.get('cursor')
+    if incoming:
+        try:
+            cursor = json.loads(base64.b64decode(incoming, validate=True).decode('utf8'))
+            if cursor.get('v') != 2 or cursor.get('q') != query:
+                raise ValueError()
+            after = cursor.get('after')
+            if after is not None and not isinstance(after, str):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError):
+            raise AgentError('STALE_CURSOR', 'Query or directory changed; restart the search')
+
+    budget = Budget(budget_bytes, budget_seconds)
+    rg_binary = shutil.which('rg')
+    stream = None
+    engine = 'python-walk'
+    if rg_binary is not None:
+        try:
+            files = filter_rg_lines(root, rg_list(rg_binary, root, budget),
+                                    include_hidden, respect_gitignore)
+            skeleton = stream_paths(root, include_hidden, respect_gitignore,
+                                    skip_files=True, budget=budget)
+            stream = dedupe_merge(files, skeleton)
+            engine = 'ripgrep-files'
+        except (BackendFailure, OSError):
+            # A crashed or unspawnable rg must not look like an empty tree:
+            # fall back to the plain Python walk for this page.
+            stream = None
+    if stream is None:
+        stream = stream_paths(root, include_hidden, respect_gitignore, budget=budget)
+
+    entries = []
+    page_bytes = 0
+    yielded = 0
+    matched_total = 0
+    exhausted = False
+    reason = None
+    last = after
+    try:
+        for path in stream:
+            yielded += 1
+            if yielded > MAX_CANDIDATES:
+                raise AgentError('SCAN_LIMIT',
+                                 'More than {} entries; narrow the search directory'.format(MAX_CANDIDATES))
+            current = str(path)
+            relative = display(service, path)
+            matched = fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative, pattern)
+            if matched:
+                matched_total += 1
+            if after is not None and current <= after:
+                continue
+            # Candidates considered this page charge the enumeration budget by
+            # their path bytes; the overrun check runs after each charge so a
+            # budget smaller than the tree still advances the cursor. Entries
+            # already returned by earlier pages skip without recharging.
+            budget.add(len(current.encode('utf8')))
+            if not matched:
+                budget.ensure_within()
+                last = current
+                continue
+            info = path.lstat()
+            kind = 'symlink' if stat.S_ISLNK(info.st_mode) else \
+                'directory' if stat.S_ISDIR(info.st_mode) else \
+                'file' if stat.S_ISREG(info.st_mode) else 'other'
+            item = {'path': relative, 'type': kind, 'size': info.st_size}
+            size = len(json.dumps(item, ensure_ascii=False).encode('utf8'))
+            if len(entries) >= limit or page_bytes + size > PAGE_OUTPUT_BYTES:
+                reason = 'RESULT_LIMIT'
+                break
+            entries.append(item)
+            page_bytes += size
+            budget.ensure_within()
+            last = current
+        else:
+            exhausted = True
+    except BudgetStop as stop:
+        reason = {'bytes': 'SCAN_BYTE_LIMIT', 'time': 'SCAN_TIME_LIMIT'}[stop.reason]
+    # A stop always leaves a continuable cursor: `after` anchors the resume
+    # point (None restarts the enumeration, e.g. a time stop before any
+    # admission); only a naturally exhausted stream has no next page.
+    cursor = encode_cursor({'v': 2, 'q': query, 'after': last}) if not exhausted else None
+    result = {'entries': entries, 'nextCursor': cursor, 'truncated': cursor is not None,
+              'totalEntries': matched_total if exhausted else None, 'engine': engine}
+    if reason:
+        result['reason'] = reason
+    return result
+
+
 def discover(service, action, request):
     root = service.path(request.get('path', '.'))
     if not root.exists():
         raise AgentError('PATH_NOT_FOUND', 'Search path does not exist')
     if action == 'file_search':
         return file_search(service, root, request)
+    if action == 'file_find':
+        return file_find(service, root, request)
     limit = limits(request)
     pattern = request.get('pattern', '*')
     if not isinstance(pattern, str) or not pattern or len(pattern) > 4096:
         raise AgentError('INVALID_PATTERN', 'Provide a nonempty pattern up to 4096 characters')
-    paths = candidates(service, root, action != 'file_list')
+    paths = candidates(service, root, False)
     entries = []
     for path in paths:
         relative = display(service, path)
-        if action == 'file_find' and not (fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative, pattern)):
-            continue
         info = path.lstat()
         kind = 'symlink' if stat.S_ISLNK(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'file' if stat.S_ISREG(info.st_mode) else 'other'
         entries.append({'path': relative, 'type': kind, 'size': info.st_size})
