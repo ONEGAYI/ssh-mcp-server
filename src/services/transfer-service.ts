@@ -24,15 +24,19 @@
  * accept that identifier. The start/resume budget (budgetMs) bounds one
  * driving call: when it runs out, the bounded progress returns with
  * budgetExhausted=true and a resume hint; nothing about the transfer itself
- * failed. Cancel/acknowledgement are issue #15 and are refused here.
+ * failed. Cancellation (issue #15) confirms the stop -- the remote lock for
+ * uploads, reconciled local evidence for downloads -- before releasing any
+ * uncommitted data, never rolls back a proven publication, and reports
+ * unknown rather than guessing; acknowledgement consumes a terminal result
+ * and is kept apart from the read-only status.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { FileHandle, link, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { FileHandle, link, mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceConfig } from "../config/workspace.js";
-import { RemoteAgentClient, RemoteAgentError } from "./remote-agent-client.js";
+import { RemoteAgentError } from "./remote-agent-client.js";
 import { FileService } from "./file-service.js";
 import { SpaceLedger, workspaceLedgerDirectory } from "./space-ledger.js";
 
@@ -51,6 +55,27 @@ const TRANSFER_TTL_MS = 3 * 24 * 3600 * 1000;
 /** Bounded in-drive retries for one block whose exchange or digest failed
  * transiently; the durable resume path takes over afterwards. */
 const FETCH_ATTEMPTS = 3;
+/** Results an acknowledgement may consume (issue #15). `unknown` is absent by
+ * design: an unverified outcome must never be acknowledged into "consumed". */
+const TERMINAL_TRANSFER_STATES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+
+/** The remote surface this driver needs; satisfied by RemoteAgentClient and by
+ * offline stubs (the recovery hook lists registrations without any network). */
+export interface TransferRemote {
+  exchange<T = Record<string, unknown>>(action: string, input: Buffer, options?: { timeoutMs?: number }): Promise<T>;
+  exchangeBinary(action: string, input: Buffer, options?: { timeoutMs?: number }):
+    Promise<{ control: Record<string, unknown>; payload: Buffer; result: Record<string, unknown> }>;
+}
+
+export interface PendingTransfer {
+  transferId: string;
+  direction: "upload" | "download";
+  path: string;
+  localPath: string;
+  totalBytes: number;
+  state?: string;
+  createdAt: string;
+}
 
 export interface UploadRequest {
   localPath: string;
@@ -147,8 +172,9 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 export class TransferService {
   private readonly directory: string;
   private readonly ledger: SpaceLedger;
+  readonly transferRegistryIssues: Array<{ transferId: string; code: string }> = [];
 
-  constructor(private readonly remote: RemoteAgentClient, private readonly config: WorkspaceConfig,
+  constructor(private readonly remote: TransferRemote, private readonly config: WorkspaceConfig,
     private readonly files: Pick<FileService, "call" | "localPath">) {
     const identityDirectory = join(config.localStateDir, createHash("sha256").update(config.identity).digest("hex").slice(0, 24));
     this.directory = join(identityDirectory, "transfers");
@@ -786,13 +812,6 @@ export class TransferService {
       bytesWritten: record.totalBytes, committedAt: record.completedAt ?? undefined };
   }
 
-  private async failedOutcome(record: LocalTransferRecord): Promise<TransferOutcome> {
-    return { transferId: record.transferId, direction: "download", state: "failed",
-      path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
-      confirmedOffset: record.confirmedOffset ?? 0, blocksFetched: 0,
-      message: record.error ? `${record.error.code}: ${record.error.message}` : "The transfer failed" };
-  }
-
   // --- shared follow-up entry points ------------------------------------------
 
   async resume(sessionId: string, transferId: string, budgetMs?: number): Promise<TransferOutcome> {
@@ -820,6 +839,13 @@ export class TransferService {
         totalBytes: record.totalBytes, confirmedOffset: state.confirmedOffset, blocksSent: 0,
         message: state.error ? `${state.error.code}: ${state.error.message}` : "The transfer failed its final verification" };
     }
+    if (state.state === "cancelled") {
+      // A cancelled transfer never resurrects through resume (issue #15).
+      return { transferId, direction: "upload", state: "cancelled", path: record.remotePath,
+        localPath: record.localPath, totalBytes: record.totalBytes,
+        confirmedOffset: state.confirmedOffset, blocksSent: 0,
+        message: "The transfer was cancelled; register a new transfer instead of resuming" };
+    }
     const handle = await open(record.localPath, "r");
     try {
       return await this.driveUpload(handle, record, sessionId, state.confirmedOffset, Date.now() + budget);
@@ -831,7 +857,7 @@ export class TransferService {
 
   private async resumeDownload(record: LocalTransferRecord, sessionId: string, budget: number): Promise<TransferOutcome> {
     if (record.state === "failed" || record.state === "unknown" || record.state === "cancelled") {
-      return this.failedOutcome(record);
+      return this.stoppedOutcome(record);
     }
     if (record.state === "prepared") {
       throw new RemoteAgentError("INVALID_STATE", "This transfer never started; call the download tool with action=start again with the same target");
@@ -844,7 +870,7 @@ export class TransferService {
     if (state.state === "failed") {
       await this.failLocal(record, state.error?.code ?? "TRANSFER_FAILED",
         state.error?.message ?? "The sender failed the transfer");
-      return this.failedOutcome(record);
+      return this.stoppedOutcome(record);
     }
     await this.healDownload(record);
     await this.saveRecord(record);
@@ -867,5 +893,190 @@ export class TransferService {
       registeredAt: record.registeredAt, expiresAt: record.expiresAt,
       completedAt: record.completedAt ?? undefined,
       error: record.error ?? undefined, remoteState: remote?.state };
+  }
+
+  // --- cancellation and acknowledgement (issue #15) -----------------------------
+
+  /** Stop a transfer and release its uncommitted data. A request is not the
+   * proof: the remote per-transfer lock (uploads) or the reconciled local
+   * evidence (downloads) confirms the stop before anything is deleted, and a
+   * publication the evidence proves happened is never rolled back. */
+  async cancel(sessionId: string, transferId: string): Promise<TransferOutcome> {
+    const record = await this.localRecord(transferId, sessionId);
+    return record.direction === "upload"
+      ? this.cancelUpload(record, sessionId)
+      : this.cancelDownload(record, sessionId);
+  }
+
+  /** Uploads keep the received data remotely; the remote record and its lock
+   * are the authority for whether the transfer actually stopped. */
+  private async cancelUpload(record: LocalTransferRecord, sessionId: string): Promise<TransferOutcome> {
+    const remote = await this.raw<{ state: string; confirmedOffset?: number; sha256?: string }>(
+      "transfer_cancel", sessionId, { transferId: record.transferId });
+    return { transferId: record.transferId, direction: "upload", state: remote.state,
+      path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
+      confirmedOffset: remote.confirmedOffset ?? 0, blocksSent: 0,
+      sha256: remote.state === "completed" ? (remote.sha256 ?? record.totalSha256) : undefined,
+      message: remote.state === "completed"
+        ? "The transfer had already committed; the published target is not rolled back"
+        : remote.state === "cancelled" ? "Transfer cancelled and its uncommitted remote data released" : undefined };
+  }
+
+  /** Downloads keep the receiver data locally; this side reconciles its own
+   * commit window by evidence before releasing anything. */
+  private async cancelDownload(record: LocalTransferRecord, sessionId: string): Promise<TransferOutcome> {
+    const state = record.state ?? "prepared";
+    if (state === "completed") return this.completedOutcome(record);
+    if (state === "failed" || state === "cancelled") return this.stoppedOutcome(record);
+    if (state === "unknown") {
+      throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN",
+        "The outcome is not yet verified; inspect the target manually before cancelling");
+    }
+    if (state === "committing") return this.cancelCommittingDownload(record, sessionId);
+    // prepared / transferring / verifying / interrupted: stop the sender first,
+    // then release this side's uncommitted receiver data.
+    await this.raw("transfer_cancel", sessionId, { transferId: record.transferId });
+    await this.releaseReceiverData(record);
+    record.state = "cancelled";
+    record.error = { code: "CANCELLED", message: "Cancelled by request" };
+    record.completedAt = Date.now();
+    await this.saveRecord(record);
+    return this.stoppedOutcome(record);
+  }
+
+  /** The commit window is resolved by evidence, never by the cancel request:
+   * a receipt or an intent-matching target completes the publication, a still
+   * present temp proves the publish never happened, anything else stays
+   * unknown and untouched. */
+  private async cancelCommittingDownload(record: LocalTransferRecord, sessionId: string): Promise<TransferOutcome> {
+    const directory = join(this.directory, record.transferId);
+    const receipt = await readFile(join(directory, "receipt.json"), "utf8")
+      .then(text => JSON.parse(text) as { committedAt: number })
+      .catch(error => { if (!isMissing(error)) throw error; return null; });
+    if (receipt) {
+      record.state = "completed";
+      record.completedAt = receipt.committedAt;
+      if (record.resourceId) {
+        await this.ledger.release(record.resourceId).catch(() => undefined);
+        record.resourceId = null;
+      }
+      await this.saveRecord(record);
+      return this.completedOutcome(record);
+    }
+    const intent = JSON.parse(await readFile(join(directory, "intent.json"), "utf8")) as {
+      tempIdentity: string; totalSha256: string; totalBytes: number };
+    const info = await stat(record.localPath).catch(error => { if (isMissing(error)) return null; throw error; });
+    let matches = !!info && `${info!.dev}:${info!.ino}` === intent.tempIdentity && info!.size === intent.totalBytes;
+    if (matches) {
+      const target = await open(record.localPath, "r");
+      try { matches = await this.digest(target, info!.size) === intent.totalSha256; }
+      finally { await target.close(); }
+    }
+    if (matches) {
+      // The rename already happened before the cancel arrived: the publication
+      // stands and the receipt trail completes, exactly like a lost response.
+      const completed = { bytes: intent.totalBytes, committedAt: Date.now(), targetIdentity: intent.tempIdentity };
+      await atomicJson(join(directory, "receipt.json"), { schemaVersion: 1, ...completed });
+      record.state = "completed";
+      record.completedAt = completed.committedAt;
+      if (record.resourceId) {
+        await this.ledger.release(record.resourceId).catch(() => undefined);
+        record.resourceId = null;
+      }
+      await this.saveRecord(record);
+      return this.completedOutcome(record);
+    }
+    const tempExists = await stat(record.tempPath!).then(() => true, error => {
+      if (isMissing(error)) return false;
+      throw error;
+    });
+    if (!tempExists) {
+      throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN",
+        "Cancel raced the commit window without evidence of the outcome; inspect the target manually");
+    }
+    // The publish never took effect and the temp is still the intent's data:
+    // release it and record the stop.
+    await this.raw("transfer_cancel", sessionId, { transferId: record.transferId });
+    await this.releaseReceiverData(record);
+    record.state = "cancelled";
+    record.error = { code: "CANCELLED", message: "Cancelled by request before the pending publication" };
+    record.completedAt = Date.now();
+    await this.saveRecord(record);
+    return this.stoppedOutcome(record);
+  }
+
+  /** Delete the uncommitted receiver temp, its manifest and ledger entry. */
+  private async releaseReceiverData(record: LocalTransferRecord): Promise<void> {
+    await this.resetLocalTemp(record);
+    await unlink(join(this.directory, record.transferId, "chunks.jsonl"))
+      .catch(error => { if (!isMissing(error)) throw error; });
+  }
+
+  /** The observed outcome of a transfer that is no longer running. */
+  private stoppedOutcome(record: LocalTransferRecord): TransferOutcome {
+    return { transferId: record.transferId, direction: "download", state: record.state ?? "failed",
+      path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
+      confirmedOffset: record.confirmedOffset ?? 0, blocksFetched: 0,
+      message: record.error ? `${record.error.code}: ${record.error.message}` : `The transfer stopped in state ${record.state}` };
+  }
+
+  /** Consume a terminal result (issue #15). Kept separate from status, which
+   * stays a read-only observation; an unknown outcome is never acknowledged. */
+  async acknowledge(sessionId: string, transferId: string): Promise<{ acknowledged: boolean; transferId: string; state: string }> {
+    const record = await this.localRecord(transferId, sessionId);
+    const state = record.direction === "download"
+      ? record.state ?? "prepared"
+      : (await this.raw<{ state: string }>("transfer_status", sessionId, { transferId })).state;
+    if (state === "unknown") {
+      throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN", "An unverified outcome cannot be acknowledged; inspect it first");
+    }
+    if (!TERMINAL_TRANSFER_STATES.has(state)) {
+      throw new RemoteAgentError("TRANSFER_NOT_FINISHED", "Only a terminal transfer result can be acknowledged");
+    }
+    await this.raw("transfer_ack", sessionId, { transferId });
+    await atomicJson(join(this.directory, transferId, "ack.json"),
+      { schemaVersion: 1, transferId, state, acknowledgedAt: new Date().toISOString() });
+    return { acknowledged: true, transferId, state };
+  }
+
+  /** This conversation's registrations whose results have not been
+   * acknowledged. Local read only: safe from the recovery hook. */
+  async pending(sessionId: string): Promise<PendingTransfer[]> {
+    this.transferRegistryIssues.length = 0;
+    let entries;
+    try { entries = await readdir(this.directory, { withFileTypes: true }); }
+    catch (error) { if (isMissing(error)) return []; throw error; }
+    const pending: PendingTransfer[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
+      let record: LocalTransferRecord;
+      try { record = await this.localRecord(entry.name, sessionId); }
+      catch (error) {
+        const code = (error as RemoteAgentError).code;
+        // Another session's or workspace's registration is an ordinary
+        // exclusion, not a defect; anything else is a registry issue.
+        if (code === "TRANSFER_SCOPE_MISMATCH") continue;
+        this.transferRegistryIssues.push({ transferId: entry.name, code: code ?? "REGISTRY_CORRUPT" });
+        continue;
+      }
+      try {
+        const ack = JSON.parse(await readFile(join(this.directory, entry.name, "ack.json"), "utf8"));
+        if (ack.transferId !== entry.name) throw new RemoteAgentError("REGISTRY_CORRUPT", "Invalid transfer acknowledgement");
+        continue; // already consumed
+      } catch (error) {
+        if (!isMissing(error) && (error as RemoteAgentError).code === "REGISTRY_CORRUPT") {
+          // No valid acknowledgement exists: it stays pending, with the issue noted.
+          this.transferRegistryIssues.push({ transferId: entry.name, code: "INVALID_ACKNOWLEDGEMENT" });
+        } else if (!isMissing(error) && (error as NodeJS.ErrnoException).code !== "ENOENT") {
+          this.transferRegistryIssues.push({ transferId: entry.name, code: "REGISTRY_CORRUPT" });
+          continue;
+        }
+      }
+      pending.push({ transferId: entry.name, direction: record.direction,
+        path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
+        state: record.direction === "download" ? record.state : undefined,
+        createdAt: record.createdAt });
+    }
+    return pending.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 }
