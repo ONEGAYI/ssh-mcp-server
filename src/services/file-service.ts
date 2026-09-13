@@ -1,23 +1,10 @@
-import { FileHandle, link, lstat, open, realpath, rename, unlink } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WorkspaceConfig } from "../config/workspace.js";
 import { RemoteAgentClient, RemoteAgentError } from "./remote-agent-client.js";
-import { SpaceLedger, workspaceLedgerDirectory } from "./space-ledger.js";
-
-interface ReadResult {
-  data: string; version: string; nextOffset: number | null; readToken: string; size: number;
-}
 
 export class FileService {
-  private readonly ledger: SpaceLedger;
-
-  constructor(private readonly remote: Pick<RemoteAgentClient, "call">, private readonly config: WorkspaceConfig) {
-    // Issue #8: one local space ledger per workspace. Since #18 the limit comes
-    // from the resolved unified policy (limits.localWorkspaceBytes, default 10 GiB).
-    this.ledger = new SpaceLedger(workspaceLedgerDirectory(config.localStateDir, config.identity),
-      config.policy.limits.localWorkspaceBytes);
-  }
+  constructor(private readonly remote: Pick<RemoteAgentClient, "call">, private readonly config: WorkspaceConfig) {}
 
   call(action: string, sessionId: string, request: Record<string, unknown> = {}) {
     if (!sessionId || sessionId.length > 256 || sessionId.includes("\0")) throw new RemoteAgentError("INVALID_SESSION", "Use the actual session identifier supplied by the recovery hook");
@@ -27,14 +14,16 @@ export class FileService {
   }
 
   /** Resolve and boundary-check a local transfer path (shared with the
-   * transfer driver since issue #13; the old buffered upload path is gone). */
+   * transfer driver since issue #13; the old buffered upload path is gone,
+   * and since issue #14 downloads are transactional transfers too). */
   async localPath(value: string, writing: boolean): Promise<string> {
     const absolute = resolve(this.config.localRoot, value);
+    const parent = dirname(absolute);
     let canonical: string;
     try { canonical = await realpath(absolute); }
     catch (error) {
       if (!writing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      canonical = join(await realpath(dirname(absolute)), relative(dirname(absolute), absolute));
+      canonical = join(await realpath(parent), relative(parent, absolute));
     }
     const roots = [this.config.localRoot, ...(this.config.sshConfigs[this.config.connectionName].allowedLocalPaths ?? [])];
     for (const root of roots) {
@@ -49,56 +38,5 @@ export class FileService {
       }
     }
     throw new RemoteAgentError("PATH_NOT_ALLOWED", "Local transfer path is outside the workspace and configured allowed roots");
-  }
-
-  async download(sessionId: string, request: { localPath: string; path: string; overwrite?: boolean }) {
-    const path = await this.localPath(request.localPath, true);
-    const temporary = join(dirname(path), `.ssh-mcp-download-${randomUUID()}`);
-    let offset = 0, version: string | undefined;
-    // Issue #8: the temp file is registered (and quota-checked) before it can
-    // exist on disk; a crash therefore never leaves an untracked temp behind.
-    let resourceId: string | undefined;
-    let handle: FileHandle | undefined;
-    try {
-      for (;;) {
-        const result = await this.call("file_read", sessionId, { path: request.path, encoding: "base64", offset, maxBytes: 262144, grantRead: false }) as unknown as ReadResult;
-        if (version !== undefined && result.version !== version) throw new RemoteAgentError("FILE_CONFLICT", "Remote download source changed between chunks");
-        version = result.version;
-        const data = Buffer.from(result.data, "base64");
-        if (offset + data.length > 16 * 1024 * 1024) throw new RemoteAgentError("FILE_TOO_LARGE", "Download exceeds 16 MiB");
-        if (resourceId === undefined) {
-          resourceId = (await this.ledger.register(temporary, result.size, "local-download")).resourceId;
-          handle = await open(temporary, "wx", 0o600);
-        }
-        try { if (handle) await handle.writeFile(data); }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
-            throw new RemoteAgentError("STORAGE_FULL", "Local filesystem reported ENOSPC while downloading");
-          }
-          throw error;
-        }
-        offset += data.length;
-        if (result.nextOffset === null) break;
-        if (result.nextOffset !== offset || !data.length) throw new RemoteAgentError("INVALID_HELPER_RESPONSE", "Invalid download cursor");
-      }
-      if (!handle) throw new RemoteAgentError("INVALID_HELPER_RESPONSE", "Download delivered no chunks");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      if (await this.localPath(request.localPath, true) !== path) throw new RemoteAgentError("FILE_CONFLICT", "Local destination changed");
-      if (request.overwrite) await rename(temporary, path);
-      else {
-        try { await link(temporary, path); }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new RemoteAgentError("FILE_CONFLICT", "Local download target already exists");
-          throw error;
-        }
-      }
-      return { localPath: path, remotePath: request.path, bytesWritten: offset, version };
-    } finally {
-      if (handle) await handle.close().catch(() => undefined);
-      await unlink(temporary).catch(error => { if (error.code !== "ENOENT") throw error; });
-      if (resourceId !== undefined) await this.ledger.release(resourceId).catch(() => undefined);
-    }
   }
 }

@@ -458,6 +458,20 @@ def main():
         result = block_exchange(root, sys.stdin.buffer)
         emit({'ok': True, 'result': result})
         return
+    if args.action == 'transfer_fetch':
+        # Download fetches invert the framing onto stdout: a JSON control
+        # line, exactly `size` raw bytes, a newline, then the regular
+        # envelope -- so binary blocks never ride inside base64 JSON. An
+        # error keeps the envelope-only shape.
+        from transfer import fetch_exchange
+        control, payload, result = fetch_exchange(root, sys.stdin.buffer)
+        sys.stdout.buffer.write(json.dumps(control, ensure_ascii=True, sort_keys=True).encode('utf8'))
+        sys.stdout.buffer.write(b'\n')
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.write(b'\n')
+        sys.stdout.buffer.flush()
+        emit({'ok': True, 'result': result})
+        return
     request = json.loads(sys.stdin.buffer.read().decode('utf8'))
     if not isinstance(request, dict):
         raise AgentError('INVALID_REQUEST', 'Request must be an object')

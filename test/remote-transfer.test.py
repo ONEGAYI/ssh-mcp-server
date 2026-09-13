@@ -1,6 +1,6 @@
-"""Ticket #13 behavior tests: resumable verified upload transfers, driven
-through the helper's public CLI (register/start/block/verify/commit/status/
-resume). Runs on Linux (fcntl) with Python 3.6+."""
+"""Ticket #13/#14 behavior tests: resumable verified transfers in both
+directions, driven through the helper's public CLI (register/start/block/
+fetch/verify/commit/status/resume). Runs on Linux (fcntl) with Python 3.6+."""
 import base64
 import hashlib
 import json
@@ -98,6 +98,65 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertTrue(committed['ok'], committed)
         return transfer_id, committed['result']
 
+    # --- download direction helpers (issue #14) --------------------------------
+
+    def dregister(self, data=None, source='source.bin', chunk=CHUNK, **overrides):
+        """Register a download transfer over a fixture source file."""
+        if data is not None:
+            (self.work / source).write_bytes(data)
+        request = {'protocol': 2, 'direction': 'download', 'sourcePath': source,
+                   'chunkSize': chunk, 'overwrite': False, 'create': False,
+                   'targetPath': 'C:/local/destination.bin'}
+        request.update(overrides)
+        return self.call('transfer_register', request)
+
+    def dstart(self, transfer_id, source_version=None):
+        if source_version is None:
+            source_version = self.record(transfer_id)['sourceVersion']
+        return self.call('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                            'sourceVersion': source_version})
+
+    def fetch(self, transfer_id, index, offset, size, session='session-one'):
+        """One framed fetch exchange; returns the raw stdout bytes."""
+        control = json.dumps({'transferId': transfer_id, 'index': index, 'offset': offset,
+                              'size': size, 'sessionId': session})
+        run = subprocess.run([sys.executable, str(HELPER), '--root', str(self.state), 'transfer_fetch'],
+                             input=(control + '\n').encode('utf8'), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout
+
+    def parse_fetch(self, stdout):
+        """Split the framed response: control line, exact bytes, envelope.
+
+        Error paths carry no frame: the whole stdout is the envelope alone.
+        """
+        if stdout.startswith(b'SSH_MCP_V1 '):
+            envelope = json.loads(base64.b64decode(stdout.split(b' ', 1)[1].strip()))
+            return None, None, envelope
+        self.assertTrue(stdout.startswith(b'{'), stdout[:80])
+        head, remainder = stdout.split(b'\n', 1)
+        control = json.loads(head.decode('utf8'))
+        self.assertIn('size', control)
+        payload = remainder[:control['size']]
+        rest = remainder[control['size']:]
+        self.assertTrue(rest.startswith(b'\n'), 'payload must be followed by a newline')
+        envelope = json.loads(base64.b64decode(rest[1:].split(b' ', 1)[1].strip()))
+        return control, payload, envelope
+
+    def fetch_block(self, transfer_id, index, offset, data, session='session-one'):
+        stdout = self.fetch(transfer_id, index, offset, len(data), session=session)
+        return self.parse_fetch(stdout)
+
+    def drain(self, transfer_id, data, chunk=CHUNK):
+        """Fetch every remaining block; returns the receiver-side digest."""
+        for offset in range(0, len(data), chunk):
+            control, payload, envelope = self.fetch_block(
+                transfer_id, offset // chunk, offset, data[offset:offset + chunk])
+            self.assertTrue(envelope['ok'], envelope)
+            self.assertEqual(payload, data[offset:offset + chunk])
+        return hashlib.sha256(data).hexdigest()
+
     # --- registration and the register-then-execute protocol --------------------
 
     def test_register_persists_prepared_record_and_limits_active_transfers(self):
@@ -146,7 +205,7 @@ class RemoteTransferTest(unittest.TestCase):
     def test_register_rejects_invalid_parameters_and_targets(self):
         data = b'x' * 10
         cases = [
-            ({'direction': 'download'}, 'INVALID_REQUEST'),
+            ({'direction': 'sideways'}, 'INVALID_REQUEST'),
             ({'chunkSize': 1024}, 'INVALID_REQUEST'),
             ({'chunkSize': 'big'}, 'INVALID_REQUEST'),
             ({'totalBytes': 11}, 'INVALID_REQUEST'),
@@ -651,6 +710,300 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertEqual(committed['bytesWritten'], 0)
         self.assertEqual(committed['sha256'], hashlib.sha256(b'').hexdigest())
         self.assertEqual((self.work / 'target.bin').read_bytes(), b'')
+
+    # --- download direction: registration (issue #14) ---------------------------
+
+    def test_download_register_digests_the_source_and_binds_its_version(self):
+        data = os.urandom(CHUNK * 2 + 33)
+        registration = self.dregister(data=data, chunk=CHUNK)
+        self.assertTrue(registration['ok'], registration)
+        result = registration['result']
+        self.assertEqual(result['state'], 'prepared')
+        self.assertEqual(result['direction'], 'download')
+        self.assertEqual(result['totalBytes'], len(data))
+        self.assertEqual(result['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertTrue(result['sourceVersion'].startswith('m1-'))
+        self.assertTrue(result['sourcePath'].endswith('source.bin'))
+        self.assertEqual(result['confirmedOffset'], 0)
+        record = self.record(result['transferId'])
+        self.assertEqual(record['state'], 'prepared')
+        self.assertEqual(record['sourceVersion'], result['sourceVersion'])
+        self.assertIsNone(record['tempPath'])
+        self.assertIsNone(record['resourceId'])
+        # The sender materializes nothing: no temp file, no ledger resource.
+        self.assertEqual(list(self.work.glob('.ssh-mcp-upload-*')), [])
+        ledger = json.loads((self.state / 'ledger' / 'ledger.json').read_text()) \
+            if (self.state / 'ledger' / 'ledger.json').exists() else {'resources': {}}
+        self.assertEqual(ledger['resources'], {})
+
+    def test_download_register_validates_parameters_and_sources(self):
+        (self.work / 'source.bin').write_bytes(b'payload')
+        cases = [
+            ({'direction': 'sideways'}, 'INVALID_REQUEST'),
+            ({'totalBytes': 7}, 'INVALID_REQUEST'),
+            ({'totalSha256': hashlib.sha256(b'payload').hexdigest()}, 'INVALID_REQUEST'),
+            ({'sourceIdentity': {'size': 7, 'mtimeMs': 1.0}}, 'INVALID_REQUEST'),
+            ({'sourcePath': 'missing.bin'}, 'PATH_NOT_FOUND'),
+            ({'sourcePath': '../outside'}, 'PATH_NOT_ALLOWED'),
+            ({'sourcePath': None}, 'INVALID_PATH'),
+            ({'targetPath': None}, 'INVALID_REQUEST'),
+            ({'overwrite': True}, 'INVALID_REQUEST'),
+            ({'expectedVersion': 'l1-any'}, 'INVALID_REQUEST'),
+            ({'create': True, 'overwrite': True, 'expectedVersion': 'l1-any'}, 'INVALID_REQUEST'),
+        ]
+        for overrides, code in cases:
+            response = self.dregister(**overrides)
+            self.assertEqual(response['ok'], False, overrides)
+            self.assertEqual(response['error']['code'], code, overrides)
+        missing_protocol = self.call('transfer_register', {
+            'direction': 'download', 'sourcePath': 'source.bin', 'chunkSize': CHUNK,
+            'targetPath': 'C:/local/destination.bin'})
+        self.assertEqual(missing_protocol['error']['code'], 'INVALID_PROTOCOL')
+
+    def test_download_register_refuses_a_source_that_moves_under_it(self):
+        data = b'unstable source'
+        (self.work / 'source.bin').write_bytes(data)
+        # The stability double-check around the streamed digest runs inside the
+        # helper process, so this exercises the module directly: the source
+        # mutates right after the digest completes and the registration must
+        # refuse to anchor a digest that no longer describes the file.
+        sys.path.insert(0, str(HELPER.parent))
+        import transfer as transfer_module
+        from common import AgentError
+        self.state.mkdir(mode=0o700, parents=True, exist_ok=True)  # main() prepares the state root
+        request = {'protocol': 2, 'direction': 'download', 'sourcePath': 'source.bin',
+                   'chunkSize': CHUNK, 'overwrite': False, 'create': False,
+                   'targetPath': 'C:/local/destination.bin',
+                   'workspaceRoot': str(self.work), 'sessionId': 'session-one'}
+        original = transfer_module._observe_source
+        def mutating_observe(path):
+            result = original(path)
+            with open(str(path), 'r+b') as stream:  # same size, new content: ctime/mtime move
+                stream.write(b'X')
+            return result
+        transfer_module._observe_source = mutating_observe
+        try:
+            with self.assertRaises(AgentError) as caught:
+                transfer_module.register(self.state, request)
+        finally:
+            transfer_module._observe_source = original
+        self.assertEqual(caught.exception.code, 'FILE_CONFLICT')
+        # Nothing was anchored: no transfer directory exists.
+        self.assertEqual(list((self.state / 'transfers').iterdir()), [])
+
+    def test_download_shares_the_active_transfer_pool_with_uploads(self):
+        upload_id = self.register(b'upload payload')['result']['transferId']
+        download = self.dregister(data=b'download payload')
+        self.assertTrue(download['ok'], download)
+        download_id = download['result']['transferId']
+        # Two active transfers (one per direction): the pool is full.
+        third = self.dregister(data=b'third', source='other.bin')
+        self.assertEqual(third['error']['code'], 'TRANSFER_LIMIT_REACHED')
+        # Completing the download frees the shared slot again.
+        self.dstart(download_id)
+        self.drain(download_id, b'download payload')
+        self.call('transfer_verify', {'transferId': download_id,
+                                      'sha256': hashlib.sha256(b'download payload').hexdigest()})
+        committed = self.call('transfer_commit', {'transferId': download_id})
+        self.assertEqual(committed['result']['state'], 'completed')
+        fourth = self.dregister(data=b'fourth', source='other.bin')
+        self.assertTrue(fourth['ok'], fourth)
+
+    # --- download direction: start and source stability -------------------------
+
+    def test_download_start_is_idempotent_and_refuses_changed_sources(self):
+        data = b'stable download source'
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        first = self.dstart(transfer_id)
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(first['result']['state'], 'transferring')
+        again = self.dstart(transfer_id)
+        self.assertEqual(again['result']['state'], 'transferring')
+        # An echoed source version that no longer matches refuses the transfer.
+        stale_echo = self.call('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                                  'sourceVersion': 'm1-not-the-version'})
+        self.assertEqual(stale_echo['error']['code'], 'TRANSFER_SOURCE_CHANGED')
+        # A live source mutation (same size, new mtime) is equally refused.
+        os.utime(str(self.work / 'source.bin'), (1.0, 1.0))
+        changed = self.dstart(transfer_id)
+        self.assertEqual(changed['error']['code'], 'TRANSFER_SOURCE_CHANGED')
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceVersion': self.record(transfer_id)['sourceVersion']})
+        self.assertEqual(resumed['error']['code'], 'TRANSFER_SOURCE_CHANGED')
+
+    def test_download_start_requires_protocol_and_valid_echo(self):
+        transfer_id = self.dregister(data=b'x')['result']['transferId']
+        bare = self.call('transfer_start', {'transferId': transfer_id})
+        self.assertEqual(bare['error']['code'], 'INVALID_PROTOCOL')
+        invalid = self.call('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                               'sourceVersion': 42})
+        self.assertEqual(invalid['error']['code'], 'INVALID_REQUEST')
+        missing = self.call('transfer_start', {'protocol': 2, 'transferId': transfer_id})
+        self.assertEqual(missing['error']['code'], 'INVALID_REQUEST')
+
+    def test_download_resume_refuses_prepared_and_reports_terminal_states(self):
+        transfer_id = self.dregister(data=b'not yet started')['result']['transferId']
+        refused = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceVersion': self.record(transfer_id)['sourceVersion']})
+        self.assertEqual(refused['error']['code'], 'INVALID_STATE')
+        self.dstart(transfer_id)
+        accepted = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                 'sourceVersion': self.record(transfer_id)['sourceVersion']})
+        self.assertTrue(accepted['ok'], accepted)
+        self.assertEqual(accepted['result']['state'], 'transferring')
+
+    # --- download direction: framed block fetch ---------------------------------
+
+    def test_download_fetch_streams_framed_raw_blocks(self):
+        data = b'\x00\xff\nbinary\r\npayload' * 6000  # spans several chunks with hostile bytes
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        control, payload, envelope = self.fetch_block(transfer_id, 0, 0, data[:CHUNK])
+        self.assertEqual(control['transferId'], transfer_id)
+        self.assertEqual(control['index'], 0)
+        self.assertEqual(control['offset'], 0)
+        self.assertEqual(control['size'], CHUNK)
+        self.assertEqual(control['sha256'], hashlib.sha256(data[:CHUNK]).hexdigest())
+        self.assertEqual(payload, data[:CHUNK])
+        self.assertTrue(envelope['ok'], envelope)
+        self.assertEqual(envelope['result']['confirmedOffset'], CHUNK)
+        self.assertFalse(envelope['result']['complete'])
+        digest = self.drain(transfer_id, data)
+        self.assertEqual(self.record(transfer_id)['confirmedOffset'], len(data))
+        self.assertEqual(digest, hashlib.sha256(data).hexdigest())
+
+    def test_download_fetch_rejects_unknown_scope_state_and_order(self):
+        data = b'z' * (CHUNK * 2 + 10)
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        unknown = self.parse_fetch(self.fetch('f' * 32, 0, 0, 16))[2]
+        self.assertEqual(unknown['ok'], False)
+        self.assertEqual(unknown['error']['code'], 'REQUEST_EXPIRED_OR_UNKNOWN')
+        wrong_session = self.parse_fetch(self.fetch(transfer_id, 0, 0, CHUNK, session='other'))[2]
+        self.assertEqual(wrong_session['error']['code'], 'TRANSFER_SCOPE_MISMATCH')
+        not_started = self.parse_fetch(self.fetch(transfer_id, 0, 0, CHUNK))[2]
+        self.assertEqual(not_started['error']['code'], 'INVALID_STATE')
+        self.dstart(transfer_id)
+        out_of_order = self.parse_fetch(self.fetch(transfer_id, 1, CHUNK, CHUNK))[2]
+        self.assertEqual(out_of_order['error']['code'], 'INVALID_REQUEST')
+        misaligned = self.parse_fetch(self.fetch(transfer_id, 0, 10, CHUNK - 10))[2]
+        self.assertEqual(misaligned['error']['code'], 'INVALID_REQUEST')
+        for size in (0, CHUNK + 1):
+            bad_size = self.parse_fetch(self.fetch(transfer_id, 0, 0, size))[2]
+            self.assertEqual(bad_size['error']['code'], 'INVALID_REQUEST', size)
+        overrun = self.parse_fetch(self.fetch(transfer_id, 2, CHUNK * 2, CHUNK))[2]
+        self.assertEqual(overrun['error']['code'], 'INVALID_REQUEST')
+        # An upload transfer is not fetchable.
+        upload_id = self.register(b'upload')['result']['transferId']
+        wrong_direction = self.parse_fetch(self.fetch(upload_id, 0, 0, 6))[2]
+        self.assertEqual(wrong_direction['error']['code'], 'INVALID_REQUEST')
+
+    def test_download_fetch_allows_rewinding_to_a_served_boundary(self):
+        data = b'r' * (CHUNK * 3)
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        self.fetch_block(transfer_id, 0, 0, data[:CHUNK])
+        self.fetch_block(transfer_id, 1, CHUNK, data[CHUNK:CHUNK * 2])
+        # The response for block 1 was lost after the sender served it: the
+        # receiver re-asserts its confirmed boundary and the sender rewinds.
+        # The receiver may lag by any number of served blocks, so rewinding to
+        # block 0 (two blocks back) is equally legitimate.
+        control, payload, envelope = self.fetch_block(transfer_id, 0, 0, data[:CHUNK])
+        self.assertTrue(envelope['ok'], envelope)
+        self.assertEqual(envelope['result']['confirmedOffset'], CHUNK)
+        self.assertEqual(self.record(transfer_id)['confirmedOffset'], CHUNK)
+        # Serving continues in order from the rewound boundary.
+        digest = self.drain(transfer_id, data, chunk=CHUNK)
+        self.assertEqual(self.record(transfer_id)['confirmedOffset'], len(data))
+        self.assertEqual(digest, hashlib.sha256(data).hexdigest())
+        # A misaligned pair (index and offset disagree) is still refused.
+        misaligned = self.parse_fetch(self.fetch(transfer_id, 0, 4, 16))[2]
+        self.assertEqual(misaligned['error']['code'], 'INVALID_REQUEST')
+
+    def test_download_fetch_fails_the_transfer_when_the_source_changes(self):
+        data = b'v' * (CHUNK * 2)
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        self.fetch_block(transfer_id, 0, 0, data[:CHUNK])
+        (self.work / 'source.bin').write_bytes(b'X' * (CHUNK * 2))  # new content, same size
+        response = self.parse_fetch(self.fetch(transfer_id, 1, CHUNK, CHUNK))[2]
+        self.assertEqual(response['error']['code'], 'TRANSFER_SOURCE_CHANGED')
+        record = self.record(transfer_id)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['error']['code'], 'TRANSFER_SOURCE_CHANGED')
+        # The failed transfer neither serves blocks nor resurrects via resume.
+        after = self.parse_fetch(self.fetch(transfer_id, 1, CHUNK, CHUNK))[2]
+        self.assertEqual(after['error']['code'], 'INVALID_STATE')
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceVersion': self.record(transfer_id)['sourceVersion']})
+        self.assertEqual(resumed['result']['state'], 'failed')
+
+    # --- download direction: verify and commit ----------------------------------
+
+    def test_download_verify_compares_the_asserted_receiver_digest(self):
+        data = b'd' * (CHUNK + 5)
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        early = self.call('transfer_verify', {'transferId': transfer_id,
+                                              'sha256': hashlib.sha256(data).hexdigest()})
+        self.assertEqual(early['error']['code'], 'INVALID_STATE')
+        self.drain(transfer_id, data)
+        bad_digest = hashlib.sha256(b'other content').hexdigest()
+        mismatch = self.call('transfer_verify', {'transferId': transfer_id, 'sha256': bad_digest})
+        self.assertEqual(mismatch['error']['code'], 'VERIFY_MISMATCH')
+        self.assertEqual(self.record(transfer_id)['state'], 'failed')
+        # A fresh transfer verifies against the sender's register-time digest.
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        self.drain(transfer_id, data)
+        invalid = self.call('transfer_verify', {'transferId': transfer_id, 'sha256': 'zz'})
+        self.assertEqual(invalid['error']['code'], 'INVALID_REQUEST')
+        verified = self.call('transfer_verify', {'transferId': transfer_id,
+                                                 'sha256': hashlib.sha256(data).hexdigest()})
+        self.assertTrue(verified['ok'], verified)
+        self.assertEqual(verified['result']['state'], 'verifying')
+
+    def test_download_commit_records_completion_idempotently(self):
+        data = b'commit me'
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        premature = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(premature['error']['code'], 'INVALID_STATE')
+        self.dstart(transfer_id)
+        self.drain(transfer_id, data)
+        self.call('transfer_verify', {'transferId': transfer_id,
+                                      'sha256': hashlib.sha256(data).hexdigest()})
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual(committed['result']['state'], 'completed')
+        self.assertEqual(committed['result']['bytesWritten'], len(data))
+        self.assertEqual(committed['result']['sha256'], hashlib.sha256(data).hexdigest())
+        receipt = json.loads((self.state / 'transfers' / transfer_id / 'receipt.json').read_text())
+        self.assertEqual(receipt['bytes'], len(data))
+        again = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(again['ok'], again)
+        self.assertEqual(again['result']['state'], 'completed')
+
+    def test_download_status_reports_the_sender_view_without_renewal(self):
+        data = b'status probe download'
+        transfer_id = self.dregister(data=data)['result']['transferId']
+        self.dstart(transfer_id)
+        before = self.record(transfer_id)
+        status = self.call('transfer_status', {'transferId': transfer_id})
+        self.assertTrue(status['ok'], status)
+        self.assertEqual(status['result']['state'], 'transferring')
+        self.assertEqual(status['result']['direction'], 'download')
+        self.assertEqual(status['result']['confirmedOffset'], 0)
+        self.assertNotIn('chunks', status['result'])
+        self.assertEqual(self.record(transfer_id)['expiresAt'], before['expiresAt'])
+
+    def test_download_empty_source_transfers_with_no_blocks(self):
+        (self.work / 'source.bin').write_bytes(b'')
+        transfer_id = self.dregister()['result']['transferId']
+        self.dstart(transfer_id)
+        verified = self.call('transfer_verify', {'transferId': transfer_id,
+                                                 'sha256': hashlib.sha256(b'').hexdigest()})
+        self.assertTrue(verified['ok'], verified)
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(committed['result']['bytesWritten'], 0)
 
 
 if __name__ == '__main__':

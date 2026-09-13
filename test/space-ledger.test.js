@@ -2,7 +2,7 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -182,118 +182,4 @@ it('local inspect reports object identity and holder evidence without age judgme
     assert.equal(missing.exists, false);
     assert.equal(missing.identityMatches, null);
   } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-function downloadConfig(root, limitBytes) {
-  return {
-    remoteRoot: '/remote', connectionName: 'fixture', directoryScope: 'restricted',
-    sshConfigs: { fixture: {} }, localRoot: join(root, 'work'), localStateDir: join(root, 'state'),
-    identity: 'ticket-08-identity', policy: { limits: { localWorkspaceBytes: limitBytes } },
-  };
-}
-
-function stubRemote(payload) {
-  const version = 'v1';
-  return {
-    calls: [],
-    async call(action, request) {
-      this.calls.push({ action, request });
-      assert.equal(action, 'file_read');
-      assert.equal(request.grantRead, false);
-      const offset = request.offset ?? 0;
-      const chunk = payload.subarray(offset, offset + request.maxBytes);
-      return { data: chunk.toString('base64'), encoding: 'base64', version, size: payload.length,
-        startOffset: offset, endOffset: offset + chunk.length,
-        nextOffset: offset + chunk.length < payload.length ? offset + chunk.length : null, truncated: false };
-    },
-  };
-}
-
-async function localTemps(work) {
-  return (await readdir(work)).filter(name => name.startsWith('.ssh-mcp-download-'));
-}
-
-it('download registers its temporary before creation and rejects over-quota transfers cleanly', async () => {
-  assert.ok(SpaceLedger);
-  let FileService;
-  try { ({ FileService } = await import('../build/services/file-service.js')); }
-  catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }
-  assert.ok(FileService, 'FileService is not built');
-  const root = await fixture();
-  try {
-    await mkdir(join(root, 'work'), { recursive: true });
-    const remote = stubRemote(Buffer.alloc(5000, 7));
-    const files = new FileService(remote, downloadConfig(root, 2048));
-    await assert.rejects(files.download('session', { path: 'big.bin', localPath: 'big.bin' }),
-      error => error.code === 'WORKSPACE_QUOTA_EXCEEDED');
-    assert.equal((await localTemps(join(root, 'work'))).length, 0);
-    const ledger = new SpaceLedger(join(root, 'state',
-      createHash('sha256').update('ticket-08-identity').digest('hex').slice(0, 24), 'ledger'), 2048);
-    const usage = await ledger.usage();
-    assert.equal(usage.tempBytes, 0);
-    assert.equal(usage.limitBytes, 2048);
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-it('committed downloads leave the space measurement and clean their registrations', async () => {
-  assert.ok(SpaceLedger);
-  let FileService;
-  try { ({ FileService } = await import('../build/services/file-service.js')); }
-  catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }
-  assert.ok(FileService);
-  const root = await fixture();
-  try {
-    await mkdir(join(root, 'work'), { recursive: true });
-    const payload = Buffer.alloc(3000, 9);
-    const ledger = new SpaceLedger(join(root, 'state',
-      createHash('sha256').update('ticket-08-identity').digest('hex').slice(0, 24), 'ledger'), 8192);
-    for (const name of ['first.bin', 'second.bin']) {
-      const files = new FileService(stubRemote(payload), downloadConfig(root, 8192));
-      const result = await files.download('session', { path: 'payload.bin', localPath: name });
-      assert.equal(result.bytesWritten, 3000);
-      assert.deepEqual(await readFile(join(root, 'work', name)), payload);
-    }
-    // Both committed files together exceed half the limit: they must not be counted.
-    const usage = await ledger.usage();
-    assert.equal(usage.tempBytes, 0);
-    assert.equal(usage.resourceCount, 0);
-    assert.equal((await localTemps(join(root, 'work'))).length, 0);
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-it('local ENOSPC while writing the temp maps to STORAGE_FULL and clears the registration', async () => {
-  assert.ok(SpaceLedger);
-  let FileService;
-  try { ({ FileService } = await import('../build/services/file-service.js')); }
-  catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }
-  assert.ok(FileService);
-  const root = await fixture();
-  await mkdir(join(root, 'work'), { recursive: true });
-  const scratch = await open(join(root, 'probe'), 'w');
-  const handlePrototype = Object.getPrototypeOf(scratch);
-  await scratch.close();
-  const original = handlePrototype.writeFile;
-  try {
-    const payload = Buffer.alloc(3000, 5);
-    // Fail exactly one large temp write; ledger writes stay below the threshold.
-    let failed = false;
-    handlePrototype.writeFile = async function (data, options) {
-      if (!failed && data.length > 1000) {
-        failed = true;
-        throw Object.assign(new Error('simulated no space'), { code: 'ENOSPC' });
-      }
-      return original.call(this, data, options);
-    };
-    const files = new FileService(stubRemote(payload), downloadConfig(root, 1 << 20));
-    await assert.rejects(files.download('session', { path: 'nospace.bin', localPath: 'nospace.bin' }),
-      error => error.code === 'STORAGE_FULL');
-    handlePrototype.writeFile = original;
-    assert.equal((await localTemps(join(root, 'work'))).length, 0);
-    const ledger = new SpaceLedger(join(root, 'state',
-      createHash('sha256').update('ticket-08-identity').digest('hex').slice(0, 24), 'ledger'), 1 << 20);
-    assert.equal((await ledger.usage()).resourceCount, 0);
-  } finally {
-    handlePrototype.writeFile = original;
-    await rm(root, { recursive: true, force: true });
-  }
 });

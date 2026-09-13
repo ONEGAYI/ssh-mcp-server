@@ -69,8 +69,29 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
     });
-  register("remote_download", "Download a stable version to an allowed local path; local overwrite is opt-in. Downloaded bytes do not grant model read coverage.",
-    { sessionId, path, localPath: z.string(), overwrite: z.boolean().optional() }, input => files.download(input.sessionId, input as any));
+  register("remote_download", "Download a remote file of any size through a resumable verified transfer, the reverse of remote_upload: the remote source is bound to its observed m1- version, each fetched 1 MiB chunk is digested locally before it is confirmed, and a final local SHA-256 must match the sender's register-time digest before the atomic commit. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId plus bounded progress; on budgetExhausted=true call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is refetched; a changed remote source is refused). action=status observes without side effects. The local target must be absent by default; replacing it requires overwrite=true plus the expectedVersion reported for the local target in the FILE_CONFLICT guidance. Downloads never issue a readToken and never grant model read coverage. cancel/ack arrive with issue #15.",
+    { sessionId,
+      action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
+      transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
+      path: path.optional().describe("Remote source path (start only)"),
+      localPath: z.string().optional().describe("Local destination inside the workspace or allowed roots (start only)"),
+      create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent for the local target; must pair with expectedVersion"),
+      expectedVersion: z.string().optional().describe("Version reported for the existing local target; required with overwrite"),
+      chunkSize: z.number().int().min(65536).max(8388608).optional().describe("Chunk size between 64 KiB and 8 MiB; default 1 MiB"),
+      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Driving budget for this call; on exhaustion the bounded progress returns with budgetExhausted=true"),
+    }, async input => {
+      if (input.action === "cancel" || input.action === "ack") {
+        throw new RemoteAgentError("UNSUPPORTED_ACTION", "Transfer cancel and acknowledgement arrive with issue #15");
+      }
+      if (input.action === "start") {
+        if (!input.path || !input.localPath) throw new RemoteAgentError("INVALID_REQUEST", "start requires path and localPath");
+        return transfers.download(input.sessionId, input as { path: string; localPath: string;
+          create?: boolean; overwrite?: boolean; expectedVersion?: string; chunkSize?: number; budgetMs?: number });
+      }
+      if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
+      if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
+      return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
+    });
   register("remote_move", "Move a completely read file on the same filesystem. Existing destination requires its own complete read token.",
     { sessionId, path, readToken, target: path, targetReadToken: readToken }, input => files.call("file_move", input.sessionId, input));
   register("remote_delete", "Delete one completely read regular file if its version is unchanged. No recursive deletion.", { sessionId, path, readToken }, input => files.call("file_delete", input.sessionId, input));
