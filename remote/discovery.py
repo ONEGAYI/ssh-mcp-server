@@ -1,13 +1,142 @@
-"""Bounded stdlib discovery. Literal search deliberately does not emulate ripgrep."""
+"""Bounded stdlib discovery with pluggable literal-search backends (issue #11).
+
+Content search picks ripgrep > GNU grep > a built-in chunked scanner by remote
+availability. All backends share one candidate filter (workspace boundary,
+hidden files, .gitignore) and one line semantics (byte-level literal matching,
+\\n line ends, UTF-8 validation, NUL rejection): an external backend only ever
+receives line-aligned chunks through a controlled stdin stream, so the engine
+choice cannot change results. Paths never enter shell text; the backend argv
+list passes the pattern as one argument and reads data from stdin.
+"""
 import base64
+import bisect
 import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import selectors
+import shutil
 import stat
+import subprocess
+import time
 from common import AgentError
+from files import metadata
 
+
+BLOCK_BYTES = 1024 * 1024
+LINE_SOFT_LIMIT = 8 * BLOCK_BYTES
+SNIPPET_CHARS = 2000
+EXTERNAL_LINE_BYTES = 16384
+PAGE_OUTPUT_BYTES = 65536
+MAX_CANDIDATES = 50000
+EXTERNAL_THRESHOLD_BYTES = BLOCK_BYTES
+MAX_BACKEND_FAILURES = 3
+# Policy hook (#18): these defaults become configurable once policy plumbing
+# lands; requests may already tighten or widen them within the clamps below.
+DEFAULT_SCAN_BUDGET_BYTES = 512 * 1024 * 1024
+DEFAULT_SCAN_BUDGET_SECONDS = 10
+EXTERNAL_BACKENDS = (('ripgrep', 'rg'), ('gnu-grep', 'grep'))
+
+
+def available_search_backends():
+    """Ordered (name, executable) pairs for what is actually usable remotely."""
+    found = []
+    for name, binary in EXTERNAL_BACKENDS:
+        located = shutil.which(binary)
+        if located:
+            found.append((name, located))
+    return found
+
+
+def search_capabilities():
+    names = [name for name, _ in available_search_backends()]
+    return {'searchEngine': names[0] if names else 'python-literal',
+            'searchBackends': names + ['python-literal']}
+
+
+# --- gitignore subset -----------------------------------------------------------
+# Supports negation, directory-only rules, escaped characters, anchored and
+# basename patterns, nesting (deeper files win) and the git rule that a file
+# under an ignored directory cannot be re-included.
+
+def parse_gitignore(text):
+    rules = []
+    for raw in text.split('\n'):
+        line = raw.rstrip('\r')
+        if not line.strip() or line.startswith('#'):
+            continue
+        while line.endswith(' ') and not line.endswith('\\ '):
+            line = line[:-1]
+        if not line:
+            continue
+        negated = line.startswith('!')
+        if negated:
+            line = line[1:]
+        if not line:
+            continue
+        directory_only = line.endswith('/')
+        body = line.rstrip('/')
+        anchored = '/' in body
+        body = body.lstrip('/')
+        if not body:
+            continue
+        body = re.sub(r'\\(.)', r'\1', body)
+        rules.append({'negated': negated, 'directory': directory_only,
+                      'anchored': anchored, 'segments': body.split('/')})
+    return rules
+
+
+def segments_match(pattern, target):
+    if not pattern:
+        return not target
+    if pattern[0] == '**':
+        return any(segments_match(pattern[1:], target[skip:]) for skip in range(len(target) + 1))
+    if not target:
+        return False
+    return fnmatch.fnmatchcase(target[0], pattern[0]) and segments_match(pattern[1:], target[1:])
+
+
+def rule_decides(rule, base, relative, is_dir):
+    if rule['directory'] and not is_dir:
+        return False
+    if rule['anchored']:
+        if len(relative) <= len(base):
+            return False
+        return segments_match(rule['segments'], relative[len(base):])
+    if not relative:
+        return False
+    return fnmatch.fnmatchcase(relative[-1], rule['segments'][0])
+
+
+class IgnoreLayers:
+    """Stacked .gitignore layers; deeper layers and later rules override."""
+
+    def __init__(self):
+        self.layers = []
+
+    def enter(self, directory, relative):
+        self.layers = self.layers[:len(relative)]
+        rules = []
+        ignore_file = directory / '.gitignore'
+        try:
+            if ignore_file.is_file():
+                rules = parse_gitignore(ignore_file.read_text('utf8', errors='ignore'))
+        except OSError:
+            rules = []
+        self.layers.append((relative, rules))
+
+    def ignored(self, relative, is_dir):
+        verdict = False
+        for base, rules in self.layers:
+            for rule in rules:
+                if rule_decides(rule, base, relative, is_dir):
+                    verdict = not rule['negated']
+        return verdict
+
+
+# --- candidate enumeration --------------------------------------------------------
 
 def limits(request):
     limit = request.get('limit', 100)
@@ -16,19 +145,49 @@ def limits(request):
     return limit
 
 
-def candidates(service, root, recursive):
+def iter_paths(root, recursive, include_hidden=True, respect_gitignore=False):
+    """Shared candidate filter for search and find: one sorted entry list.
+
+    Always prunes .git, drops dot-prefixed entries when include_hidden is off,
+    and applies the layered .gitignore subset when explicitly requested.
+    """
     if not root.is_dir():
         return [root]
-    result = []
-    for current, directories, files in os.walk(str(root), followlinks=False):
-        directories[:] = sorted(name for name in directories if name != '.git')
-        for name in sorted(directories + files):
-            result.append(Path(current) / name)
-            if len(result) > 50000:
-                raise AgentError('SCAN_LIMIT', 'More than 50000 entries; narrow the search directory')
-        if not recursive:
-            break
-    return sorted(result, key=str)
+    results = []
+    ignore = IgnoreLayers() if respect_gitignore else None
+
+    def recurse(directory, relative):
+        if ignore is not None:
+            ignore.enter(directory, relative)
+        try:
+            with os.scandir(str(directory)) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError:
+            return
+        for entry in entries:
+            name = entry.name
+            if name == '.git' or (name.startswith('.') and not include_hidden):
+                continue
+            child = relative + [name]
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if ignore is not None and ignore.ignored(child, is_dir):
+                continue
+            results.append(Path(entry.path))
+            if len(results) > MAX_CANDIDATES:
+                raise AgentError('SCAN_LIMIT', 'More than {} entries; narrow the search directory'.format(MAX_CANDIDATES))
+            if recursive and is_dir:
+                recurse(Path(entry.path), child)
+
+    recurse(root, [])
+    return sorted(results, key=str)
+
+
+def candidates(service, root, recursive):
+    """Legacy enumeration for file_list/file_find (behavior unchanged)."""
+    return iter_paths(root, recursive)
 
 
 def display(service, path):
@@ -39,59 +198,613 @@ def display(service, path):
         return str(path)
 
 
+# --- search scanning primitives ---------------------------------------------------
+
+class SkipFile(Exception):
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason  # 'binary' | 'encoding' | 'io'
+
+
+class BudgetStop(Exception):
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason  # 'bytes' | 'time'
+
+
+class BackendFailure(Exception):
+    pass
+
+
+class Budget:
+    def __init__(self, byte_limit, seconds):
+        self.remaining = byte_limit
+        self.consumed = 0
+        self.deadline = time.monotonic() + seconds
+
+    def check_time(self):
+        if time.monotonic() >= self.deadline:
+            raise BudgetStop('time')
+
+    def add(self, count):
+        """Record read bytes; the overrun check stays with the emitter so a
+        budget smaller than one block still makes progress per page."""
+        self.consumed += count
+        self.remaining -= count
+
+    def ensure_within(self):
+        if self.remaining < 0:
+            raise BudgetStop('bytes')
+        self.check_time()
+
+
+def require_utf8(data):
+    try:
+        data.decode('utf8')
+    except UnicodeDecodeError:
+        raise SkipFile('encoding')
+
+
+def feed_units(stream, start_byte, start_line, needle_len, budget):
+    """Generate (data, unit) pairs of line-aligned chunks from start_byte.
+
+    Unit data always ends with \\n so a backend counts lines the same way the
+    helper does. Lines longer than LINE_SOFT_LIMIT are reported as overlapping
+    bounded fragments (needle_len - 1 bytes of overlap, so a match crossing a
+    fragment edge is never missed). Raises SkipFile/BudgetStop from the reads.
+    """
+    state = {'file_byte': start_byte, 'file_line': start_line}
+
+    def generate():
+        stream.seek(start_byte)
+        counter = [1]  # stream-relative line number where the next unit starts
+        pending = b''
+        pending_start = start_byte
+        pending_line = start_line
+        long_start = None
+
+        def unit_for(data, file_byte, file_line, long_line, line_start):
+            unit = {'stream_line': counter[0], 'file_byte': file_byte, 'file_line': file_line,
+                    'long': long_line, 'line_start': line_start}
+            counter[0] += data.count(b'\n')
+            state['file_byte'] = file_byte + len(data)
+            state['file_line'] = file_line + data.count(b'\n')
+            return unit
+
+        while True:
+            budget.check_time()
+            try:
+                chunk = stream.read(BLOCK_BYTES)
+            except OSError:
+                raise SkipFile('io')
+            if chunk:
+                budget.add(len(chunk))
+            if b'\0' in chunk:
+                raise SkipFile('binary')
+            buffer = pending + chunk
+            cut = buffer.rfind(b'\n')
+            if cut >= 0:
+                data = buffer[:cut + 1]
+                require_utf8(data)
+                yield (data, unit_for(data, pending_start, pending_line, False, pending_start))
+                pending = buffer[cut + 1:]
+                pending_start = state['file_byte']
+                pending_line = state['file_line']
+                long_start = None
+            else:
+                pending = buffer
+                if pending and long_start is None:
+                    long_start = pending_start
+            if not chunk:
+                if pending:
+                    # Final unterminated line: report it as one bounded chunk.
+                    require_utf8(pending)
+                    yield (pending + b'\n', unit_for(pending, pending_start, pending_line, False, pending_start))
+                break
+            while len(pending) >= BLOCK_BYTES:
+                fragment = pending[:BLOCK_BYTES]
+                unit = {'stream_line': counter[0], 'file_byte': pending_start,
+                        'file_line': pending_line, 'long': True, 'line_start': long_start}
+                counter[0] += 1  # the appended \n makes the fragment one stream line
+                state['file_byte'] = pending_start + len(fragment)
+                state['file_line'] = pending_line
+                yield (fragment + b'\n', unit)
+                overlap = min(max(needle_len - 1, 0), BLOCK_BYTES - 1)
+                pending = pending[len(fragment) - overlap:]
+                pending_start = state['file_byte']
+            # The overrun check runs after this block is reported, so a page
+            # budget smaller than one block still advances the cursor.
+            budget.ensure_within()
+
+    return generate(), state
+
+
+def line_snippet(raw):
+    shown = raw[:EXTERNAL_LINE_BYTES].decode('utf8', 'replace')
+    truncated = len(raw) > EXTERNAL_LINE_BYTES or len(shown) > SNIPPET_CHARS
+    return shown[:SNIPPET_CHARS], truncated
+
+
+def python_scan(feeder, needle, sink, units, current):
+    """Built-in chunked scanner: same units and line semantics as backends."""
+    for data, unit in feeder:
+        units.append(unit)
+        current['unit_index'] = len(units) - 1
+        parts = data.split(b'\n')
+        if parts and parts[-1] == b'':
+            parts.pop()
+        for offset, raw in enumerate(parts):
+            file_line = unit['file_line'] if unit['long'] else unit['file_line'] + offset
+            if needle not in raw:
+                continue
+            text, truncated = line_snippet(raw)
+            if not sink(file_line, text, truncated, current['unit_index']):
+                return 'page'
+    return None
+
+
+def external_scan(binary, needle_text, feeder, sink, units, current, budget):
+    """Feed line-aligned chunks to rg/grep through stdin and parse "N:line".
+
+    Writes are non-blocking with bounded buffers; reads cap any single backend
+    output line so a giant match line cannot grow memory without bound. The
+    process exits 0/1 normally; higher codes or signals raise BackendFailure.
+    """
+    argv = [binary, '-F', '-a', '-n', '--color=never', '--', needle_text, '-']
+    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, close_fds=True)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    selector.register(process.stdin, selectors.EVENT_WRITE)
+    os.set_blocking(process.stdin.fileno(), False)
+    os.set_blocking(process.stdout.fileno(), False)
+    os.set_blocking(process.stderr.fileno(), False)
+    pending_exception = None
+    stop_reason = None
+    killed = False
+    send = b''
+    writing = True
+    buffer = b''
+    dropping = False
+    stderr_tail = b''
+    stream_lines = [0]
+    drained_deadline = None
+
+    def halt(reason):
+        """Stop feeding: drop unwritten bytes, close stdin, keep draining output.
+
+        Output produced after a halt still flows through the sink: when the page
+        budget stopped us the sink rejects and records the resume anchor; when a
+        scan budget stopped us the page may still accept every drained hit.
+        """
+        nonlocal stop_reason, writing, send
+        stop_reason = reason if reason else stop_reason
+        writing = False
+        send = b''
+        try:
+            selector.unregister(process.stdin)
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+
+    def process_buffer():
+        """Parse complete and synthetic lines out of the read buffer.
+
+        Runs after every read and again each loop turn: a synthetic line for an
+        oversized output line must flush even when the backend has no more
+        bytes to send. `dropping` then discards the original line's tail bytes
+        until its real newline.
+        """
+        nonlocal buffer, dropping, stop_reason
+        while True:
+            if dropping:
+                cut = buffer.find(b'\n')
+                if cut < 0:
+                    buffer = b''
+                    break
+                buffer = buffer[cut + 1:]
+                dropping = False
+                continue
+            cut = buffer.find(b'\n')
+            if cut >= 0:
+                line, buffer = buffer[:cut], buffer[cut + 1:]
+            elif len(buffer) > EXTERNAL_LINE_BYTES:
+                # Bounded prefix of an unfinished oversized line; the line
+                # number lives at its start, so parse the prefix now.
+                line = buffer[:EXTERNAL_LINE_BYTES]
+                buffer = b''
+                dropping = True
+            else:
+                break
+            number, _, text = line.partition(b':')
+            if not number.isdigit():
+                continue
+            position = bisect.bisect_right(stream_lines, int(number)) - 1
+            if position <= 0:
+                continue
+            unit = units[position - 1]
+            stream_line = int(number)
+            file_line = unit['file_line'] if unit['long'] else \
+                unit['file_line'] + (stream_line - unit['stream_line'])
+            shown, truncated = line_snippet(text)
+            if not sink(file_line, shown, truncated, position - 1):
+                if stop_reason is None:
+                    stop_reason = 'page'
+
+    try:
+        while True:
+            if writing and not send and pending_exception is None and stop_reason is None:
+                try:
+                    data, unit = next(feeder)
+                except StopIteration:
+                    writing = False
+                    try:
+                        selector.unregister(process.stdin)
+                    except (KeyError, ValueError, OSError):
+                        pass
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                except (SkipFile, BudgetStop) as stop:
+                    pending_exception = stop
+                    halt(stop.reason if isinstance(stop, BudgetStop) else None)
+                else:
+                    send = data
+                    units.append(unit)
+                    stream_lines.append(unit['stream_line'])
+            for key, _ in selector.select(0.05):
+                try:
+                    data = os.read(key.fileobj.fileno(), 65536)
+                except (BlockingIOError, OSError):
+                    continue
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.fileobj is process.stderr:
+                    stderr_tail = (stderr_tail + data)[-4096:]
+                    continue
+                if dropping:
+                    # Oversized-line tail: discard at read level up to its
+                    # real newline instead of buffering megabytes.
+                    cut = data.find(b'\n')
+                    if cut >= 0:
+                        buffer = data[cut + 1:]
+                        dropping = False
+                    continue
+                buffer += data
+            process_buffer()
+            if send:
+                try:
+                    written = os.write(process.stdin.fileno(), send)
+                    send = send[written:]
+                except (BlockingIOError, ValueError):
+                    pass
+                except OSError:
+                    writing = False
+                    send = b''
+                    try:
+                        selector.unregister(process.stdin)
+                    except (KeyError, ValueError, OSError):
+                        pass
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+            now = time.monotonic()
+            if writing and now >= budget.deadline:
+                halt('time')
+            if not writing and selector.get_map():
+                if drained_deadline is None:
+                    drained_deadline = now + 10.0
+                elif now >= drained_deadline:
+                    process.kill()
+                    killed = True
+            if not writing and not selector.get_map() and not send:
+                break
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr, process.stdin):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        try:
+            returncode = process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            returncode = process.wait()
+    if pending_exception is not None:
+        raise pending_exception
+    if (returncode > 1 or returncode < 0) and not killed:
+        raise BackendFailure(stderr_tail.decode('utf8', 'replace')[-200:])
+    if killed and stop_reason is None:
+        stop_reason = 'time'
+    return stop_reason, killed
+
+
+# --- search orchestration -----------------------------------------------------------
+
+def optional_bool(request, name, default):
+    value = request.get(name, default)
+    if not isinstance(value, bool):
+        raise AgentError('INVALID_REQUEST', '{} must be boolean'.format(name))
+    return value
+
+
+def bounded_number(request, name, default, minimum, maximum):
+    value = request.get(name, default)
+    if value is None:
+        value = default
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise AgentError('INVALID_LIMIT', '{} must be between {} and {}'.format(name, minimum, maximum))
+    return value
+
+
+def file_version(path):
+    try:
+        return hashlib.sha256(json.dumps(metadata(path.stat())).encode('utf8')).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def serialized_size(items):
+    return sum(len(json.dumps(item, ensure_ascii=False).encode('utf8')) for item in items)
+
+
+def resume_point(units, state, kept_hit, rejected_hit, matches, mark, killed=False):
+    """Where the next page restarts inside the current file.
+
+    The anchor is the last produced hit, kept or rejected: rewind to the block
+    (or oversized line start) that produced it so nothing accepted-then-
+    dropped is lost; kept hits filter duplicates by line number on rescan.
+    Without any produced hit, continue at the exact scanned position. After a
+    killed drain the scanned position is not trustworthy (output was cut), so
+    rewind to the last fed unit instead.
+    """
+    anchor = kept_hit if kept_hit['line'] else rejected_hit
+    if anchor['line']:
+        unit = units[anchor['unit_index']]
+        if unit['long']:
+            rewind = len(matches)
+            for position in range(mark, len(matches)):
+                if matches[position]['line'] >= unit['file_line']:
+                    rewind = position
+                    break
+            del matches[rewind:]
+            return {'byteOffset': unit['line_start'], 'line': unit['file_line'],
+                    'lastLine': unit['file_line'] - 1}
+        return {'byteOffset': unit['file_byte'], 'line': unit['file_line'],
+                'lastLine': kept_hit['line']}
+    if killed and units:
+        last = units[-1]
+        return {'byteOffset': last['file_byte'], 'line': last['file_line'], 'lastLine': 0}
+    return {'byteOffset': state['file_byte'], 'line': state['file_line'], 'lastLine': 0}
+
+
+def encode_cursor(cursor):
+    return base64.b64encode(json.dumps(cursor, separators=(',', ':')).encode('utf8')).decode('ascii')
+
+
+def partial_result(matches, reason, cursor, engine, scanned_files, bytes_scanned, skipped, fallback_files):
+    result = {'matches': matches, 'truncated': reason is not None, 'engine': engine,
+              'nextCursor': encode_cursor(cursor) if cursor else None,
+              'scannedFiles': scanned_files, 'bytesScanned': bytes_scanned,
+              'skippedFiles': sum(skipped.values()), 'skippedDetail': skipped,
+              'fallbackFiles': fallback_files,
+              'ignores': ['.git'], 'gitignoreSupported': True}
+    if reason:
+        result['reason'] = reason
+    return result
+
+
+def file_search(service, root, request):
+    limit = limits(request)
+    pattern = request.get('pattern')
+    if not isinstance(pattern, str) or not pattern or len(pattern) > 4096 \
+            or '\n' in pattern or '\0' in pattern:
+        raise AgentError('INVALID_PATTERN', 'Provide a nonempty single-line pattern up to 4096 characters')
+    try:
+        needle = pattern.encode('utf8')
+    except UnicodeEncodeError:
+        raise AgentError('INVALID_PATTERN', 'Pattern must be valid UTF-8 text')
+    file_pattern = request.get('filePattern', '*')
+    if not isinstance(file_pattern, str) or not file_pattern or len(file_pattern) > 4096:
+        raise AgentError('INVALID_PATTERN', 'filePattern must be nonempty text up to 4096 characters')
+    include_hidden = optional_bool(request, 'includeHidden', True)
+    respect_gitignore = optional_bool(request, 'respectGitignore', False)
+    budget_bytes = bounded_number(request, 'scanBudgetBytes', DEFAULT_SCAN_BUDGET_BYTES,
+                                  64 * 1024, 2 * 1024 * 1024 * 1024)
+    budget_seconds = bounded_number(request, 'scanBudgetSeconds', DEFAULT_SCAN_BUDGET_SECONDS, 1, 60)
+    if any(part == '.git' for part in root.parts):
+        raise AgentError('PATH_NOT_ALLOWED', 'The .git directory is always excluded from search')
+
+    files = [path for path in iter_paths(root, True, include_hidden, respect_gitignore)
+             if not path.is_symlink() and path.is_file()
+             and fnmatch.fnmatch(path.name, file_pattern)]
+    listing_digest = hashlib.sha256(
+        json.dumps([str(path) for path in files]).encode('utf8')).hexdigest()
+    binding = [str(service.workspace), service.session, str(root), 'file_search', pattern,
+               file_pattern, include_hidden, respect_gitignore, budget_bytes, budget_seconds,
+               listing_digest]
+    query = hashlib.sha256(json.dumps(binding, sort_keys=True).encode('utf8')).hexdigest()
+
+    start_index, resume = 0, None
+    incoming = request.get('cursor')
+    if incoming:
+        try:
+            cursor = json.loads(base64.b64decode(incoming, validate=True).decode('utf8'))
+            if cursor.get('v') != 1 or cursor.get('query') != query:
+                raise ValueError()
+            start_index = cursor['next']
+            resume = cursor.get('resume')
+            if not isinstance(start_index, int) or isinstance(start_index, bool) \
+                    or not 0 <= start_index <= len(files):
+                raise ValueError()
+            if resume is not None and (not isinstance(resume, dict) or start_index >= len(files)
+                                        or str(files[start_index]) != resume.get('path')):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError):
+            raise AgentError('STALE_CURSOR', 'Query or directory changed; restart the search')
+        if resume is not None and file_version(files[start_index]) != resume.get('version'):
+            raise AgentError('CURSOR_CONFLICT', 'The file changed while paging; restart the search')
+
+    primary = available_search_backends()
+    primary_name = primary[0][0] if primary else None
+    primary_binary = primary[0][1] if primary else None
+    budget = Budget(budget_bytes, budget_seconds)
+    matches = []
+    page = {'output': 0}
+    skipped = {'binary': 0, 'encoding': 0, 'io': 0}
+    counters = {'scanned': 0, 'fallback': 0, 'backend_failures': 0, 'external_used': 0}
+
+    def make_sink(path, last_line):
+        kept = {'unit_index': None, 'line': 0}
+        rejected = {'unit_index': None, 'line': 0}
+
+        def sink(file_line, text, truncated, unit_index):
+            if file_line <= last_line:
+                return True
+            item = {'path': display(service, path), 'line': file_line,
+                    'text': text[:SNIPPET_CHARS], 'lineTruncated': bool(truncated)}
+            size = len(json.dumps(item, ensure_ascii=False).encode('utf8'))
+            if len(matches) >= limit or page['output'] + size > PAGE_OUTPUT_BYTES:
+                rejected.update(unit_index=unit_index, line=file_line)
+                return False
+            matches.append(item)
+            page['output'] += size
+            kept.update(unit_index=unit_index, line=file_line)
+            return True
+        return sink, kept, rejected
+
+    def run_python_scan(path, start_byte, start_line, last_line):
+        """In-process scan used for small files and after a backend failure.
+
+        Returns {'outcome','reason','units','kept','rejected','state'}.
+        """
+        current = {'unit_index': None}
+        sink, kept, rejected = make_sink(path, last_line)
+        units = []
+        empty_state = {'file_byte': start_byte, 'file_line': start_line}
+        try:
+            stream = path.open('rb')
+        except OSError:
+            return {'outcome': 'skip', 'reason': 'io', 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': empty_state}
+        try:
+            feeder, state = feed_units(stream, start_byte, start_line, len(needle), budget)
+            try:
+                outcome = python_scan(feeder, needle, sink, units, current)
+            except SkipFile as skip:
+                return {'outcome': 'skip', 'reason': skip.reason, 'units': units,
+                        'kept': kept, 'rejected': rejected, 'state': state}
+            except BudgetStop as stop:
+                return {'outcome': stop.reason, 'reason': None, 'units': units,
+                        'kept': kept, 'rejected': rejected, 'state': state}
+            return {'outcome': outcome, 'reason': None, 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': state}
+        finally:
+            stream.close()
+
+    def attempt(path, start_byte, start_line, last_line):
+        """One file scan with the preferred backend; never raises scan errors."""
+        current = {'unit_index': None}
+        sink, kept, rejected = make_sink(path, last_line)
+        units = []
+        empty_state = {'file_byte': start_byte, 'file_line': start_line}
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return {'outcome': 'skip', 'reason': 'io', 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': empty_state}
+        use_external = primary_binary is not None and size >= EXTERNAL_THRESHOLD_BYTES \
+            and counters['backend_failures'] < MAX_BACKEND_FAILURES
+        try:
+            stream = path.open('rb')
+        except OSError:
+            return {'outcome': 'skip', 'reason': 'io', 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': empty_state}
+        try:
+            feeder, state = feed_units(stream, start_byte, start_line, len(needle), budget)
+            if use_external:
+                try:
+                    outcome, killed = external_scan(primary_binary, pattern, feeder, sink, units, current, budget)
+                except BackendFailure as failure:
+                    # A crashed backend must not look like "no matches": the
+                    # caller drops this file's partial hits and rescans in-process.
+                    return {'outcome': 'backend', 'reason': str(failure), 'units': units,
+                            'kept': kept, 'rejected': rejected, 'state': state}
+                counters['external_used'] += 1
+                return {'outcome': outcome, 'reason': None, 'units': units,
+                        'kept': kept, 'rejected': rejected, 'state': state, 'killed': killed}
+            outcome = python_scan(feeder, needle, sink, units, current)
+            return {'outcome': outcome, 'reason': None, 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': state}
+        except SkipFile as skip:
+            return {'outcome': 'skip', 'reason': skip.reason, 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': state}
+        except BudgetStop as stop:
+            return {'outcome': stop.reason, 'reason': None, 'units': units,
+                    'kept': kept, 'rejected': rejected, 'state': state}
+        finally:
+            stream.close()
+
+    index = start_index
+    while index < len(files):
+        path = files[index]
+        if resume is not None:
+            start_byte, start_line, last_line = resume['byteOffset'], resume['line'], resume['lastLine']
+        else:
+            start_byte, start_line, last_line = 0, 1, 0
+        mark = len(matches)
+        result = attempt(path, start_byte, start_line, last_line)
+        if result['outcome'] == 'backend':
+            counters['fallback'] += 1
+            counters['backend_failures'] += 1
+            del matches[mark:]
+            page['output'] = serialized_size(matches)
+            result = run_python_scan(path, start_byte, start_line, last_line)
+        if result['outcome'] == 'skip':
+            del matches[mark:]
+            page['output'] = serialized_size(matches)
+            skipped[result['reason']] = skipped.get(result['reason'], 0) + 1
+            index += 1
+            resume = None
+            continue
+        if result['outcome'] is None:
+            counters['scanned'] += 1
+            index += 1
+            resume = None
+            continue
+        position = resume_point(result['units'], result['state'], result['kept'], result['rejected'],
+                                matches, mark, result.get('killed', False))
+        cursor = {'v': 1, 'query': query, 'next': index,
+                  'resume': dict(position, path=str(path), version=file_version(path))}
+        reason = {'page': 'RESULT_LIMIT', 'bytes': 'SCAN_BYTE_LIMIT',
+                  'time': 'SCAN_TIME_LIMIT'}[result['outcome']]
+        return partial_result(matches, reason, cursor,
+                              primary_name if primary_name and counters['external_used'] > 0 else 'python-literal',
+                              counters['scanned'], budget.consumed, skipped, counters['fallback'])
+    return partial_result(matches, None, None,
+                          primary_name if primary_name and counters['external_used'] > 0 else 'python-literal',
+                          counters['scanned'], budget.consumed, skipped, counters['fallback'])
+
+
 def discover(service, action, request):
     root = service.path(request.get('path', '.'))
     if not root.exists():
         raise AgentError('PATH_NOT_FOUND', 'Search path does not exist')
+    if action == 'file_search':
+        return file_search(service, root, request)
     limit = limits(request)
     pattern = request.get('pattern', '*')
     if not isinstance(pattern, str) or not pattern or len(pattern) > 4096:
         raise AgentError('INVALID_PATTERN', 'Provide a nonempty pattern up to 4096 characters')
     paths = candidates(service, root, action != 'file_list')
-    if action == 'file_search':
-        matches, skipped, scanned, bytes_scanned = [], 0, 0, 0
-        output_bytes = 0
-        for path in paths:
-            if path.is_symlink() or not path.is_file():
-                continue
-            if not fnmatch.fnmatch(path.name, request.get('filePattern', '*')):
-                continue
-            size = path.stat().st_size
-            if size > 16 * 1024 * 1024:
-                skipped += 1
-                continue
-            if bytes_scanned + size > 64 * 1024 * 1024:
-                return {'matches': matches, 'truncated': True, 'reason': 'SCAN_BYTE_LIMIT',
-                        'engine': 'python-literal', 'skippedFiles': skipped, 'scannedFiles': scanned}
-            # Bound the actual read too: another writer can grow a file after stat.
-            with path.open('rb') as stream:
-                data = stream.read(min(16 * 1024 * 1024, 64 * 1024 * 1024 - bytes_scanned) + 1)
-            if len(data) > 16 * 1024 * 1024 or bytes_scanned + len(data) > 64 * 1024 * 1024:
-                skipped += 1
-                continue
-            bytes_scanned += len(data)
-            try:
-                text = data.decode('utf-8-sig')
-            except UnicodeDecodeError:
-                skipped += 1
-                continue
-            if '\0' in text:
-                skipped += 1
-                continue
-            scanned += 1
-            for number, line in enumerate(text.splitlines(), 1):
-                if pattern not in line:
-                    continue
-                item = {'path': display(service, path), 'line': number,
-                        'text': line[:2000], 'lineTruncated': len(line) > 2000}
-                item_bytes = len(json.dumps(item, ensure_ascii=False).encode('utf8'))
-                if len(matches) == limit or output_bytes + item_bytes > 65536:
-                    return {'matches': matches, 'truncated': True, 'reason': 'RESULT_LIMIT',
-                            'engine': 'python-literal', 'skippedFiles': skipped, 'scannedFiles': scanned}
-                matches.append(item)
-                output_bytes += item_bytes
-        return {'matches': matches, 'truncated': False, 'engine': 'python-literal',
-                'skippedFiles': skipped, 'scannedFiles': scanned, 'ignores': ['.git'], 'gitignoreSupported': False}
     entries = []
     for path in paths:
         relative = display(service, path)
@@ -114,7 +827,7 @@ def discover(service, action, request):
     page, byte_count = [], 0
     for item in entries[offset:offset + limit]:
         count = len(json.dumps(item, ensure_ascii=False).encode('utf8'))
-        if byte_count + count > 65536:
+        if byte_count + count > PAGE_OUTPUT_BYTES:
             break
         page.append(item)
         byte_count += count

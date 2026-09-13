@@ -949,6 +949,8 @@ class FileService:
         if action == 'file_workspace':
             import platform
             import shutil
+            from discovery import search_capabilities, DEFAULT_SCAN_BUDGET_BYTES, DEFAULT_SCAN_BUDGET_SECONDS
+            capabilities = search_capabilities()
             return {'remoteRoot': str(self.workspace), 'directoryScope': 'unrestricted' if self.unrestricted else 'restricted',
                     'python': platform.python_version(),
                     'runtimeLibc': os.confstr('CS_GNU_LIBC_VERSION'),
@@ -958,7 +960,12 @@ class FileService:
                     'capabilities': {'interactiveInput': False, 'pty': False, 'reattachTerminal': False,
                                      'persistentTasks': True, 'streamedRead': True, 'streamedWrite': True,
                                      'readTokenTtlDays': READ_TOKEN_TTL_SECONDS // 86400,
-                                     'searchEngine': 'python-literal', 'gitignoreSearch': False, 'rgPath': shutil.which('rg')}}
+                                     'searchEngine': capabilities['searchEngine'],
+                                     'searchBackends': capabilities['searchBackends'],
+                                     'gitignoreSearch': True,
+                                     'searchScanBudgetBytes': DEFAULT_SCAN_BUDGET_BYTES,
+                                     'searchScanBudgetSeconds': DEFAULT_SCAN_BUDGET_SECONDS,
+                                     'rgPath': shutil.which('rg'), 'grepPath': shutil.which('grep')}}
         if action in ('file_list', 'file_find', 'file_search'):
             from discovery import discover
             return discover(self, action, request)
