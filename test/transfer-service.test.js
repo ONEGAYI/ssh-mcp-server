@@ -370,6 +370,13 @@ class FakeRemote {
 
 async function buildHarness(limitBytes = 10 * 1024 ** 3) {
   const fake = new FakeRemote();
+  // A real profile file: since #16 the ledger limit is reloaded from the
+  // profile (loadPolicy) on every quota check, so the fixture must exist.
+  const profilePath = join(fake.stateRoot, 'profile.json');
+  await writeFile(profilePath, JSON.stringify({
+    workspaceId: 'transfer-test',
+    policy: { limits: { localWorkspaceBytes: limitBytes } },
+  }));
   const parseAction = command => command.trim().split(' ').pop().replace(/'/g, '');
   const envelope = (ok, payload) => 'SSH_MCP_V1 '
     + Buffer.from(JSON.stringify(ok ? { ok: true, result: payload } : { ok: false, error: payload })).toString('base64') + '\n';
@@ -404,7 +411,7 @@ async function buildHarness(limitBytes = 10 * 1024 ** 3) {
   };
   const remote = new RemoteAgentClient(transport, { remoteStateDir: '/fake/remote-state', pythonPath: '/usr/bin/python3' });
   const config = {
-    workspaceId: 'test-workspace', identity: 'identity-13', profilePath: '/tmp/profile.json',
+    workspaceId: 'test-workspace', identity: 'identity-13', profilePath,
     connectionName: 'default', sshConfigFile: '/tmp/ssh.json',
     sshConfigs: { default: { allowedLocalPaths: [], allowedRemotePaths: [] } },
     remoteRoot: fake.workspace, remoteStateDir: fake.stateRoot, directoryScope: 'restricted',

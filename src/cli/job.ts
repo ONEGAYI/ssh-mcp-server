@@ -5,10 +5,11 @@ import { parseArgs } from "node:util";
 import { createWorkspaceRuntime } from "../services/workspace-runtime.js";
 import { FileService } from "../services/file-service.js";
 import { TransferService, TransferOutcome } from "../services/transfer-service.js";
+import { MaintenanceService } from "../services/maintenance.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { RemoteTask } from "../services/task-service.js";
 
-const HELP = `Usage: ssh-mcp-job <run|wait|status|cancel|pending|ack|cleanup|doctor> --workspace <profile.json> --session <session-id>
+const HELP = `Usage: ssh-mcp-job <run|wait|status|cancel|pending|ack|cleanup|doctor|maintain> --workspace <profile.json> --session <session-id>
   run --command <shell text> [--cwd <remote directory>] [--env KEY=value]
       [--execution-timeout <ms>] [--max-output-bytes <bytes>]
   wait|status|cancel|ack --job-id <id>
@@ -20,11 +21,13 @@ const HELP = `Usage: ssh-mcp-job <run|wait|status|cancel|pending|ack|cleanup|doc
       wait|status|resume|cancel|ack --transfer-id <id>
       wait|resume [--budget <ms>]  wait also takes [--wait-timeout <ms>]
   cleanup [--retention-days <days>]  Delete only acknowledged terminal logs (default 7 days)
+  maintain                          Run one bounded expiry-reclamation round now (both ends);
+                                    normally triggered automatically, at most hourly
   doctor                            Inspect remote capabilities and actual runtime libc
 Run this command through ZCode's native background Shell tool for automatic completion delivery.
 Ending this local waiter does not cancel the remote task or transfer. Results remain pending until ack.`;
 
-const TASK_ACTIONS = ["run", "wait", "status", "cancel", "pending", "ack", "cleanup", "doctor"];
+const TASK_ACTIONS = ["run", "wait", "status", "cancel", "pending", "ack", "cleanup", "doctor", "maintain"];
 const TRANSFER_ACTIONS = ["start", "wait", "status", "resume", "cancel", "ack", "pending"];
 /** Transfer outcomes that end a background waiter (issue #15). */
 const TERMINAL_TRANSFERS = new Set(["completed", "failed", "cancelled"]);
@@ -98,6 +101,13 @@ async function main(): Promise<void> {
   }
   const runtime = await createWorkspaceRuntime(values.workspace);
   try {
+    // Hourly online maintenance rides along with every CLI run (issue #16);
+    // a failure here never blocks the requested action. `pending` stays an
+    // offline-safe recovery query: no remote round-trip is added to it.
+    const maintenance = new MaintenanceService(runtime.config, runtime.remote);
+    if (action !== "maintain" && action !== "pending") {
+      await maintenance.maybeMaintain().catch(() => undefined);
+    }
     if (transferMode) {
       const files = new FileService(runtime.remote, runtime.config);
       const transfers = new TransferService(runtime.remote, runtime.config, files);
@@ -158,6 +168,7 @@ async function main(): Promise<void> {
       return;
     }
     if (action === "cleanup") { console.log(JSON.stringify(await runtime.remote.call("cleanup", { retentionDays: numberOption(values["retention-days"]) ?? 7 }))); return; }
+    if (action === "maintain") { console.log(JSON.stringify(await maintenance.maybeMaintain())); return; }
     if (action === "doctor") { console.log(JSON.stringify(await new FileService(runtime.remote, runtime.config).call("file_workspace", values.session))); return; }
     if (action === "pending") { console.log(JSON.stringify({ tasks: await runtime.tasks.pending(values.session) })); return; }
     let jobId = values["job-id"];
