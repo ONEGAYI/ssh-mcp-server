@@ -20,7 +20,7 @@
 
 - 一个本机项目可承载多个命名绑定。每个绑定独立 profile（无名绑定保持 `.ssh-mcp-workspace.json`，命名绑定 `.ssh-mcp-workspace.<bindingName>.json`）、独立 workspaceId、独立 MCP 服务与恢复钩子；绑定名限小写字母/数字/连字符。
 - 自动 workspaceId 由本机项目路径与绑定名联合派生；旧无名绑定算法不变，任何变更不得改变既有任务的 identity 归属。显式 workspaceId 冲突（同名 MCP 服务指向不同 profile）必须拒绝。
-- setup 集成冲突检测先于 profile 落盘：被拒绝的绑定不得在项目里残留半配置 profile 文件。已知边界：检测通过到集成写入之间存在毫秒级窗口，并发改写项目配置可能留下"已写 profile、未集成"状态；重跑同一 setup 幂等收敛。
+- setup 集成冲突检测先于 profile 落盘：被拒绝的绑定不得在项目里残留半配置 profile 文件。已知边界：检测通过到集成写入之间存在毫秒级窗口，并发改写项目配置可能留下"已写 profile、未集成"状态；重跑同一 setup 幂等收敛。update 的 writeAtomic 同为无锁原子写：expected revision 复核与写前重读把并发冲突窗口压到复检与 rename 之间的毫秒级，极端并发下仍可能 last-writer-wins（无半写，丢失一次并发更新）。
 - 恢复钩子输出必须标明绑定名、连接名、对应 MCP serverName、远端工程根与目录边界模式；只列出属于当前真实会话且属于本绑定的任务。
 - 文件工具目录边界默认 `restricted`（remoteRoot 内）。仅用户显式选择后记为 `unrestricted`：只解除目录边界，readToken、已读区间、外部变更检查、截断保护与 16 MiB 上限不变；SSH 配置显式 `allowedRemotePaths` 继续作为交集限制。缺省与未确认一律 restricted，不得隐式扩大访问。
 - `directoryScope` 不参与 identity 计算；切换模式不得使旧任务或已签发凭据的归属键失效。unrestricted 绑定仍需存在的 remoteRoot 作为默认执行目录，不引入 `~` 记号。
@@ -70,13 +70,13 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 2026-09-13 票据 #13 已实施可校验续传的流式上传事务、票据 #14 已实施下载方向（WSL Python 套件、npm test 与 VM 套件实测，内网现场未验收）：
 
-- **事务与记录**：上传走 `transfer_register`（服务端持久分配 32 hex `transferId`，不可自带）→ `transfer_start`（幂等）→ 分块交换 → `transfer_verify` → `transfer_commit` 的登记后执行协议；任何后续动作遇到缺记录一律 `REQUEST_EXPIRED_OR_UNKNOWN`，绝不落入创建分支。两端各存小型记录：远端 `<状态根>/transfers/<transferId>/` 下 `record.json`（身份、状态机、确认偏移、实际进展时间、到期时间、资源登记标识）、`chunks.jsonl`（每已确认块一行，追加写入、流式读取）、提交期 `intent.json`（目标预期版本、临时对象身份、最终摘要）与 `receipt.json`（回执）；本机 `<localStateDir>/<identity[:24]>/transfers/<transferId>/record.json` 承担归属与恢复登记（会话不匹配拒绝 `TRANSFER_SCOPE_MISMATCH`）。接收临时数据放目标同目录 `.ssh-mcp-upload-<id>`，先入 #8 资源账本（精确大小直接登记，无 reserve+register 双算）再落盘，提交后注销、正式目标移出计量。
-- **状态机**：`prepared → transferring → verifying → committing → completed`，另有 `failed`（校验或提交复核失败，留痕不复活）与规格预留的 `interrupted`、`cancelled`、`unknown`（后三者由 #15 写入/触发）。查询（status）只读，不启动新传输、不续期；实际块进展同时推进 lastProgressAt 与 3 天到期时间。分配成功但从未启动的记录到期回收属 #16。
+- **事务与记录**：上传走 `transfer_register`（服务端持久分配 32 hex `transferId`，不可自带）→ `transfer_start`（幂等）→ 分块交换 → `transfer_verify` → `transfer_commit` 的登记后执行协议；任何后续动作遇到缺记录一律 `REQUEST_EXPIRED_OR_UNKNOWN`，绝不落入创建分支。两端各存小型记录：远端 `<状态根>/transfers/<transferId>/` 下 `record.json`（身份、状态机、确认偏移、实际进展时间、到期时间、资源登记标识）、`chunks.jsonl`（每已确认块一行，追加写入、流式读取；撕裂的半行按清单结束于上一完整行处理，等价于该块未确认）、提交期 `intent.json`（目标预期版本、临时对象身份、最终摘要）与 `receipt.json`（回执）；本机 `<localStateDir>/<identity[:24]>/transfers/<transferId>/record.json` 承担归属与恢复登记。**会话核对覆盖全部传输动作**（start/resume/verify/commit/status 及块交换）：与登记会话不符一律 `TRANSFER_SCOPE_MISMATCH`。接收临时数据放目标同目录 `.ssh-mcp-upload-<id>`，先入 #8 资源账本（精确大小直接登记，无 reserve+register 双算；引用预留的登记按净增量计额度，预留与兑现不双重计数）再落盘，提交后注销、正式目标移出计量（对账补回执路径同样注销）。传输动作只受锁槽协议切换门槛约束，不检查任务协议排空门槛——两协议不写同一对象，legacy 写入检测由锁槽门槛承担。
+- **状态机**：`prepared → transferring → verifying → committing → completed`，另有 `failed`（校验或提交复核失败——含 verify 尺寸不符与提交发布段的 OS 失败（目标消失/并发出现/权限），后者映射 `FILE_CONFLICT` 留痕，不裸抛 HELPER_ERROR 卡死状态机——留痕不复活）与规格预留的 `interrupted`、`cancelled`、`unknown`（后三者由 #15 写入/触发）。查询（status）只读，不启动新传输、不续期；实际块进展同时推进 lastProgressAt 与 3 天到期时间。分配成功但从未启动的记录到期回收属 #16。
 - **分块与线格式**：默认 1 MiB（可配 64 KiB–8 MiB）；每工作区最多 2 个活动传输；每传输单个在途块、严格顺序接收。块经 SSH exec stdin 二进制流传输——一行有界 JSON 控制帧（transferId/index/offset/size/sha256/sessionId）+ 精确 `size` 原始字节，摘要校验通过且落盘后才追加清单并推进确认偏移；损坏块（`BLOCK_CHECKSUM_MISMATCH`）、乱序/重复块、短块一律拒绝且不推进。整文件不 Base64 进 JSON，模型不参与逐块调用（本机 Node 驱动循环，每次交换独立 60 秒超时，不沿用 30 秒默认命令超时）。
-- **续传与校验**：`transfer_resume` 重读持久块流式重校验，首个不可信边界处截断清单与临时文件（损坏块及其后数据从最近可信边界重传）；临时文件丢失从零重建；未启动过的事务 resume 拒绝（`INVALID_STATE`）。上传源=本机文件：登记时记录源身份（size+mtimeMs），start/resume 重报不符即 `TRANSFER_SOURCE_CHANGED`，本机驱动每块前后再核对。最终两端各自流式 SHA-256 核对相同全文摘要（`transfer_verify`），不跨网传全文；不匹配进 `failed`。
+- **续传与校验**：`transfer_resume` 重读持久块流式重校验，可信边界按各清单条目的实际 `size` 累加（短尾块不影响——绝不用"块数 × 分块大小"推算），首个不可信边界处截断清单与临时文件（损坏块及其后数据从最近可信边界重传）；临时文件丢失从零重建；未启动过的事务 resume 拒绝（`INVALID_STATE`）。`transfer_start` 的崩溃残留（已创建临时文件与账本登记）在重试时按 `.ssh-mcp-upload-<id>` 的唯一命名自愈清理——prepared 态从未接收块，残留可安全重建。上传源=本机文件：登记时记录源身份（size+mtimeMs），start/resume 重报不符即 `TRANSFER_SOURCE_CHANGED`，本机驱动每块前后再核对。最终两端各自流式 SHA-256 核对相同全文摘要（`transfer_verify`），不跨网传全文；不匹配进 `failed`。
 - **提交**：沿用 #10 骨架——默认目标不存在（link 防覆盖创建），覆盖必须 `overwrite=true` 绑定 metadataOnly 的 `expectedVersion`（register 时早检 + commit 时在目标槽位锁内复核），保留权限属组、fsync 文件与目录、原子替换。提交前持久化意图，提交后持久化回执；提交响应丢失重试时按对象身份（rename 保留 inode）加内容摘要双证据核对原事务补回执，证据不足保持 `TRANSFER_STATE_UNKNOWN`，不盲目再覆盖、不把偶然内容相同当作原提交证明。
 - **下载方向（票据 #14，上传的反向）**：远端为发送方，本机 Node 驱动为接收方。`transfer_register(direction=download)` 时远端以 metadataOnly 的 `m1-` 版本观察源并流式摘要（前后双 stat 稳定窗），`totalBytes`/`totalSha256` 一律由发送方计算，调用方自带即拒绝；与上传共享每工作区 2 个活动传输的池。块交换走新 `transfer_fetch` 独立帧通道（与上传 `transfer_block` 的 stdin 模式对称的反向）：stdout 为一行有界 JSON 控制帧 + 精确 `size` 原始字节 + 换行 + 既有 `SSH_MCP_V1` 信封，错误时保持信封-only 形状；本机传输层新增二进制 stdout 通道（`Buffer` 不做 UTF-8 解码），按声明 size 结构化定位载荷，任意二进制内容不会污染解析。接收方确认位置权威：请求落在发送方已服务边界及之前时回退重取（响应丢失后发送方已推进的场景），之后严格顺序。每块前后核对源 `m1-` 版本，变化即置 `failed`（`TRANSFER_SOURCE_CHANGED`，不复活）。本机接收记录（`record.json`/`chunks.jsonl`/`intent.json`/`receipt.json`）为下载方向的权威状态；接收临时 `.ssh-mcp-download-<id>` 先入 #8 本机 SpaceLedger 再落盘，提交后注销移出计量；本机磁盘写满（ENOSPC）时清理临时与登记并从零续传。`transfer_verify` 携带接收方重算摘要，与发送方登记期摘要核对（两端各自流式 SHA-256，不跨网重读）；不匹配两端同置 `failed`。提交在本机执行：默认 link 防覆盖创建，覆盖须 `overwrite=true` 绑定本机目标观察版本（`l1-<size>:<mtimeMs>`，由拒绝消息给出，提交时复核），rename 原子替换；崩溃在 intent 与回执之间时按对象身份（dev:ino）加内容摘要双证据核对补回执，证据不足保持 `TRANSFER_STATE_UNKNOWN`。远端 `transfer_commit` 幂等记录发送方回执以释放共享活动槽位（本机回执权威）。`remote_download` 保持工具名、改 `action=start|status|resume`（默认 start；`cancel`/`ack` 预留 #15），预算与单块 60 秒交换超时同上传；瞬时通道错误驱动内有界重试。下载不签发 readToken、不授予模型已读范围；旧 base64 分块循环与 16 MiB 下载上限已移除。
-- **公共入口**：`remote_upload` 保持工具名，`action=start|status|resume`（默认 start，`cancel`/`ack` 枚举预留、本票以 `UNSUPPORTED_ACTION` 拒绝，#15 交付）。start 返回持久标识与有界状态（响应不含文件数据）；单次调用在 `budgetMs`（默认 55 秒，上限 600 秒）内驱动，预算耗尽返回 `transferring` + `confirmedOffset` + `budgetExhausted=true` 与 resume 指引；resume 只补未确认块。上传不再有 16 MiB 门槛，受两端空间额度约束。下载自 #14 起为同一事务结构的反向（见上一条目），`remote_download` 同样提供 `action=start|status|resume`。
+- **公共入口**：`remote_upload` 保持工具名，`action=start|status|resume`（默认 start，`cancel`/`ack` 枚举预留、本票以 `UNSUPPORTED_ACTION` 拒绝，#15 交付）。start 返回持久标识与有界状态（响应不含文件数据）；单次调用在 `budgetMs`（默认 55 秒，上限 600 秒）内驱动，预算耗尽返回 `transferring` + `confirmedOffset` + `budgetExhausted=true` 与 resume 指引；最后一块确认后才耗尽的预算同样先返回，verify/commit 延后到 resume 执行（尾部不逃出预算，两端同规则）；resume 只补未确认块。上传不再有 16 MiB 门槛，受两端空间额度约束。下载自 #14 起为同一事务结构的反向（见上一条目），`remote_download` 同样提供 `action=start|status|resume`。
 
 主动取消时，确认传输停止后立即删除尚未提交且不再使用的临时数据，不保留续传窗口；已经提交的正式文件不回滚，取消与提交并发时先核对实际结果（#15）。此规则不改变意外中断的 3 天临时数据期限。
 
@@ -101,7 +101,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 | Windows | rg → GNU grep → Python 分块搜索 → Windows PowerShell Select-String（未实施，见 #4） |
 
 - 在执行搜索的远端用 `shutil.which` 检测实际可用性，不假定远端已装某工具。当前实现细节：
-  - **统一语义**：字面量、大小写敏感、UTF-8、按字节匹配；`\n` 分行（`\r` 保留在行内）；pattern 含换行或 NUL 报 `INVALID_PATTERN`。外部后端以受控 stdin 流接收行对齐数据块（`-F -a -n`，pattern 经 argv 单参数传递，不拼接 Shell 文本），行号与字节位置由 helper 侧映射，三后端命中集合一致。
+  - **统一语义**：字面量、大小写敏感、UTF-8、按字节匹配；`\n` 分行（`\r` 保留在行内）；pattern 含换行或 NUL 报 `INVALID_PATTERN`。外部后端以受控 stdin 流接收行对齐数据块（`-F -a -n`，pattern 经 argv 单参数传递，不拼接 Shell 文本），argv 以 bytes 传递、与远端 locale 无关（无 LANG/LC_* 的 exec 通道下 Python 3.6 的 ascii filesystem encoding 不影响中文 pattern 与路径），行号与字节位置由 helper 侧映射，三后端命中集合一致。
   - **大小文件路径**：≥1 MiB 的文件走外部后端；更小的文件直接用内建扫描（避免每文件 fork 开销）。`engine` 字段报告本页实际使用的后端；外部后端全部失败时如实报告 `python-literal`。
   - **崩溃不当无匹配**：外部进程退出码 >1 或被信号杀死时，撤销该文件已产出命中、当页计数 `fallbackFiles+1`、文件改用内建扫描重扫；连续 3 个文件失败后本页剩余文件全部内建。
   - **跳过摘要**：NUL 字节或 UTF-8 解码失败的文件计入 `skippedFiles`（`skippedDetail` 分 binary/encoding/io），不静默消失。超过 8 MiB 无换行的超长行按 1 MiB 片段加 `len(pattern)-1` 字节重叠报告，跨片段匹配不遗漏（重叠区命中极罕见地可能重复报告，行标记 `lineTruncated`）。
@@ -113,7 +113,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 - **结果不依赖后端**：rg 只提供文件条目；目录、符号链接等条目由 Python 骨架遍历（同一筛选规则、跳过普通文件）补齐，两路归并为一条全局按路径排序的流并去重。rg 崩溃或无法启动时本页回退纯 Python 遍历（不能冒充空树），`engine` 如实报本页实际使用的 `ripgrep-files` 或 `python-walk`。骨架遍历惰性产出（每目录排序的 k 路归并），预算中断留下的必然是真排序前缀。
 - **glob 契约保持**：模式继续按 basename 或相对路径 `fnmatch` 匹配，条目仍为 `{path, type, size}`，顺序仍为全局路径排序；`file_list` 既有行为不变（非递归、摘要游标、无 engine 字段）。
 - **过滤对齐 search**：`includeHidden` 默认 true、`respectGitignore` 默认 false，语义与 `remote_search` 完全同一（层级 .gitignore、被忽略父目录不能复活子文件、嵌套否定）；`.git` 内部始终排除，显式指定 `.git` 内路径拒绝 `PATH_NOT_ALLOWED`。
-- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），`scanBudgetSeconds` 约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
+- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），`scanBudgetSeconds` 约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举阶段（含 rg `--files` 读取）耗尽同样返回 partial 与重启游标，不冒充 HELPER_ERROR；**续页在"跳过已返回候选"阶段就耗尽时间预算（游标零推进，重试必在同一位置再超时）时返回明确的 `SCAN_TIME_LIMIT` 错误**，指引缩小目录而非同游标 partial；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
 - **游标**：绑定工作区、会话、根路径、模式、隐藏/忽略开关与预算参数；查询变化返回 `STALE_CURSOR`。目录枚举是尽力快照（规格 5.2），翻页期间目录增删不触发检测，需要新查询。
 
 **未实测边界**：上述行为已在 WSL（假 rg 枚举后端 + 真实 Python 遍历）自动化验证；CentOS 7 VM 无 rg，仅实测 `python-walk` 路径。真实 ripgrep 二进制的 `--files` 输出顺序与旗标行为未经自动化覆盖（实现按路径排序后消费，不依赖其输出顺序）；最终内网离线现场验收仍未完成，见 usage/progress。
@@ -134,7 +134,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 - 版本由服务从 Linux 元数据（设备号、inode、文件大小、mtime_ns、ctime_ns）生成，字符串带 `m1-` 方案前缀；不再计算全文摘要。所有版本均由服务签发与核对，绑定当前工作区与解析后的规范路径（读取前后核对描述符与路径仍指向同一对象）。读取凭据由服务签发并校验，记录工作区、文件身份、版本、实际交付范围、调用作用域与到期时间。Agent 自填哈希或仅执行一次 `stat`（含 metadataOnly 观察本身）不算已经读取。
 - 读取无文件体积上限：内容按 256 KiB 流式缓冲交付，文本输出序列化后控制在 56 KiB 内，`maxBytes`（1..1048576）是返回预算而非文件大小上限。读取不存在的路径返回 `PATH_NOT_FOUND`。
-- `metadataOnly=true` 只接受路径，返回服务观察的目标版本或明确的不存在状态（`exists=false`、`version=null`），不返回内容、不签发读取凭据；供 remote_write/上传的覆盖前置检查使用（#10 消费）。
+- `metadataOnly=true` 只接受路径（与观察无关的 `offset`/`fromLine`/`toLine`/`maxBytes`/`encoding`/`expectedVersion`/`readToken` 出现即 `INVALID_REQUEST`），返回服务观察的目标版本或明确的不存在状态（`exists=false`、`version=null`，存在时附 `size` 与 BOM 判定），不返回内容、不签发读取凭据；供 remote_write/上传的覆盖前置检查使用（#10 消费）。
 - 按行请求（行边界以 LF 定义）从文件头顺序扫描定位，行号不能当字节偏移使用；不回传窗口之前的内容、不缓存全文、不建立永久行索引。行模式返回 `lineStart`/`lineEnd`/`lineEndComplete`；超长行按预算分块交付，续读用 `nextOffset` 字节游标。文本输出不切断 UTF-8 多字节字符；BOM 字节计入已读范围但不进入交付文本；`newline` 按交付窗口计算（窗口无换行时为 null），CRLF 信息保留。
 - 字节游标（`offset`/`nextOffset`）可带可选 `expectedVersion`：与当前观察版本不符时返回 `FILE_CONFLICT`，拒绝在变化后的文件上续用旧游标。不带预期版本的续读会观察到新版本；旧凭据不会静默延伸到新版本。
 - 交付窗口内的无效 UTF-8 明确报 `UNSUPPORTED_ENCODING`（提示改用 base64）；`offset` 落在多字节字符中间报 `INVALID_OFFSET`。
@@ -156,7 +156,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 - **编辑路径无体积上限**：oldText 匹配改为对整个文件的分块字节扫描（256 KiB 块、携带跨块尾部），语义与首版全文匹配一致——恰好一次方可编辑，零匹配返回 `EDIT_MATCH_ERROR` 并提示重读，多匹配同样拒绝并要求扩大 oldText；完整匹配的字节区间必须落在 readToken 已交付范围内（跨块边界的匹配同样受已读保护）。UTF-8 自同步性保证字节级区间等价于原全文文本匹配；同一遍扫描完成全文 UTF-8 校验（文本编辑继续拒绝二进制目标）与换行普查（CRLF 保留）。
 - **流式原子提交**：变长替换不再重组全文，而是按排序后的替换区间把源文件分块复制进已登记的同目录临时文件、在区间处拼接新字节；磁盘 I/O 与网络传输都只经过有界缓冲。多项替换全部定位成功后才写临时文件，任一项失败（歧义、未读、重叠）不产生部分提交；写入并 fsync 后在锁内复核版本，再原子替换并 fsync 目标目录（补上 #6 遗留的目录条目持久化缺口），任一失败保留原目标。成功编辑的凭据续期沿用区间重映射（后像验证改为身份+大小核对）；失败续签仍明确报告已提交。
-- **整体覆盖显式化（ADR 0008）**：`file_write` 默认 create-only——目标存在而无 `overwrite=true` 时拒绝（`FILE_CONFLICT`，消息指引覆盖流程）；覆盖必须 `overwrite=true` 加 `expectedVersion`（metadataOnly 观察版本），二者缺一或与其他参数矛盾返回 `INVALID_REQUEST`；提交前复核版本，外部变化拒绝；创建与覆盖互斥，`readToken` 不再是 write 的参数（helper 层出现即拒绝，MCP schema 已不声明）。覆盖无需旧全文已读；文本覆盖保留 BOM/CRLF 并要求旧内容可解码（分块校验），base64 覆盖无此要求；权限与属组保留。局部编辑的已读区间保护不变。
+- **整体覆盖显式化（ADR 0008）**：`file_write` 默认 create-only——目标存在而无 `overwrite=true` 时拒绝（`FILE_CONFLICT`，消息指引覆盖流程）；覆盖必须 `overwrite=true` 加 `expectedVersion`（metadataOnly 观察版本），二者缺一或与其他参数矛盾返回 `INVALID_REQUEST`；提交前复核版本，外部变化拒绝；创建与覆盖互斥，`readToken` 不再是 write 的参数（helper 层出现即拒绝，MCP schema 已不声明）。覆盖无需旧全文已读；文本覆盖保留 BOM/CRLF 并要求旧内容可解码（分块校验），base64 覆盖无此要求；权限与属组保留。局部编辑的已读区间保护不变。**inline 内容（text/base64 解码后）受 16 MiB 请求预算约束（规格 4.3）**：超出返回 `FILE_TOO_LARGE` 并指引改走 `remote_upload`；恰好 16 MiB 允许，编辑路径（oldText/newText）不受此门，MCP schema 层另有 64 MiB 字符粗防。写入已提交（原子替换完成）后的簿记失败（目录 fsync、账本注销）不掩盖已提交事实：报 `COMMITTED_UNCONFIRMED` 说明已写入与失败原因，调用方须重读当前文件、不得当未写入盲重试。
 - 上传（`remote_upload`）沿用同一覆盖语义：覆盖已有远端目标同样走 `overwrite` + `expectedVersion`（register 早检 + commit 锁内复核）；自 #13 起上传整体改为可续传的流式传输事务（见「大文件传输恢复」一节），16 MiB 本机读取边界已移除，任意大小受两端空间额度约束。
 - 临时文件登记量按流式输出的精确字节数（原大小减去被替换区间加新字节）计算，额度检查随登记在账本锁内完成；删除/移动仍走首版 16 MiB 快照路径。
 

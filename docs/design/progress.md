@@ -122,7 +122,7 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 
 ## 当前交付边界
 
-- 读侧无文件体积上限（流式有界交付，#9 已实施）；写侧单文件 16 MiB 全文边界保留（编辑/覆盖/删除/移动/提交输出），待 #10/#13。Python 搜索不模拟 rg/.gitignore。
+- 读侧与写侧均无文件体积上限（#9 流式读取、#10 流式提交、#13/#14 可续传上传下载事务均已实施）；inline 写入（text/base64）解码后受 16 MiB 请求预算约束，更大内容走上传。搜索为三后端字面量（rg → grep → Python，#11）且文件名查找后端对齐（#12）。
 - 无交互式 stdin/PTY；延期方案见 interactive-assessment.md。
 - 协作锁不能消除不遵守锁的外部写入者的最后竞争窗口。
 - 不自动判断 ZCode 原对话是否已删除，不自动转投其他对话。
@@ -130,3 +130,15 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 - 离线包使用当前 Windows/架构 Node 和已安装依赖。最终内网机器与现有 Python 环境需按 usage.md 验收，不能把联网 VM 测试称为最终离线现场验收。
 
 接入与人工验收步骤见 [usage.md](usage.md)。
+
+## 审查轮 1（2026-09-13，PR #22 内）
+
+三个只读审查代理覆盖已合入的九张票（#6–#13、#18）+ #14 交叉检查，主代理逐项核实源码后确认 23 项缺陷并全部修复（三个并行修复分支 + 合并语义并集），无 P0；最严重为 P1 一项（上传续传 `_heal` 以"块数 × 分块大小"推算可信偏移，短尾块全部可信时把临时文件 truncate 零扩展、事务永久死循环——WSL 实证复现）。
+
+修复要点（详见各 fix 提交正文）：传输层续传流式可信偏移、清单半行容错、提交对账补账本释放、发布段 OS 失败落 failed、崩溃残留自愈、五动作会话核对、verify/commit 尾部不逃出预算；两端账本预留兑现净增量；本机锁回收窗口收窄；搜索续页零推进明确报错、rg 枚举超时转 partial、argv bytes 化（实测 VM exec 通道当前带 LANG=en_US.UTF-8，`env -i` 下 3.6.8 退化为 ascii——bytes argv 使行为与 locale 解耦）；文件链路恢复 inline 16 MiB 请求预算门（规格 4.3）、`COMMITTED_UNCONFIRMED` 不掩盖已提交事实、metadataOnly 拒绝清单补全、symlink 复查前移；`task_start` 两写窗口崩溃自愈；`atomic_json` 补父目录 fsync。
+
+#14 合并时把上述修复语义扩展到下载新增路径（本机 `healDownload` 同构短尾块缺陷、下载尾部预算），由新增的下载预算用例先红后绿捕获。已知测试限制：本机锁 TOCTOU 精确交错与 zod schema 行为级校验无法单进程构造，分别以回归用例与 `maxLength` 声明断言代替。
+
+验证：npm 238 tests/231 pass/0 fail/7 skip（VM 门控项）；WSL 五套件 remote-files 44、remote-agent 13、remote-ledger 12、remote-discovery 27、remote-transfer 46 全 OK；VM 串行门控 workspace-mcp 4/4（含 200 MiB 上传 61 s、下载 64.5 s、编辑 8.8 s）与 job-cli 2/2。注意：两个 VM 套件同 profile 并行执行存在 helper 部署竞争抖动（`node --test` 按文件并行），验证时串行执行或拆 profile。
+
+不修记档（后续票据对齐）：搜索预算参数未暴露 MCP schema 且 policy 层无消费者（#16/#19 接线时统一）；`_truncate_manifest` 固定临时名（锁内私有目录，可接受）；额度检查的递归扫描在锁内执行的性能特征（#19 汇总时观察）。
