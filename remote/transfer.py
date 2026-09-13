@@ -237,7 +237,14 @@ def _materialize(root, record):
 
 
 def _read_manifest(root, transfer_id):
-    """Stream the chunk manifest one line at a time; never a whole-file load."""
+    """Stream the chunk manifest one line at a time; never a whole-file load.
+
+    A process killed mid-append leaves a torn final line: the first line that
+    fails to parse ends the manifest (the torn line and anything after it is
+    not trusted). The record for that chunk advances only after the manifest
+    append, so dropping the torn tail equals treating the chunk as
+    unconfirmed and _heal's truncation rewinds accordingly.
+    """
     path = transfer_path(root, transfer_id) / 'chunks.jsonl'
     if not path.is_file():
         return
@@ -245,7 +252,10 @@ def _read_manifest(root, transfer_id):
         for line in stream:
             line = line.strip()
             if line:
-                yield json.loads(line)
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    return
 
 
 def _truncate_manifest(root, transfer_id, keep):
@@ -288,8 +298,8 @@ def _heal(root, transfer_id, record):
     to that boundary. A deleted temp restarts from zero.
     """
     temp = Path(record['tempPath'])
-    chunk_size = record['chunkSize']
     trusted = 0
+    trusted_offset = 0
     if temp.exists():
         for entry in _read_manifest(root, transfer_id):
             size = entry['size']
@@ -300,7 +310,11 @@ def _heal(root, transfer_id, record):
             if current != entry['sha256']:
                 break
             trusted += 1
-        trusted_offset = trusted * chunk_size
+            # The trusted boundary is the sum of the verified entries' sizes
+            # (the final block may be short), never trusted * chunk_size --
+            # that would extend the temp past the real content when every
+            # block is already confirmed.
+            trusted_offset += size
         if trusted_offset != temp.stat().st_size:
             with temp.open('r+b') as stream:
                 stream.truncate(trusted_offset)
@@ -431,6 +445,11 @@ def verify(root, request):
         temp = Path(record['tempPath'])
         actual_size = temp.stat().st_size
         if actual_size != record['totalBytes']:
+            record.update(state='failed',
+                          error={'code': 'VERIFY_MISMATCH',
+                                 'message': 'Received size {} does not match {}'.format(actual_size, record['totalBytes'])},
+                          completedAt=_now())
+            _save_record(root, transfer_id, record)
             raise AgentError('VERIFY_MISMATCH', 'Received size {} does not match {}'.format(actual_size, record['totalBytes']))
         digest = hashlib.sha256()
         with temp.open('rb') as stream:

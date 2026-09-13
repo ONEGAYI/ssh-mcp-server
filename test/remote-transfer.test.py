@@ -414,6 +414,56 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertEqual(resumed['result']['confirmedOffset'], CHUNK)
         self.assertEqual(self.temp_path(transfer_id).stat().st_size, CHUNK)
 
+    def test_resume_after_full_confirmation_keeps_a_short_tail_intact(self):
+        # 短尾块传输（totalBytes 非 chunkSize 整除）全部确认后断线，resume
+        # 不得把可信偏移当作“满块数 × chunkSize”：那会零扩展 temp 并让
+        # verify 永远尺寸不符。
+        data = b't' * (CHUNK + 10)  # 块0：65536 字节满块；块1：10 字节短块
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data[:CHUNK])
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': self.source(len(data))})
+        self.assertTrue(resumed['ok'], resumed)
+        self.assertEqual(resumed['result']['confirmedOffset'], len(data))
+        self.assertEqual(resumed['result']['chunkCount'], 2)
+        self.assertEqual(self.temp_path(transfer_id).stat().st_size, len(data))
+        verified = self.call('transfer_verify', {'transferId': transfer_id})
+        self.assertTrue(verified['ok'], verified)
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
+    def test_resume_tolerates_a_torn_manifest_tail(self):
+        # 进程在 manifest 行追加中途被杀会留下撕裂半行：resume 必须把它
+        # 视为清单结束并回到可信边界，而不是裸抛 JSON 解析错误。
+        data = b'x' * (CHUNK + 10)
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data[:CHUNK])
+        with (self.state / 'transfers' / transfer_id / 'chunks.jsonl').open('a') as stream:
+            stream.write('{"ind')  # 崩溃留下的撕裂片段
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': self.source(len(data))})
+        self.assertTrue(resumed['ok'], resumed)
+        self.assertEqual(resumed['result']['confirmedOffset'], CHUNK)
+        self.assertEqual(resumed['result']['chunkCount'], 1)
+        # 半行之后追加的块会与撕裂行粘连成不可解析的行，同样不可信：
+        # resume 回退到块0，重传即可完成。
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        healed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                               'sourceIdentity': self.source(len(data))})
+        self.assertTrue(healed['ok'], healed)
+        self.assertEqual(healed['result']['confirmedOffset'], CHUNK)
+        self.assertEqual(len(self.chunks(transfer_id)), 1)
+        self.assertEqual(self.temp_path(transfer_id).stat().st_size, CHUNK)
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        self.call('transfer_verify', {'transferId': transfer_id})
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
     def test_resume_refuses_prepared_transfers_that_never_started(self):
         transfer_id = self.register(b'never started')['result']['transferId']
         response = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
@@ -477,6 +527,21 @@ class RemoteTransferTest(unittest.TestCase):
             response = self.call(action, {'transferId': transfer_id})
             self.assertEqual(response['ok'], False)
             self.assertEqual(response['error']['code'], 'UNSUPPORTED_ACTION')
+
+    def test_verify_size_mismatch_records_failed_state(self):
+        # 尺寸不符与摘要不符同样致命：该分支也必须落 failed 留痕，
+        # 而不是让 record 停在 transferring。
+        data = b's' * 100
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        with self.temp_path(transfer_id).open('r+b') as stream:
+            stream.truncate(150)  # 外部扩展
+        verified = self.call('transfer_verify', {'transferId': transfer_id})
+        self.assertEqual(verified['error']['code'], 'VERIFY_MISMATCH')
+        record = self.record(transfer_id)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['error']['code'], 'VERIFY_MISMATCH')
 
     def test_empty_file_transfers_with_no_blocks(self):
         transfer_id, committed = self.deliver(b'')
