@@ -683,12 +683,147 @@ class RemoteTransferTest(unittest.TestCase):
         # The failed start left the record observable for retry or expiry.
         self.assertEqual(self.record(transfer_id)['state'], 'prepared')
 
-    def test_cancel_and_ack_are_reserved_for_issue_15(self):
-        transfer_id = self.register(b'future')['result']['transferId']
-        for action in ('transfer_cancel', 'transfer_ack'):
-            response = self.call(action, {'transferId': transfer_id})
-            self.assertEqual(response['ok'], False)
-            self.assertEqual(response['error']['code'], 'UNSUPPORTED_ACTION')
+    # --- issue #15: explicit cancellation ---------------------------------------
+
+    def test_cancel_stops_an_upload_and_releases_its_temp_data(self):
+        data = b'c' * (CHUNK + 20)
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data[:CHUNK])
+        cancelled = self.call('transfer_cancel', {'transferId': transfer_id})
+        self.assertTrue(cancelled['ok'], cancelled)
+        self.assertEqual(cancelled['result']['state'], 'cancelled')
+        # 取消即释放：未提交临时数据立即删除，账本登记随之消失。
+        self.assertFalse(self.temp_path(transfer_id).exists())
+        ledger = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        self.assertEqual(ledger['resources'], {})
+        # 已停止的传输不再接收块，也不经 resume 复活。
+        refused = self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        self.assertEqual(refused['error']['code'], 'INVALID_STATE')
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': self.source(len(data))})
+        self.assertEqual(resumed['result']['state'], 'cancelled')
+        # 活动槽已释放：可以注册新传输。
+        fresh = self.register(b'fresh', target='fresh.bin')
+        self.assertTrue(fresh['ok'], fresh)
+
+    def test_cancel_is_idempotent_and_never_rolls_back_committed_targets(self):
+        data = b'already committed'
+        transfer_id, committed = self.deliver(data, target='committed.bin')
+        # 取消请求不能否定已完成的提交：状态保持 completed，目标不回滚。
+        cancelled = self.call('transfer_cancel', {'transferId': transfer_id})
+        self.assertTrue(cancelled['ok'], cancelled)
+        self.assertEqual(cancelled['result']['state'], 'completed')
+        self.assertEqual((self.work / 'committed.bin').read_bytes(), data)
+        again = self.call('transfer_cancel', {'transferId': transfer_id})
+        self.assertEqual(again['result']['state'], 'completed')
+        # failed 与已取消的传输重复取消同样幂等观察。
+        failed_id = self.register(b'will fail', target='fail.bin')['result']['transferId']
+        self.start(failed_id)
+        self.block(failed_id, 0, 0, b'will fail')
+        with self.temp_path(failed_id).open('r+b') as stream:
+            stream.write(b'X')
+        self.call('transfer_verify', {'transferId': failed_id})
+        self.assertEqual(self.call('transfer_cancel', {'transferId': failed_id})['result']['state'],
+                         'failed')
+
+    def test_cancel_in_the_commit_window_reconciles_by_evidence(self):
+        # 场景一：rename 已发生（发布完成）但 receipt 丢失——取消必须按
+        # intent 身份+摘要证据认账为 completed，而不是回滚已提交目标。
+        data = b'published before cancel'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        temp = self.temp_path(transfer_id)
+        info = temp.stat()
+        intent = {'schemaVersion': 1, 'targetPath': str(self.work / 'target.bin'),
+                  'expectedVersion': None, 'overwrite': False, 'create': False,
+                  'tempIdentity': '{}:{}'.format(info.st_dev, info.st_ino),
+                  'totalSha256': hashlib.sha256(data).hexdigest(), 'totalBytes': len(data),
+                  'plannedAt': time.time()}
+        directory = self.state / 'transfers' / transfer_id
+        (directory / 'intent.json').write_text(json.dumps(intent))
+        record = self.record(transfer_id)
+        record['state'] = 'committing'
+        (directory / 'record.json').write_text(json.dumps(record))
+        os.replace(str(temp), str(self.work / 'target.bin'))
+        reconciled = self.call('transfer_cancel', {'transferId': transfer_id})
+        self.assertTrue(reconciled['ok'], reconciled)
+        self.assertEqual(reconciled['result']['state'], 'completed')
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+        self.assertTrue((directory / 'receipt.json').exists())
+        # 场景二：intent 已持久化但发布从未发生（temp 还在）——持锁观察即
+        # 证明提交无法再启动，取消安全：删 temp、置 cancelled。
+        second = self.register(data, target='late.bin')['result']['transferId']
+        self.start(second)
+        self.block(second, 0, 0, data)
+        self.call('transfer_verify', {'transferId': second})
+        temp = self.temp_path(second)
+        info = temp.stat()
+        directory = self.state / 'transfers' / second
+        (directory / 'intent.json').write_text(json.dumps(dict(intent, targetPath=str(self.work / 'late.bin'),
+                                                              tempIdentity='{}:{}'.format(info.st_dev, info.st_ino))))
+        record = self.record(second)
+        record['state'] = 'committing'
+        (directory / 'record.json').write_text(json.dumps(record))
+        stopped = self.call('transfer_cancel', {'transferId': second})
+        self.assertTrue(stopped['ok'], stopped)
+        self.assertEqual(stopped['result']['state'], 'cancelled')
+        self.assertFalse(temp.exists())
+        self.assertFalse((self.work / 'late.bin').exists())
+
+    def test_cancel_rejects_foreign_sessions_and_unknown_identifiers(self):
+        data = b'scoped cancel'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        foreign = self.call('transfer_cancel', {'transferId': transfer_id}, session='session-other')
+        self.assertEqual(foreign['error']['code'], 'TRANSFER_SCOPE_MISMATCH')
+        unknown = self.call('transfer_cancel', {'transferId': 'f' * 32})
+        self.assertEqual(unknown['error']['code'], 'REQUEST_EXPIRED_OR_UNKNOWN')
+        # 取消从未启动的（prepared）登记同样成立：无临时数据，直接终态。
+        quiet = self.register(b'never started', target='quiet.bin')['result']['transferId']
+        early = self.call('transfer_cancel', {'transferId': quiet})
+        self.assertEqual(early['result']['state'], 'cancelled')
+
+    # --- issue #15: acknowledgement ----------------------------------------------
+
+    def test_ack_requires_a_terminal_state_and_is_idempotent(self):
+        data = b'ack me'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        # 传输进行中不允许确认。
+        premature = self.call('transfer_ack', {'transferId': transfer_id})
+        self.assertEqual(premature['error']['code'], 'TRANSFER_NOT_FINISHED')
+        self.assertFalse((self.state / 'transfers' / transfer_id / 'ack.json').exists())
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        self.call('transfer_commit', {'transferId': transfer_id})
+        first = self.call('transfer_ack', {'transferId': transfer_id})
+        self.assertTrue(first['ok'], first)
+        self.assertTrue(first['result']['acknowledged'])
+        self.assertEqual(first['result']['state'], 'completed')
+        ack = json.loads((self.state / 'transfers' / transfer_id / 'ack.json').read_text())
+        self.assertEqual(ack['transferId'], transfer_id)
+        again = self.call('transfer_ack', {'transferId': transfer_id})
+        self.assertTrue(again['result']['acknowledged'])
+        # failed 与 cancelled 的结果同样可以（且应当被）确认消费。
+        failed_id = self.register(b'fails later', target='f2.bin')['result']['transferId']
+        self.start(failed_id)
+        self.block(failed_id, 0, 0, b'fails later')
+        with self.temp_path(failed_id).open('r+b') as stream:
+            stream.write(b'X')
+        self.call('transfer_verify', {'transferId': failed_id})
+        self.assertEqual(self.call('transfer_ack', {'transferId': failed_id})['result']['state'], 'failed')
+        scoped = self.register(b'scope', target='scope.bin')['result']['transferId']
+        self.start(scoped)
+        self.call('transfer_cancel', {'transferId': scoped})
+        self.assertEqual(self.call('transfer_ack', {'transferId': scoped})['result']['state'], 'cancelled')
+        # 会话与未知标识的边界。
+        mismatched = self.call('transfer_ack', {'transferId': transfer_id}, session='session-other')
+        self.assertEqual(mismatched['error']['code'], 'TRANSFER_SCOPE_MISMATCH')
+        self.assertEqual(self.call('transfer_ack', {'transferId': 'f' * 32})['error']['code'],
+                         'REQUEST_EXPIRED_OR_UNKNOWN')
 
     def test_verify_size_mismatch_records_failed_state(self):
         # 尺寸不符与摘要不符同样致命：该分支也必须落 failed 留痕，
