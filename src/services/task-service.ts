@@ -9,7 +9,7 @@ interface RemoteCaller {
 
 export interface RemoteTask {
   jobId: string;
-  state: "starting" | "running" | "exited" | "cancelled" | "interrupted" | "unknown";
+  state: "prepared" | "starting" | "running" | "exited" | "cancelled" | "interrupted" | "unknown";
   exitCode?: number;
   completedAt?: number;
   reason?: string;
@@ -28,6 +28,8 @@ export interface TaskRequest {
 
 export interface TaskRecord extends TaskRequest {
   schemaVersion: 1;
+  /** Marker for tasks created through the register-then-execute protocol (v2). */
+  protocol?: 2;
   jobId: string;
   workspaceId: string;
   createdAt: string;
@@ -104,13 +106,25 @@ export class TaskService {
 
   async start(request: TaskRequest): Promise<TaskRecord> {
     if (!request.sessionId || request.sessionId.includes("\0")) throw new RemoteAgentError("INVALID_SESSION", "A real owner session identifier is required");
-    const record: TaskRecord = { ...request, schemaVersion: 1, jobId: randomUUID(), workspaceId: this.workspaceId, createdAt: new Date().toISOString() };
+    // Register before executing: the remote side durably assigns the task
+    // identifier first, so a lost response cannot anchor a duplicate retry.
+    // Any failure here (parameter validation, drain gate, connection loss)
+    // leaves no local record and has caused no execution side effect.
+    const registration = await this.remote.call<{ jobId: string }>("task_register", {
+      protocol: 2, command: request.command, cwd: request.cwd, env: request.env ?? {},
+      executionTimeoutMs: request.executionTimeoutMs, maxOutputBytes: request.maxOutputBytes,
+    });
+    if (!registration?.jobId || typeof registration.jobId !== "string") {
+      throw new RemoteAgentError("INVALID_HELPER_RESPONSE", "Registration did not return a task identifier");
+    }
+    const record: TaskRecord = { ...request, env: request.env ?? {}, schemaVersion: 1, protocol: 2,
+      jobId: registration.jobId, workspaceId: this.workspaceId, createdAt: new Date().toISOString() };
     const directory = this.taskPath(record.jobId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    // Registration is durable before the first remote side effect.
+    // Registration is durable on both sides before the first execution side effect.
     await atomicJson(join(directory, "record.json"), record);
     try {
-      await this.remote.call("start", { ...request, jobId: record.jobId });
+      await this.remote.call("task_start", { protocol: 2, jobId: record.jobId });
       await atomicJson(join(directory, "started.json"), { confirmed: true });
     } catch (cause) {
       const rejected = await this.saveRejection(record.jobId, cause);
@@ -124,8 +138,9 @@ export class TaskService {
   }
 
   private async saveRejection(jobId: string, error: unknown): Promise<boolean> {
-    // These helper validation codes are emitted before any new remote task exists.
-    if (!(error instanceof RemoteAgentError) || !["INVALID_COMMAND", "INVALID_CWD", "INVALID_ENV", "INVALID_TIMEOUT", "INVALID_LIMIT"].includes(error.code)) return false;
+    // These codes are emitted before any new remote execution exists.
+    if (!(error instanceof RemoteAgentError) || !["INVALID_COMMAND", "INVALID_CWD", "INVALID_ENV",
+      "INVALID_TIMEOUT", "INVALID_LIMIT", "REQUEST_EXPIRED_OR_UNKNOWN"].includes(error.code)) return false;
     await atomicJson(join(this.taskPath(jobId), "rejected.json"), { jobId, state: "interrupted", reason: "START_REJECTED", errorCode: error.code, completedAt: Date.now() / 1000 });
     return true;
   }
@@ -136,7 +151,9 @@ export class TaskService {
   }
 
   /** Replay only an already registered request with the same ID. The remote claim
-   * reconciles ambiguity and never starts a second copy of an existing task. */
+   * reconciles ambiguity and never starts a second copy of an existing task.
+   * Protocol-v2 records replay through task_start; legacy records keep the
+   * legacy full-request replay entry. */
   async reconcile(jobId: string): Promise<void> {
     const record = await this.record(jobId);
     if (await this.rejection(jobId)) return;
@@ -145,8 +162,10 @@ export class TaskService {
       if (receipt.confirmed === true) return;
       throw new RemoteAgentError("REGISTRY_CORRUPT", "Invalid startup receipt");
     } catch (error) { if (!isMissing(error)) throw error; }
-    try { await this.remote.call("start", record as unknown as Record<string, unknown>); }
-    catch (error) { if (await this.saveRejection(jobId, error)) return; throw error; }
+    try {
+      if (record.protocol === 2) await this.remote.call("task_start", { protocol: 2, jobId });
+      else await this.remote.call("start", record as unknown as Record<string, unknown>);
+    } catch (error) { if (await this.saveRejection(jobId, error)) return; throw error; }
     await atomicJson(join(this.taskPath(jobId), "started.json"), { confirmed: true });
   }
 
