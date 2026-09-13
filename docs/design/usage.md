@@ -148,7 +148,17 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 - `maxBytes` 默认 65536，可设 1–1048576；它限制原始内容字节数，实际返回仍受独立的 64 KiB JSON 输出预算约束。文件本身无体积上限（#9 起流式交付）。
 - `truncated` 表示本次请求区间是否因上限未返回完整；`nextOffset` 给出可继续读取的字节位置，`startOffset` / `endOffset` 标出本次实际范围。
 - `complete` 表示当前凭据的已知范围覆盖整个文件（来自实际读取及自身编辑后的继承）。局部区间读完可以同时出现 `truncated=false`、`complete=false`。
-- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖与上传覆盖绑定 metadataOnly 观察版本（#10/#13），无需完整已读；下载覆盖绑定本机目标观察版本（#14，见下）；删除或移动仍须具有完整已知范围。同一文件版本变化后旧凭据失效。
+- 读取时仅实际返回的范围计入 readToken。未读完时允许编辑已知范围；整文件覆盖与上传覆盖绑定 metadataOnly 观察版本（#10/#13），无需完整已读；下载覆盖绑定本机目标观察版本（#14，见下）。同一文件版本变化后旧凭据失效。
+
+### 移动、删除与目录管理（远端 Shell）
+
+`remote_move` / `remote_delete` / `remote_mkdir` / `remote_rmdir` 已移除（ADR 0007 / #20）。这些操作通过远端 Shell 完成，即用后台任务执行 `mv`、`rm`、`mkdir`、`rmdir` 等命令：
+
+```text
+node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <会话标识> --command "mv old/name new/name"
+```
+
+**Shell 移动删除不再拥有 readToken 保护**：远端 Shell 不检查读取凭据、已读范围或文件版本，防误操作依靠操作规范与所在客户端的命令审查。这不代表任何未来删除请求自动获授权——实际操作仍需遵循当前任务范围和用户指令。文件工具的读取凭据、精确编辑与版本覆盖保护不受影响。
 
 传入 `offset` 后按该位置读取至文件尾（再受单次上限限制），不再使用 fromLine/toLine 作为区间终点；它不是绑定原区间的游标。文本 offset 必须位于 UTF-8 字符边界，使用返回的 nextOffset 可避免手算。二进制使用 `encoding: "base64"` 与字节 offset。
 
@@ -158,7 +168,7 @@ node build/cli/job.js doctor --workspace D:/RemoteWork/example/.ssh-mcp-workspac
 
 例如 `read → token A → edit → token B → edit → token C`。若初始只读了一部分文件，后续依然不能凭此覆盖整个文件；外部修改仍会使新凭据失效。
 
-如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload/delete/move 不自动续期。
+如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload 不自动续期。
 
 ### 上传大文件（可续传传输事务）
 
@@ -234,7 +244,7 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 |---|---|
 | 目录边界 | 默认限制在 remoteRoot 内；仅用户显式选择 unrestricted 后文件工具可按绝对路径访问远端任意位置，其余文件保护不变 |
 | 文件大小 | 读取与编辑无上限（流式，#9/#10）；上传与下载均无上限，走可续传传输事务（#13/#14）。inline 写入（text/base64）解码后最大 16 MiB，更大内容走上传 |
-| 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖、删除、移动需要完整已知范围 |
+| 读后写 | 服务签发凭据；局部编辑只准修改已知范围；覆盖须显式绑定观察版本。移动、删除与目录管理不属文件工具（#20 / ADR 0007），走远端 Shell，无 readToken 保护 |
 | 冲突 | 内容、身份或元数据变化后拒绝旧凭据；自身精确 edit 成功后核对写入结果并续期，其余写入口不自动续期。已提交写入的簿记失败报 `COMMITTED_UNCONFIRMED`（文件已写入，须重读后再操作，不得当未写入盲重试） |
 | 编码 | 文本 UTF-8/BOM，保留原 CRLF 约定、权限与组；混合换行不整体重排。其他编码按 base64 传输 |
 | 链接 | 经过符号链接的修改、多硬链接和非自有文件的替换明确不支持 |
@@ -245,7 +255,7 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 | 命令日志 | stdout/stderr 分开持久保存。默认每任务合计 256 MiB，超限终止受管理命令并明确 OUTPUT_LIMIT；工作区额度耗尽时停止保存新日志并标注 STORAGE_LIMIT（命令继续运行） |
 | 日志展示 | 本机最多展示 64 KiB 前缀，其余可用 remote_output 的字节游标或 tail=true 读取；不会为丢弃内容下载完整巨量日志 |
 
-普通 Shell 命令仍可写文件。这套机制保护专用文件工具的开发操作，不拦截所有 Shell 写入。版本检查与原子替换之间，对不遵守协作锁的外部写入者仍有竞争窗口。无覆盖移动使用同文件系统 link/unlink；两步间崩溃可能保留两个名字，后续多硬链接检查会明确拒绝继续修改。
+普通 Shell 命令仍可写文件。这套机制保护专用文件工具的开发操作，不拦截所有 Shell 写入。版本检查与原子替换之间，对不遵守协作锁的外部写入者仍有竞争窗口。文件工具的创建/覆盖提交使用同文件系统临时文件加原子替换；移动与目录管理属 Shell 命令（#20），本服务不约束其执行方式，操作前自行核对目标。
 
 ## 到期回收与在线维护
 

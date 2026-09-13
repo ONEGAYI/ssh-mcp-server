@@ -1,6 +1,6 @@
 # 大文件扩展实施票据
 
-状态：2026-09-13 #6–#19（含 #18）共 15 张已实施并合入 `feat/large-file-spec`（PR #22，含审查轮 1 修复与复核收尾）；#20 已解锁待实施，#21 终验收尾。
+状态：2026-09-13 #6–#19（含 #18）共 15 张已实施并合入 `feat/large-file-spec`（PR #22，含审查轮 1 修复与复核收尾）；#20 已实施（分支 `ticket/20-tool-retirement`，待审阅验收），#21 终验收尾。
 
 规格：[本地规格](large-file-spec.md) / [GitHub #5](https://github.com/ONEGAYI/ssh-mcp-server/issues/5)。既有需求 #3 保持开放，远端 Windows 另见 #4。
 

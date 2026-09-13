@@ -1,5 +1,25 @@
 # 实施进展与验证证据
 
+## 2026-09-13 票据 #20：移除四项文件管理工具并收缩旧协议
+
+分支 `ticket/20-tool-retirement`（基于 0c6208e），按规格第 9 节与 ADR 0007 实施（TDD，先红后绿，测试与实现分开提交）：
+
+1. **四工具移除**：remote_move/remote_delete/remote_mkdir/remote_rmdir 的 MCP 注册（workspace-server.ts）与远端 helper 动作分发（files.py）移除；文档（contracts/usage/README/ADR 0007）同步引导移动/删除/目录管理改用远端 Shell（登记执行任务），明确 Shell 路径不设 readToken 保护且不代表未来删除自动获授权。**helper 兼容决策**：远端不留兼容分发——helper 镜像按内容摘要隔离部署，各版本客户端用自己的镜像，旧镜像由 #17 维护轮按升级纪律回收（决策写入 contracts）。
+2. **全文快照路径移除**：仅被 delete/move 使用的 snapshot/read_whole_file/verify_stable_read/require_snapshot_size/full_read 链路删除，16 MiB 内存快照不复存在；MAX_FILE_BYTES 仅保留为 inline 写入请求预算，版本观察（m1- 元数据）与共享边界（require_regular_file/replaceable）保留。
+3. **legacy v1 记录处理补全**（规格 9 节对 #16 的核对结果）：发现并修复两处缺口——(a) reclaim 的 unknown 形态到期删除缺激活门槛，会在未激活工作区删 v1 记录、重开 legacy start 创建窗口（违反契约"v1 记录仅在激活后删除"），补上与终态一致的 `_record_deletion_allowed`；(b) `legacy_pending_jobs` 仅按 state.json 字段判活，死 worker 的 v1 running 记录既不能 cancel（WORKER_UNAVAILABLE）又永久阻塞激活，与 (a) 互锁成升级死结——判活改为与 status 同源（describe），观察为 unknown 的死记录不再阻塞切换，真活动旧任务仍 LEGACY_TASKS_PENDING（#7 既有用例回归锁定）。已知终态按原 completedAt/acknowledgedAt 到期、无法证明结束进 unknown 阶段（迁移观察时间）在 v1/v2 两种记录形状上均有行为锁定。
+4. **测试改写**（按新语义而非删除）：工具清单断言反向化（四工具必须缺席）；helper 四动作 UNSUPPORTED_ACTION 且无副作用；二进制用例聚焦 base64 读+显式覆盖+旧凭据失效；目录操作用例自建目录；版本观察用例改用 current_version；锁槽去重用例改直接驱动 locks.acquire_slots（file_move 退役后无公共多目标入口），线程看护死锁并补同槽互斥断言；VM 用例清理改登记任务 rm。
+
+验证证据（2026-09-13，worktree ticket-20，profile wt20-largefile 与其他 worktree 隔离）：
+
+- 红证据（实现前）：WSL `python3 test/remote-files.test.py RemoteFilesTest.test_file_management_actions_are_retired` → FAIL（file_delete 返回 ok=True 仍执行删除）；`node --test test/workspace-mcp.test.js` → FAIL（remote_move must no longer be advertised）；`test_legacy_v1_unfinished_record_is_observable_and_removal_gates_on_activation` → FAIL（未激活工作区 removedJobs 含 v1 记录）。`test_legacy_v1_terminal_record_...` 为 #16 既有行为的锁定用例（直接绿，按票据"已实现则验证并锁定"）。
+- Windows Node 24.15：`npm test` 272 项（258 通过、14 VM 门控跳过、0 失败）。
+- WSL Ubuntu / Python 3.12 七套件全 OK：remote-agent 13、remote-discovery 27、remote-files 45、remote-ledger 12、remote-reclaim 23（新增 2 用例）、remote-space-report、remote-transfer。
+- CentOS 7.9 VM 真实 SSH（两文件分开串行）：`workspace-mcp-remote.test.js` 5/5；`job-cli-remote.test.js` 8/8（VM 用例按新语义改写：清理走 task_register/task_start 的 rm，不再调用 remote_delete）。
+- 已知边界：死 worker 的 v1 记录在激活前不可删除也不可 cancel，只能观察为 unknown——若用户永不让新客户端完成握手，记录将一直保留（可观察、计入状态目录，无额度风险增量）；真机升级场景（旧客户端在运行时部署新客户端）未实测，仅自动化夹具覆盖。
+- 本票尚未由用户人工验收；最终内网离线现场验收仍未完成。
+
+## 2026-09-13 票据 #17：回收过期读取凭据、旧 helper 与遗留临时文件
+
 - 已知边界：远端/本机维护摘要的计数只描述最近一轮（预算中断轮次在下一轮续扫，不隐含跨轮总计）；本机 stateBytes 扫描与额度检查同一递归遍历，规模大时的性能特征待观察（沿用 #8 记档条目）；裁剪兜底阶梯的最深两级无行为级测试（固定 schema 常态不可能触发，仅防御性实现，契约已写明规则）。
 - 本票尚未由用户人工验收；最终内网离线现场验收仍未完成。
 
