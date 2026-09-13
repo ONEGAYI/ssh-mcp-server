@@ -73,6 +73,7 @@ export interface PendingTransfer {
   path: string;
   localPath: string;
   totalBytes: number;
+  confirmedOffset?: number;
   state?: string;
   createdAt: string;
 }
@@ -1074,6 +1075,7 @@ export class TransferService {
       }
       pending.push({ transferId: entry.name, direction: record.direction,
         path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
+        confirmedOffset: record.direction === "download" ? record.confirmedOffset : undefined,
         state: record.direction === "download" ? record.state : undefined,
         createdAt: record.createdAt });
     }
