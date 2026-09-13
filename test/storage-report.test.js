@@ -71,10 +71,60 @@ it('aggregates local ledger usage and maintenance counters, never per-item listi
     assert.equal(local.maintenance.itemsConsidered, 205);
     assert.equal(JSON.stringify(local.maintenance).includes('job-'), false,
       'no per-item identifiers may leak into the bounded report');
-    // The remote half is passed through as the helper produced it.
-    assert.deepEqual(report.storage.remote, remoteStorage);
+    // The remote half passes through with its second-precision maintenance
+    // timestamps normalized to milliseconds (the helper's clock is time.time()).
+    assert.deepEqual(report.storage.remote, { ...remoteStorage,
+      maintenance: { ...remoteStorage.maintenance, lastCompletedAt: 1697000001000, lastRunAt: 1697000001000 } });
     assert.ok(Buffer.byteLength(JSON.stringify(report), 'utf8') <= 4096,
       'the whole report must stay within the 4 KiB budget');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+it('remote maintenance timestamps land in the same millisecond magnitude as the local ones (review R3)', async () => {
+  assert.ok(buildStorageReport, 'storage report service is not implemented');
+  const fixture = await buildFixture();
+  try {
+    // The local maintenance record is a real executed round (milliseconds).
+    const now = Date.now();
+    await mkdir(fixture.identityDir, { recursive: true });
+    await writeFile(join(fixture.identityDir, 'maintenance.json'), JSON.stringify({ schemaVersion: 1,
+      lastCompletedAt: now - 3600000, lastRunAt: now - 3500000,
+      lastLocalSummary: { removedTasks: [], removedTransfers: [], reclaimedResources: [], itemsConsidered: 0 } }));
+    // The remote helper reports seconds (reclaim.py's clock is time.time()).
+    const nowSeconds = Math.floor(now / 1000);
+    const remoteStorage = { stateBytes: 10, tempBytes: 0, reservedBytes: 0, usedBytes: 10,
+      limitBytes: 10 * 1024 ** 3, resourceCount: 0, reservationCount: 0,
+      maintenance: { lastCompletedAt: nowSeconds, lastRunAt: nowSeconds, removedJobs: 0, itemsConsidered: 3 } };
+    const files = { call: async () => ({ storage: remoteStorage }) };
+    const report = await buildStorageReport(fixture.config, files, 'session-report');
+    const local = report.storage.local;
+    const remote = report.storage.remote;
+    // The local end reports its own lastRunAt alongside lastCompletedAt.
+    assert.equal(typeof local.maintenance.lastRunAt, 'number');
+    assert.ok(local.maintenance.lastRunAt > 0 && local.maintenance.lastRunAt <= Date.now());
+    // The remote seconds are normalized to milliseconds: same magnitude as
+    // the local figures, no 1000x skew between the two ends.
+    assert.equal(remote.maintenance.lastCompletedAt, nowSeconds * 1000);
+    assert.equal(remote.maintenance.lastRunAt, nowSeconds * 1000);
+    assert.ok(Math.abs(remote.maintenance.lastCompletedAt - local.maintenance.lastCompletedAt) < DAY,
+      'both ends must report comparable millisecond timestamps');
+    // Already-millisecond values (a future helper switch or a pre-normalized
+    // value) pass through unchanged -- never scaled a second time.
+    const milliStorage = structuredClone(remoteStorage);
+    milliStorage.maintenance.lastCompletedAt = nowSeconds * 1000;
+    milliStorage.maintenance.lastRunAt = nowSeconds * 1000;
+    const milliReport = await buildStorageReport(fixture.config,
+      { call: async () => ({ storage: milliStorage }) }, 'session-report');
+    assert.equal(milliReport.storage.remote.maintenance.lastCompletedAt, nowSeconds * 1000);
+    assert.equal(milliReport.storage.remote.maintenance.lastRunAt, nowSeconds * 1000);
+    // Zero (never ran) stays zero instead of being inflated.
+    const zeroStorage = structuredClone(remoteStorage);
+    zeroStorage.maintenance.lastCompletedAt = 0;
+    zeroStorage.maintenance.lastRunAt = 0;
+    const zeroReport = await buildStorageReport(fixture.config,
+      { call: async () => ({ storage: zeroStorage }) }, 'session-report');
+    assert.equal(zeroReport.storage.remote.maintenance.lastCompletedAt, 0);
+    assert.equal(zeroReport.storage.remote.maintenance.lastRunAt, 0);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
