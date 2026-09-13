@@ -27,8 +27,8 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
     });
   };
   register("remote_workspace", "Inspect remote workspace capabilities, directory scope, and rule-file locations. Read rules using remote_read before development.", { sessionId }, async input => files.call("file_workspace", input.sessionId));
-  register("remote_read", "Read UTF-8 text by lines or byte cursor, or base64 binary. Only returned ranges authorize later modifications. Maximum file size 16 MiB.",
-    { sessionId, path, fromLine: z.number().int().positive().optional(), toLine: z.number().int().positive().optional(), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().min(1).max(1048576).optional(), encoding: z.enum(["utf8", "base64"]).optional() },
+  register("remote_read", "Read UTF-8 text by lines or byte cursor, or base64 binary, streamed from any file size; text delivery stays within ~56 KiB. Line reads return lineStart/lineEnd/lineEndComplete and overlong lines chunk with nextOffset continuation. Only returned ranges authorize later modifications. metadataOnly=true returns just the observed version (or exists=false) without content and without granting read coverage, for overwrite prechecks.",
+    { sessionId, path, fromLine: z.number().int().positive().optional(), toLine: z.number().int().positive().optional(), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().min(1).max(1048576).optional(), encoding: z.enum(["utf8", "base64"]).optional(), metadataOnly: z.boolean().optional(), expectedVersion: z.string().optional().describe("Version the cursor was issued under; refuse with FILE_CONFLICT if the file changed since") },
     input => files.call("file_read", input.sessionId, input));
   for (const [name, action, description] of [
     ["remote_list", "file_list", "List immediate entries with stable query-scoped pagination."],

@@ -1,8 +1,9 @@
 """Workspace file operations with server-issued read records and version checks.
 
 Internal boundaries (issue #6), each replaceable without rewriting callers:
-version observation, content reading (whole-file today, streaming in #9),
-replacement planning (in-memory today, chunked in #10), and commit.
+version observation (metadata-only since issue #9, spec 4.1), content reading
+(bounded streaming windows since issue #9, spec 4.2), replacement planning
+(in-memory today, chunked in #10), and commit.
 """
 from contextlib import contextmanager
 import base64
@@ -14,40 +15,75 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import time
 import uuid
 from common import AgentError, atomic_json, read_json
 
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_STREAM_CHUNK = 256 * 1024
+READ_BUDGET = 65536 - 8192
+READ_TOKEN_TTL_SECONDS = 3 * 24 * 3600
 BOM = b'\xef\xbb\xbf'
 
 
+def _now():
+    """Clock for credential lifetimes. SSH_MCP_TEST_CLOCK is the narrow
+    test-only injection point for expiry behaviour (spec 10)."""
+    clock = os.environ.get('SSH_MCP_TEST_CLOCK')
+    return float(clock) if clock is not None else time.time()
+
+
 # --- Version observation ------------------------------------------------------
-# Observes the file identity and derives the version string. Callers compare
-# the string opaquely, so #9 can swap the content hash for metadata-only
-# observation inside this boundary alone.
+# Observes the file identity and derives the version string. Since issue #9
+# the version binds Linux metadata only; the full-content hash is gone.
 
 def metadata(info):
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink]
 
 
-def require_guarded_file(info):
-    """Snapshot gate: only regular files within the guarded size."""
+def version_fields(info):
+    """The spec 4.1 metadata set: device, inode, size, mtime_ns, ctime_ns."""
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def require_regular_file(info):
+    """Snapshot gate: only regular files participate in file tools."""
     if not stat.S_ISREG(info.st_mode):
         raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
+
+
+def require_snapshot_size(info):
+    """Whole-file gate for the mutation paths that still buffer full content.
+
+    Streaming replacement lands with issue #10; until then guarded mutations
+    keep the first-version 16 MiB bound. Content reads have no size cap.
+    """
     if info.st_size > MAX_FILE_BYTES:
-        raise AgentError('FILE_TOO_LARGE', 'Guarded file operations currently support files up to 16 MiB')
+        raise AgentError('FILE_TOO_LARGE', 'Guarded mutations currently support files up to 16 MiB')
 
 
-def content_version(info, data):
-    """Version string binding stat metadata to the full content hash."""
-    return hashlib.sha256(json.dumps(metadata(info)).encode() + data).hexdigest()
+def content_version(info):
+    """Version string binding Linux metadata alone (spec 4.1).
+
+    The m1- prefix separates this scheme from the pre-#9 content hashes, so
+    credentials issued under the old scheme can never compare equal.
+    """
+    return 'm1-' + hashlib.sha256(json.dumps(version_fields(info)).encode('utf8')).hexdigest()
+
+
+def same_object(info, path):
+    """Confirm the resolved path still names the observed object."""
+    return metadata(info) == metadata(path.stat())
 
 
 def current_version(path):
-    """Version observed right now. Still a full snapshot; #9 swaps the
-    internals for metadata-only observation without touching callers."""
-    return snapshot(path)[2]
+    """Version observed right now, from descriptor metadata alone."""
+    with path.open('rb') as stream:
+        info = os.fstat(stream.fileno())
+    if not same_object(info, path):
+        raise AgentError('FILE_CONFLICT', 'File identity changed while observing')
+    return content_version(info)
 
 
 def verify_stable_read(before, after, data, path):
@@ -57,11 +93,15 @@ def verify_stable_read(before, after, data, path):
 
 
 # --- Content reading ------------------------------------------------------------
-# Turns the file into delivered windows. Today that means buffering the whole
-# file; #9 replaces it with bounded streaming behind the same contracts.
+# Turns the file into delivered windows through bounded streaming buffers
+# (spec 4.2): line requests scan to their boundaries sequentially, byte
+# cursors read directly, and nothing buffers or returns the whole file.
 
 def read_whole_file(stream, expected):
-    """Read the entire file between two descriptor identity checks."""
+    """Read the entire file between two descriptor identity checks.
+
+    Snapshot-only helper for the mutation paths that still plan in memory.
+    """
     if metadata(os.fstat(stream.fileno())) != metadata(expected):
         raise AgentError('FILE_CONFLICT', 'File identity changed while reading')
     data = stream.read(MAX_FILE_BYTES + 1)
@@ -69,26 +109,103 @@ def read_whole_file(stream, expected):
 
 
 def snapshot(path):
-    """Observe the version and read the whole current content.
+    """Observe the metadata version and read the whole current content.
 
     Couples version observation with a whole-file read under three-way stat
-    identity checks; #9 splits the observation from streamed content while
-    keeping this contract for callers that still need both.
+    identity checks. #10 replaces the in-memory planning of its callers; the
+    size gate and full read stay so mutation behaviour is unchanged here.
     """
     before = path.stat()
-    require_guarded_file(before)
+    require_regular_file(before)
+    require_snapshot_size(before)
     with path.open('rb') as stream:
         data, after = read_whole_file(stream, before)
     verify_stable_read(before, after, data, path)
-    return data, after, content_version(after, data)
+    return data, after, content_version(after)
 
 
-def require_utf8(data):
-    """Whole-content UTF-8 gate for text reads."""
-    try:
-        data.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        raise AgentError('UNSUPPORTED_ENCODING', 'Text reads require UTF-8; use base64 for binary')
+def read_window(stream, start, length, chunk_size=MAX_STREAM_CHUNK):
+    """Read up to `length` bytes at `start` through bounded chunks."""
+    if length <= 0:
+        return b''
+    stream.seek(start)
+    parts = []
+    remaining = length
+    while remaining > 0:
+        block = stream.read(min(chunk_size, remaining))
+        if not block:
+            break
+        parts.append(block)
+        remaining -= len(block)
+    return b''.join(parts)
+
+
+def scan_to_line_start(stream, first, bom_size, chunk_size=MAX_STREAM_CHUNK):
+    """Byte offset where 1-based line `first` starts, or None past the end.
+
+    Line numbers are located by sequential newline scanning, never treated
+    as byte offsets; nothing before the target line is returned or kept.
+    """
+    if first <= 1:
+        return bom_size
+    stream.seek(bom_size)
+    consumed = bom_size
+    seen = 0
+    while True:
+        block = stream.read(chunk_size)
+        if not block:
+            return None
+        count = block.count(b'\n')
+        if seen + count >= first - 1:
+            index = -1
+            for _ in range(first - 1 - seen):
+                index = block.index(b'\n', index + 1)
+            return consumed + index + 1
+        seen += count
+        consumed += len(block)
+
+
+def scan_to_line_end(stream, last, bom_size, size, chunk_size=MAX_STREAM_CHUNK):
+    """End byte after the newline of 1-based line `last`, or the file end
+    when the file has fewer lines."""
+    stream.seek(bom_size)
+    consumed = bom_size
+    seen = 0
+    while True:
+        block = stream.read(chunk_size)
+        if not block:
+            return size
+        count = block.count(b'\n')
+        if seen + count >= last:
+            index = -1
+            for _ in range(last - seen):
+                index = block.index(b'\n', index + 1)
+            return consumed + index + 1
+        seen += count
+        consumed += len(block)
+
+
+def decode_utf8_prefix(chunk):
+    """Decode the longest valid UTF-8 prefix so characters are never split.
+
+    Returns (text, trimmed_bytes). Bytes are trimmed only when they form an
+    incomplete multibyte sequence at the tail; genuinely invalid content in
+    the window raises instead of being silently swallowed.
+    """
+    if not chunk:
+        return '', 0
+    for trim in (0, 1, 2, 3):
+        try:
+            text = chunk[:len(chunk) - trim].decode('utf8') if trim else chunk.decode('utf8')
+        except UnicodeDecodeError:
+            continue
+        if trim == 0:
+            return text, 0
+        lead = chunk[len(chunk) - trim]
+        expected = 2 if 0xc0 <= lead < 0xe0 else 3 if lead < 0xf0 else 4
+        if 0xc0 <= lead < 0xf8 and trim < expected:
+            return text, trim
+    raise AgentError('UNSUPPORTED_ENCODING', 'Text reads require UTF-8; use base64 for binary')
 
 
 def decode_edit_text(data):
@@ -99,54 +216,55 @@ def decode_edit_text(data):
         raise AgentError('UNSUPPORTED_ENCODING', 'Text edits require UTF-8')
 
 
-def delivery_window(data, request, binary):
-    """Compute the byte window one read request delivers.
+def validate_read_request(request):
+    """Validate the shared read gates; returns the maxBytes budget.
 
-    Owns the maxBytes gate, byte-offset and line positioning (BOM-aware),
-    the serialized-output budget and the no-progress guard. Returns
-    (start, end, shown, delivered_end, bom_size).
+    maxBytes is a delivery budget (not a file-size cap), bounded to 1 MiB.
     """
     limit = request.get('maxBytes', 65536)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1048576:
         raise AgentError('INVALID_LIMIT', 'maxBytes must be between 1 and 1048576')
-    bom_size = len(BOM) if not binary and data.startswith(BOM) else 0
-    if 'offset' in request or binary:
-        offset = request.get('offset', 0)
-        if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(data):
-            raise AgentError('INVALID_OFFSET', 'Byte offset is outside the file')
-        start, end = max(bom_size, offset), len(data)
-        if not binary and start < len(data) and data[start] & 0xc0 == 0x80:
-            raise AgentError('INVALID_OFFSET', 'Offset must be at a UTF-8 character boundary')
-    else:
-        lines = data[bom_size:].splitlines(keepends=True)
-        first, last = request.get('fromLine', 1), request.get('toLine', max(1, len(lines)))
-        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in (first, last)) or last < first:
-            raise AgentError('INVALID_LINE_RANGE', 'Line ranges are one-based and inclusive')
-        start = bom_size + sum(len(line) for line in lines[:first - 1])
-        end = bom_size + sum(len(line) for line in lines[:last])
-    chunk = data[start:min(end, start + limit)]
-    shown = base64.b64encode(chunk).decode('ascii') if binary else chunk.decode('utf8', errors='ignore')
-    if request.get('grantRead', True) is not False:
-        # Budget serialized tool content, not just source bytes. Reserve
-        # room for paths, version and cursor metadata before granting reads.
-        budget = 65536 - 8192
-        if len(json.dumps(shown, ensure_ascii=False).encode('utf8')) > budget:
-            low, high = 0, len(shown)
-            while low < high:
-                middle = (low + high + 1) // 2
-                if len(json.dumps(shown[:middle], ensure_ascii=False).encode('utf8')) <= budget:
-                    low = middle
-                else:
-                    high = middle - 1
-            if binary:
-                chunk = chunk[:(low // 4) * 3]
-                shown = base64.b64encode(chunk).decode('ascii')
-            else:
-                shown = shown[:low]
-    delivered_end = start + (len(chunk) if binary else len(shown.encode('utf8')))
-    if delivered_end == start and start < end:
-        raise AgentError('INVALID_LIMIT', 'maxBytes is too small for the next UTF-8 character')
-    return start, end, shown, delivered_end, bom_size
+    return limit
+
+
+def apply_delivery_budget(shown, chunk, binary):
+    """Cap serialized tool content, not just source bytes (spec 4.2).
+
+    Model-visible deliveries reserve room for paths, version and cursor
+    metadata; the transfer path (grantRead=false) skips this budget so
+    download chunks keep their caller-chosen size. Returns
+    (shown, delivered_bytes).
+    """
+    if len(json.dumps(shown, ensure_ascii=False).encode('utf8')) <= READ_BUDGET:
+        return shown, len(chunk)
+    low, high = 0, len(shown)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(json.dumps(shown[:middle], ensure_ascii=False).encode('utf8')) <= READ_BUDGET:
+            low = middle
+        else:
+            high = middle - 1
+    if binary:
+        chunk = chunk[:(low // 4) * 3]
+        return base64.b64encode(chunk).decode('ascii'), len(chunk)
+    shown = shown[:low]
+    return shown, len(shown.encode('utf8'))
+
+
+def line_metadata(payload, line_start, delivered_end, size):
+    """Report (lineEnd, lineEndComplete) for a delivered line-mode window."""
+    breaks = payload.count(b'\n')
+    line_end = line_start + breaks - (1 if payload.endswith(b'\n') else 0)
+    complete = payload.endswith(b'\n') or delivered_end >= size
+    return line_end, complete
+
+
+def line_metadata(payload, line_start, delivered_end, size):
+    """Report (lineEnd, lineEndComplete) for a delivered line-mode window."""
+    breaks = payload.count(b'\n')
+    line_end = line_start + breaks - (1 if payload.endswith(b'\n') else 0)
+    complete = payload.endswith(b'\n') or delivered_end >= size
+    return line_end, complete
 
 
 # --- Byte-range and content helpers ------------------------------------------------
@@ -344,6 +462,10 @@ class FileService:
             raise AgentError('READ_SCOPE_MISMATCH', 'Read record belongs to a different file or session')
         if token['version'] != version:
             raise AgentError('FILE_CONFLICT', 'File changed since it was read; read it again')
+        if _now() > token.get('expiresAt', 0):
+            # Three idle days killed the credential (spec 4.2); failed and
+            # query-only calls never renewed it. Expired ranges stay dead.
+            raise AgentError('READ_TOKEN_EXPIRED', 'Read credential expired after three idle days; read the file again')
         return token
 
     def read_index(self, path):
@@ -352,40 +474,157 @@ class FileService:
 
     def save_read(self, path, version, size, ranges, key=None):
         key = key or uuid.uuid4().hex
-        record = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': size}
+        now = _now()
+        record = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': size,
+                  'lastSuccessAt': now, 'expiresAt': now + READ_TOKEN_TTL_SECONDS}
         atomic_json(self.reads / (key + '.json'), record)
         atomic_json(self.read_index(path), {'readToken': key})
         return {'readToken': key, 'version': version, 'size': size, 'complete': covers(ranges, 0, size)}
 
     def grant_read(self, path, version, size, bom_size, start, delivered_end):
-        """Merge the delivered window into the session's read credential."""
+        """Merge the delivered window into the session's read credential.
+
+        Only actually delivered bytes count (spec 4.2). An expired prior
+        record is never merged back: the fresh credential starts from this
+        window alone so dead ranges cannot revive.
+        """
         index_path = self.read_index(path)
         key, previous = None, []
         if index_path.exists():
             candidate = read_json(index_path)['readToken']
             old = read_json(self.reads / (candidate + '.json'))
-            if old['session'] == self.session and old['path'] == str(path) and old['version'] == version:
+            if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
+                    and _now() <= old.get('expiresAt', 0)):
                 key, previous = candidate, old['ranges']
         ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
         return self.save_read(path, version, size, ranges, key)
 
+    def observe_metadata(self, path):
+        """metadataOnly read: the observed version or explicit absence.
+
+        Returns no content and grants no read coverage (spec 4.1); remote
+        writes and uploads bind their overwrite checks to this version.
+        """
+        try:
+            stream = path.open('rb')
+        except FileNotFoundError:
+            return {'path': str(path), 'exists': False, 'version': None, 'size': None, 'bom': None}
+        except IsADirectoryError:
+            raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
+        with stream:
+            info = os.fstat(stream.fileno())
+            require_regular_file(info)
+            if not same_object(info, path):
+                raise AgentError('FILE_CONFLICT', 'File changed while observing')
+            has_bom = info.st_size >= 3 and read_window(stream, 0, len(BOM)) == BOM
+            return {'path': str(path), 'exists': True, 'version': content_version(info),
+                    'size': info.st_size, 'bom': has_bom}
+
     def read(self, request):
+        """Stream a bounded window of the file (spec 4.2).
+
+        Byte cursors and metadataOnly answer in O(window); line requests
+        scan sequentially to their boundaries. Nothing before the window is
+        delivered, cached or indexed.
+        """
         path = self.path(request.get('path'))
+        encoding = request.get('encoding', 'utf8')
+        if encoding not in ('base64', 'utf8'):
+            raise AgentError('UNSUPPORTED_ENCODING', 'Choose utf8 or base64')
+        binary = encoding == 'base64'
+        metadata_only = request.get('metadataOnly', False)
+        if not isinstance(metadata_only, bool):
+            raise AgentError('INVALID_REQUEST', 'metadataOnly must be boolean')
+        if metadata_only:
+            if any(key in request for key in ('offset', 'fromLine', 'toLine', 'maxBytes')) or 'encoding' in request:
+                raise AgentError('INVALID_REQUEST', 'metadataOnly observes the version; drop the content selectors')
+            return self.observe_metadata(path)
+        limit = validate_read_request(request)
+        expected = request.get('expectedVersion')
+        if expected is not None and not isinstance(expected, str):
+            raise AgentError('INVALID_REQUEST', 'expectedVersion must be text')
         with self.lock(path):
-            data, info, version = snapshot(path)
-            binary = request.get('encoding', 'utf8') == 'base64'
-            if request.get('encoding', 'utf8') not in ('base64', 'utf8'):
-                raise AgentError('UNSUPPORTED_ENCODING', 'Choose utf8 or base64')
-            if not binary:
-                require_utf8(data)
-            start, end, shown, delivered_end, bom_size = delivery_window(data, request, binary)
-            result = {'path': str(path), 'data' if binary else 'text': shown, 'encoding': 'base64' if binary else 'utf8',
-                      'newline': None if binary else newline_kind(data), 'version': version,
-                      'size': len(data), 'bom': data.startswith(BOM), 'startOffset': start, 'endOffset': delivered_end,
-                      'nextOffset': delivered_end if delivered_end < end else None, 'truncated': delivered_end < end}
-            if request.get('grantRead', True) is False:
-                return result
-            return dict(result, **self.grant_read(path, version, len(data), bom_size, start, delivered_end))
+            try:
+                stream = path.open('rb')
+            except FileNotFoundError:
+                raise AgentError('PATH_NOT_FOUND', 'File does not exist')
+            except IsADirectoryError:
+                raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
+            with stream:
+                before = os.fstat(stream.fileno())
+                require_regular_file(before)
+                if not same_object(before, path):
+                    raise AgentError('FILE_CONFLICT', 'File changed while reading')
+                version = content_version(before)
+                size = before.st_size
+                if expected is not None and expected != version:
+                    # A cursor issued for another version is refused, not
+                    # silently continued into changed content (spec 4.2).
+                    raise AgentError('FILE_CONFLICT', 'File changed since this cursor was issued')
+                has_bom = size >= 3 and read_window(stream, 0, len(BOM)) == BOM
+                bom_size = 3 if has_bom and not binary else 0
+                line_window = False
+                if 'offset' in request or binary:
+                    offset = request.get('offset', 0)
+                    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= size:
+                        raise AgentError('INVALID_OFFSET', 'Byte offset is outside the file')
+                    start = max(bom_size, offset)
+                    if not binary and start < size:
+                        stream.seek(start)
+                        lead = stream.read(1)
+                        if lead and lead[0] & 0xc0 == 0x80:
+                            raise AgentError('INVALID_OFFSET', 'Offset must be at a UTF-8 character boundary')
+                    end = size
+                else:
+                    first, last = request.get('fromLine', 1), request.get('toLine')
+                    if not isinstance(first, int) or isinstance(first, bool) or first < 1:
+                        raise AgentError('INVALID_LINE_RANGE', 'Line ranges are one-based and inclusive')
+                    if last is None:
+                        last = first + size + 1  # sentinel: deliver through end of file
+                    if not isinstance(last, int) or isinstance(last, bool) or last < 1 or last < first:
+                        raise AgentError('INVALID_LINE_RANGE', 'Line ranges are one-based and inclusive')
+                    line_window = True
+                    start = scan_to_line_start(stream, first, bom_size)
+                    if start is None:
+                        start = end = size  # past the last line: empty delivery
+                    else:
+                        end = scan_to_line_end(stream, last, bom_size, size)
+                chunk = read_window(stream, start, min(end - start, limit))
+                budgeted = request.get('grantRead', True) is not False
+                if binary:
+                    shown = base64.b64encode(chunk).decode('ascii')
+                    if budgeted:
+                        shown, delivered = apply_delivery_budget(shown, chunk, binary)
+                    else:
+                        delivered = len(chunk)
+                    payload = chunk[:delivered]
+                else:
+                    text, trimmed = decode_utf8_prefix(chunk)
+                    shown, source = text, chunk[:len(chunk) - trimmed]
+                    if budgeted:
+                        shown, delivered = apply_delivery_budget(text, source, binary)
+                    else:
+                        delivered = len(source)
+                    payload = shown.encode('utf8')
+                delivered_end = start + delivered
+                if delivered_end == start and start < end:
+                    raise AgentError('INVALID_LIMIT', 'maxBytes is too small for the next UTF-8 character')
+                after = os.fstat(stream.fileno())
+                if metadata(before) != metadata(after) or not same_object(after, path):
+                    raise AgentError('FILE_CONFLICT', 'File changed while reading')
+                result = {'path': str(path), 'data' if binary else 'text': shown, 'encoding': encoding,
+                          'newline': None if binary or not (payload.count(b'\n') or payload.count(b'\r'))
+                                     else newline_kind(payload),
+                          'version': version, 'size': size, 'bom': has_bom,
+                          'startOffset': start, 'endOffset': delivered_end,
+                          'nextOffset': delivered_end if delivered_end < end else None,
+                          'truncated': delivered_end < end}
+                if line_window and start is not None:
+                    line_end, complete = line_metadata(payload, first, delivered_end, size)
+                    result.update(lineStart=first, lineEnd=line_end, lineEndComplete=complete)
+                if request.get('grantRead', True) is False:
+                    return result
+                return dict(result, **self.grant_read(path, version, size, bom_size, start, delivered_end))
 
     def edit(self, request):
         path = self.path(request.get('path'), writing=True)
@@ -523,7 +762,9 @@ class FileService:
                                   [self.workspace / 'AGENTS.md', self.workspace / 'CLAUDE.md'] if path.is_file()],
                     'instructions': 'Read applicable root and nested AGENTS.md/CLAUDE.md with file_read before editing.',
                     'capabilities': {'interactiveInput': False, 'pty': False, 'reattachTerminal': False,
-                                     'persistentTasks': True, 'maxGuardedFileBytes': MAX_FILE_BYTES,
+                                     'persistentTasks': True, 'streamedRead': True,
+                                     'maxCommitBytes': MAX_FILE_BYTES,
+                                     'readTokenTtlDays': READ_TOKEN_TTL_SECONDS // 86400,
                                      'searchEngine': 'python-literal', 'gitignoreSearch': False, 'rgPath': shutil.which('rg')}}
         if action in ('file_list', 'file_find', 'file_search'):
             from discovery import discover

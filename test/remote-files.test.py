@@ -320,18 +320,28 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
-    def test_size_gate_rejects_directories_oversized_reads_and_oversized_commits(self):
+    def test_size_gate_rejects_directories_but_streams_oversized_reads_and_gates_commits(self):
         directory = self.call('file_read', {'path': '.'})
         self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
+        # Reads no longer carry a file-size cap (issue #9): a >16 MiB file
+        # streams its first window instead of being rejected.
         oversized = self.work / 'oversized.bin'
         oversized.write_bytes(b'0' * (16 * 1024 * 1024 + 1))
-        too_large = self.call('file_read', {'path': 'oversized.bin'})
-        self.assertEqual(too_large['error']['code'], 'FILE_TOO_LARGE')
-        # The commit-side output gate applies even to creations with no prior read.
+        streamed = self.call('file_read', {'path': 'oversized.bin', 'offset': 16 * 1024 * 1024 - 10, 'maxBytes': 100})
+        self.assertTrue(streamed['ok'], streamed)
+        self.assertEqual(streamed['result']['endOffset'], 16 * 1024 * 1024 + 1)
+        self.assertIsNone(streamed['result']['nextOffset'])
+        self.assertFalse(streamed['result']['complete'])
+        # The commit-side output gate still applies, even to creations.
         payload = base64.b64encode(b'0' * (16 * 1024 * 1024 + 1)).decode('ascii')
         rejected = self.call('file_write', {'path': 'created.bin', 'data': payload, 'create': True})
         self.assertEqual(rejected['error']['code'], 'FILE_TOO_LARGE')
         self.assertFalse((self.work / 'created.bin').exists())
+        # Guarded mutations keep the whole-file bound until streaming
+        # replacement lands (#10).
+        edit = self.call('file_edit', {'path': 'oversized.bin', 'readToken': streamed['result']['readToken'],
+                                       'edits': [{'oldText': '0', 'newText': 'x'}]})
+        self.assertEqual(edit['error']['code'], 'FILE_TOO_LARGE')
 
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
@@ -530,17 +540,27 @@ class RemoteFilesTest(unittest.TestCase):
             return error
         self.fail('Expected {} from {!r}'.format(code, request))
 
+    def prefix_lines(self, line_of, upto, first_index=1):
+        """Oracle for the first `upto` bytes of generated lines."""
+        parts, index, remaining = [], first_index, upto
+        while remaining > 0:
+            row = line_of(index).encode('ascii')
+            parts.append(row[:remaining])
+            remaining -= len(row)
+            index += 1
+        return b''.join(parts).decode('ascii')
+
     def test_streamed_read_pages_large_files_with_byte_cursor(self):
         size = 64 * 1024 * 1024
         line_of = self.write_fixed_lines(self.work / 'large.txt', size // 64)
         service = self.service()
         first = service.read({'path': 'large.txt', 'offset': 0, 'maxBytes': 65536})
-        self.assertEqual((first['startOffset'], first['endOffset']), (0, 65536))
+        self.assertEqual(first['startOffset'], 0)
+        self.assertLessEqual(first['endOffset'], 65536 - 8192)  # serialized budget applies
         self.assertTrue(first['truncated'])
-        self.assertEqual(first['nextOffset'], 65536)
-        self.assertEqual(first['text'], ''.join(line_of(index) for index in range(1, 1025)))
+        self.assertEqual(first['nextOffset'], first['endOffset'])
+        self.assertEqual(first['text'], self.prefix_lines(line_of, first['endOffset']))
         self.assertLessEqual(len(json.dumps(first, ensure_ascii=False).encode('utf8')), 65536)
-        self.assertEqual(len(first['text'].encode('utf8')), 65536)
         version = first['version']
         tokens = {first['readToken']}
         # Sampling pages across the file all continue the same version and
@@ -549,10 +569,10 @@ class RemoteFilesTest(unittest.TestCase):
             page = service.read({'path': 'large.txt', 'offset': offset, 'maxBytes': 65536})
             self.assertEqual(page['version'], version)
             tokens.add(page['readToken'])
-            expected = ''.join(line_of(index) for index in range(offset // 64 + 1, offset // 64 + 1025))
-            self.assertEqual(page['text'], expected)
-            if offset + 65536 < size:
-                self.assertEqual(page['nextOffset'], offset + 65536)
+            delivered = page['endOffset'] - page['startOffset']
+            self.assertEqual(page['text'], self.prefix_lines(line_of, delivered, offset // 64 + 1))
+            if offset + delivered < size:
+                self.assertEqual(page['nextOffset'], offset + delivered)
                 self.assertTrue(page['truncated'])
             else:
                 self.assertIsNone(page['nextOffset'])
@@ -580,7 +600,7 @@ class RemoteFilesTest(unittest.TestCase):
         tail = service.read({'path': 'lines.txt', 'fromLine': total - 3})
         self.assertEqual((tail['lineStart'], tail['lineEnd'], tail['lineEndComplete']), (total - 3, total, True))
         self.assertFalse(tail['truncated'])
-        self.assertEqual(tail['text'], ''.join(line_of(index) for index in (total - 3, total - 2, total - 1)))
+        self.assertEqual(tail['text'], ''.join(line_of(index) for index in range(total - 3, total + 1)))
         # A budget-constrained middle window reports the partial last line.
         window = service.read({'path': 'lines.txt', 'fromLine': 10, 'maxBytes': 100})
         self.assertEqual(window['lineStart'], 10)
@@ -611,8 +631,9 @@ class RemoteFilesTest(unittest.TestCase):
             offset = page['nextOffset']
             pages += 1
         self.assertGreater(pages, 10)  # the single line really was chunked
-        self.assertEqual(delivered, giant.encode('ascii') + b'\n')
-        self.assertFalse(page['complete'])  # lines 1-2 and 4 were never read
+        # Byte-cursor pages run to end of file, so the whole tail arrived.
+        self.assertEqual(delivered, giant.encode('ascii') + b'\nend\n')
+        self.assertFalse(page['complete'])  # lines 1-2 were never read
         end = service.read({'path': 'tenant.txt', 'fromLine': 4, 'toLine': 4})
         self.assertEqual((end['text'], end['lineStart'], end['lineEndComplete']), ('end\n', 4, True))
         token = service.read({'path': 'tenant.txt', 'fromLine': 4, 'toLine': 4})['readToken']
@@ -703,13 +724,13 @@ class RemoteFilesTest(unittest.TestCase):
         # Without an expectation the new version is simply observed; the old
         # credential does not silently extend into the new version.
         resumed = service.read({'path': 'moving.txt', 'offset': first['nextOffset']})
-        self.assertEqual(resumed['text'], 'REPLACED\n')
+        self.assertEqual(resumed['text'], '\nREPLACED\n')
         self.assertNotEqual(resumed['version'], first['version'])
         conflict = self.call('file_edit', {'path': 'moving.txt', 'readToken': first['readToken'],
                                            'edits': [{'oldText': 'REPLACED', 'newText': 'lost'}]})
         self.assertEqual(conflict['error']['code'], 'FILE_CONFLICT')
         # Continuing with the fresh version's own cursor stays consistent.
-        pinned = service.read({'path': 'moving.txt', 'offset': 0, 'expectedVersion': resumed['version']})
+        pinned = service.read({'path': 'moving.txt', 'offset': 0, 'maxBytes': 8, 'expectedVersion': resumed['version']})
         self.assertEqual(pinned['text'], 'page one')
         # A cursor bound to the new version is rejected once it changes again.
         (self.work / 'moving.txt').write_text('page one\nFINAL\n')
