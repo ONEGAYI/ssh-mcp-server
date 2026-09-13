@@ -1087,11 +1087,16 @@ def file_find(service, root, request):
             # Candidates considered this page charge the enumeration budget by
             # their path bytes; the overrun check runs after each charge so a
             # budget smaller than the tree still advances the cursor. Entries
-            # already returned by earlier pages skip without recharging.
+            # already returned by earlier pages skip without recharging. The
+            # cursor moves past a fully considered candidate *before* the
+            # overrun check, so a stop right after admitting (or charging) it
+            # cannot hand back a cursor that re-serves it; an unadmitted
+            # candidate (RESULT_LIMIT) keeps the previous cursor so the next
+            # page reconsiders it.
             budget.add(len(current.encode('utf8')))
             if not matched:
-                budget.ensure_within()
                 last = current
+                budget.ensure_within()
                 continue
             try:
                 info = path.lstat()
@@ -1111,8 +1116,8 @@ def file_find(service, root, request):
                 break
             entries.append(item)
             page_bytes += size
-            budget.ensure_within()
             last = current
+            budget.ensure_within()
         else:
             exhausted = True
     except BudgetStop as stop:

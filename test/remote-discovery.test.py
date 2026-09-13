@@ -734,6 +734,52 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'SCAN_TIME_LIMIT')
         self.assertIn('narrow the search directory', str(caught.exception))
 
+    def test_find_cursor_advances_past_last_admitted_entry_on_byte_budget_stop(self):
+        # 字节预算恰好在最后一个已采纳条目计费后耗尽时，游标必须推进过
+        # 该条目：否则下一页重新考虑并再次返回它，分页结果重复同一条目
+        # （匹配分支的 last=current 原在 ensure_within 之后执行）。
+        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from files import FileService
+        self.write('aa.txt', 'a\n')
+        self.write('bb.txt', 'b\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        saved_which = discovery.shutil.which
+        discovery.shutil.which = lambda name: None  # 确定性走 python-walk
+
+        # A deterministic byte budget: the second charged candidate trips the
+        # overrun check right after being admitted (charges are counted per
+        # candidate because real ones bill by path bytes with a 64 KiB floor).
+        class TwoChargeBudget(discovery.Budget):
+            charged = 0
+
+            def add(self, count):
+                self.charged += 1
+
+            def ensure_within(self):
+                if self.charged >= 2:
+                    raise discovery.BudgetStop('bytes')
+
+        saved_budget = discovery.Budget
+        discovery.Budget = TwoChargeBudget
+        try:
+            first = discovery.discover(service, 'file_find',
+                                       {'path': '.', 'pattern': '*.txt', 'limit': 10})
+            self.assertTrue(first['truncated'])
+            self.assertEqual([entry['path'] for entry in first['entries']], ['aa.txt', 'bb.txt'])
+            cursor = json.loads(base64.b64decode(first['nextCursor']))
+            self.assertEqual(cursor['after'], str(self.work / 'bb.txt'))
+            second = discovery.discover(service, 'file_find',
+                                        {'path': '.', 'pattern': '*.txt', 'limit': 10,
+                                         'cursor': first['nextCursor']})
+            self.assertFalse(second['truncated'])
+            self.assertEqual(second['entries'], [])  # bb 不重复返回
+            self.assertEqual(second['totalEntries'], 2)
+        finally:
+            discovery.Budget = saved_budget
+            discovery.shutil.which = saved_which
+
     def test_find_skips_candidates_deleted_between_enumeration_and_lstat(self):
         # 枚举与 lstat 之间条目被外部删除：该候选已不再出现，游标推进
         # 过它并跳过，查询整体成功且其余结果完整（与 file_search 的

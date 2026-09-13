@@ -543,11 +543,13 @@ export class TransferService {
     const path = join(this.directory, record.transferId, "chunks.jsonl");
     const entries = [];
     try {
-      const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
-      for await (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed) entries.push(JSON.parse(trimmed));
-      }
+    const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
+    for await (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try { entries.push(JSON.parse(trimmed)); }
+      catch { break; } // torn append tail: the manifest ends at its last complete line
+    }
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
@@ -571,8 +573,16 @@ export class TransferService {
       try {
         for (const entry of entries) {
           if (entry.offset !== trustedOffset) break;
-          const digest = await this.digestWindow(handle, entry.offset, entry.size);
-          if (digest !== entry.sha256) break;
+          let window;
+          try { window = await this.digestWindow(handle, entry.offset, entry.size); }
+          catch (error) {
+            // Persisted bytes ended early (power loss between the manifest
+            // fsync and the data blocks): rewind to the last trusted boundary
+            // instead of failing the resume outright.
+            if ((error as RemoteAgentError)?.code !== "TRANSFER_DATA_SHORT") throw error;
+            break;
+          }
+          if (window !== entry.sha256) break;
           trusted += 1;
           // The trusted boundary is the sum of the verified entries' sizes
           // (the final block may be short), never trusted * chunkSize --

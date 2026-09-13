@@ -504,6 +504,38 @@ class RemoteTransferTest(unittest.TestCase):
         again = self.call('transfer_commit', {'transferId': transfer_id})
         self.assertEqual(again['error']['code'], 'INVALID_STATE')
 
+    def test_commit_post_publish_failure_keeps_committing_and_reconciles(self):
+        # rename 已生效后的目录 fsync 失败不得报成"未生效"：状态留在
+        # committing（重试走对象身份对账补回执并释放账本），错误码
+        # COMMITTED_UNCONFIRMED 与 files.py 的 publish 语义对称。
+        sys.path.insert(0, str(HELPER.parent))
+        import errno as errno_module
+        from unittest import mock
+        import files as files_module
+        import transfer as transfer_module
+        try:
+            data = b'post-publish-failure'
+            transfer_id = self.register(data)['result']['transferId']
+            self.start(transfer_id)
+            self.block(transfer_id, 0, 0, data)
+            self.call('transfer_verify', {'transferId': transfer_id})
+            request = {'transferId': transfer_id, 'workspaceRoot': str(self.work), 'sessionId': 'session-one'}
+            with mock.patch.object(files_module, 'sync_directory',
+                                   side_effect=OSError(errno_module.ENOSPC, 'disk full')):
+                with self.assertRaises(transfer_module.AgentError) as caught:
+                    transfer_module.commit(self.state, dict(request))
+            self.assertEqual(caught.exception.code, 'COMMITTED_UNCONFIRMED')
+            # The rename already took effect: the target carries the verified content.
+            self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+            # Not failed: the state stays committing so a retry reconciles.
+            self.assertEqual(self.record(transfer_id)['state'], 'committing')
+            reconciled = self.call('transfer_commit', {'transferId': transfer_id})
+            self.assertTrue(reconciled['ok'], reconciled)
+            self.assertEqual(reconciled['result']['state'], 'completed')
+            self.assertTrue((self.state / 'transfers' / transfer_id / 'receipt.json').is_file())
+        finally:
+            sys.path.remove(str(HELPER.parent))
+
     def test_commit_is_idempotent_after_completion(self):
         data = b'idempotent'
         transfer_id, first = self.deliver(data)
@@ -778,8 +810,13 @@ class RemoteTransferTest(unittest.TestCase):
         original = transfer_module._observe_source
         def mutating_observe(path):
             result = original(path)
-            with open(str(path), 'r+b') as stream:  # same size, new content: ctime/mtime move
-                stream.write(b'X')
+            # Grow the file and restamp it explicitly: on WSL's 9p mount a
+            # same-size overwrite sometimes leaves the observing descriptor's
+            # cached timestamps unchanged, making the stability window blind;
+            # a size change is a deterministic signal on every filesystem.
+            with open(str(path), 'r+b') as stream:
+                stream.write(b'XX')
+            os.utime(str(path), (123.0, 456.0))
             return result
         transfer_module._observe_source = mutating_observe
         try:

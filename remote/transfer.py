@@ -816,6 +816,7 @@ def commit(root, request):
         atomic_json(transfer_path(root, transfer_id) / 'intent.json', intent)
         record['state'] = 'committing'
         _save_record(root, transfer_id, record)
+        committed = False
         try:
             target = Path(record['targetPath'])
             if record['overwrite']:
@@ -830,10 +831,12 @@ def commit(root, request):
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(str(temp), str(target))
+                committed = True
             else:
                 if target.exists():
                     raise AgentError('FILE_CONFLICT', 'Creation target appeared before commit')
                 os.link(str(temp), str(target))
+                committed = True
                 os.unlink(str(temp))
             sync_directory(target.parent)
         except AgentError as error:
@@ -841,10 +844,21 @@ def commit(root, request):
             _save_record(root, transfer_id, record)
             raise
         except OSError as error:
-            # Publication-stage OS failures (vanished overwrite target, a
-            # create target appearing concurrently, permission errors, ...)
-            # must leave the same failed trail instead of stranding the state
-            # in committing with a raw HELPER_ERROR on every retry.
+            if committed:
+                # The rename already took effect: a failure here (directory
+                # fsync, temp cleanup) must not strand the transfer in a
+                # "failed / never took effect" shape. Keep the state at
+                # committing so a retry reconciles by object identity and
+                # completes the receipt (COMMITTED_UNCONFIRMED parity with
+                # files.py publish).
+                raise AgentError('COMMITTED_UNCONFIRMED',
+                                 'The commit took effect at {} but post-commit durability failed: {}. '
+                                 'Do not start a new transfer; re-issue commit or status to reconcile'.format(record['targetPath'], error))
+            # Publication-stage OS failures before the target took effect
+            # (vanished overwrite target, create target appearing
+            # concurrently, permission errors, ...) leave the same failed
+            # trail instead of stranding the state in committing with a raw
+            # HELPER_ERROR on every retry.
             record.update(state='failed',
                           error={'code': 'FILE_CONFLICT',
                                  'message': 'Commit publish failed before the target took effect: {}'.format(error)},

@@ -777,6 +777,61 @@ it('download budget exhaustion right after the last block defers verify and comm
   } finally { await fake.cleanup(); }
 });
 
+it('a torn local manifest tail truncates to the last complete line on resume', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.concat([Buffer.alloc(CHUNK, 3), Buffer.alloc(CHUNK, 4), Buffer.from('tail')]);
+    const name = 'torn-' + randomUUID() + '.bin';
+    await writeSource(fake.workspace, name, data);
+    fake.fetchDelayMs = 400;
+    const partial = await transfers.download('session-a', {
+      path: name, localPath: 'torn.bin', chunkSize: CHUNK, budgetMs: 1000,
+    });
+    assert.equal(partial.state, 'transferring');
+    assert.equal(partial.confirmedOffset, data.length); // every block persisted
+    fake.fetchDelayMs = 0;
+    // A kill mid-manifest-append leaves a torn half line behind; the manifest
+    // must resume from its last complete line, not crash the transfer forever.
+    const manifest = join(fake.stateRoot, 'local-state',
+      createHash('sha256').update('identity-13').digest('hex').slice(0, 24),
+      'transfers', partial.transferId, 'chunks.jsonl');
+    const complete = await readFile(manifest, 'utf8');
+    await writeFile(manifest, complete + '{"ind', 'utf8');
+    const done = await transfers.resume('session-a', partial.transferId);
+    assert.equal(done.state, 'completed');
+    assert.equal(done.sha256, createHash('sha256').update(data).digest('hex'));
+  } finally { await fake.cleanup(); }
+});
+
+it('local heal falls back to the last trusted boundary when persisted bytes end early', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.concat([Buffer.alloc(CHUNK, 3), Buffer.alloc(CHUNK, 4),
+      Buffer.alloc(CHUNK, 5), Buffer.from('tail')]);
+    const name = 'short-' + randomUUID() + '.bin';
+    await writeSource(fake.workspace, name, data);
+    fake.fetchDelayMs = 400;
+    const partial = await transfers.download('session-a', {
+      path: name, localPath: 'short.bin', chunkSize: CHUNK, budgetMs: 1000,
+    });
+    assert.equal(partial.state, 'transferring');
+    assert.equal(partial.confirmedOffset, CHUNK * 3); // three blocks persisted
+    fake.fetchDelayMs = 0;
+    // Power-loss shape: manifest and record are synced, but the last confirmed
+    // block's bytes never reached the platter; the heal must rewind past it
+    // instead of failing the resume with a data-short error.
+    const temp = join(fake.workspace, '.ssh-mcp-download-' + partial.transferId);
+    const handle = await open(temp, 'r+');
+    try { await handle.truncate(CHUNK * 3 - 10); } finally { await handle.close(); }
+    const done = await transfers.resume('session-a', partial.transferId);
+    assert.equal(done.state, 'completed');
+    assert.equal(done.sha256, createHash('sha256').update(data).digest('hex'));
+    const indexes = fake.exchanges.filter(exchange => exchange.action === 'transfer_fetch')
+      .map(exchange => JSON.parse(exchange.input.toString('utf8').trim()).index);
+    assert.deepEqual(indexes, [0, 1, 2, 2, 3]); // block 2 refetched whole from the trusted boundary
+  } finally { await fake.cleanup(); }
+});
+
 it('download enforces the local target overwrite contract', async () => {
   const { fake, transfers } = await buildHarness();
   try {
