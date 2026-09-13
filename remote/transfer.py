@@ -136,6 +136,12 @@ def _match_source(record, source_identity):
                          'The local source changed since registration; refuse to mix versions, register a new transfer')
 
 
+def _require_session(record, request):
+    """Every action (not just block exchange) belongs to the registering session."""
+    if request.get('sessionId') != record['sessionId']:
+        raise AgentError('TRANSFER_SCOPE_MISMATCH', 'Transfer belongs to a different session')
+
+
 def _active_transfer_count(root):
     count = 0
     for candidate in sorted(transfers_directory(root).iterdir()):
@@ -352,6 +358,7 @@ def start(root, request):
     source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         _match_source(record, source)
         if record['state'] == 'prepared':
             _materialize(root, record)
@@ -374,6 +381,7 @@ def resume(root, request):
     source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         _match_source(record, source)
         if record['state'] == 'prepared':
             raise AgentError('INVALID_STATE', 'This transfer never started; call transfer_start first')
@@ -401,9 +409,7 @@ def receive_block(root, transfer_id, control, payload):
         raise AgentError('INVALID_REQUEST', 'Blocks must carry at least one byte')
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
-        session = control.get('sessionId')
-        if session != record['sessionId']:
-            raise AgentError('TRANSFER_SCOPE_MISMATCH', 'Transfer belongs to a different session')
+        _require_session(record, control)
         if record['state'] != 'transferring':
             raise AgentError('INVALID_STATE', 'This transfer is not accepting blocks in state {}'.format(record['state']))
         if index != record['chunkCount'] or offset != record['confirmedOffset']:
@@ -446,6 +452,7 @@ def verify(root, request):
     transfer_id = _transfer_id(request.get('transferId'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         if record['state'] == 'verifying':
             return describe(record)
         if record['state'] in ('committing', 'completed'):
@@ -502,6 +509,7 @@ def commit(root, request):
     record = None
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         directory = transfer_path(root, transfer_id)
         if record['state'] in ('completed', 'committing'):
             receipt_path = directory / 'receipt.json'
@@ -611,6 +619,7 @@ def status(root, request):
     """Read-only bounded observation; starts nothing, renews nothing."""
     transfer_id = _transfer_id(request.get('transferId'))
     record = _load_record(root, transfer_id)
+    _require_session(record, request)
     return describe(record)
 
 

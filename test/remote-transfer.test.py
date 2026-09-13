@@ -564,6 +564,30 @@ class RemoteTransferTest(unittest.TestCase):
 
     # --- status: bounded, read-only, non-renewing ---------------------------------
 
+    def test_actions_reject_a_foreign_session(self):
+        # 会话归属不只由 receive_block 核对：start/resume/verify/commit/
+        # status（含 verify/commit 的幂等分支）都必须核对 sessionId。
+        data = b'session bound'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        cases = (('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                     'sourceIdentity': self.source(len(data))}),
+                 ('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                      'sourceIdentity': self.source(len(data))}),
+                 ('transfer_verify', {'transferId': transfer_id}),
+                 ('transfer_commit', {'transferId': transfer_id}),
+                 ('transfer_status', {'transferId': transfer_id}))
+        for action, request in cases:
+            response = self.call(action, request, session='session-other')
+            self.assertEqual(response['ok'], False, action)
+            self.assertEqual(response['error']['code'], 'TRANSFER_SCOPE_MISMATCH', action)
+        # 正确会话不受影响，传输照常完成。
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual(committed['result']['state'], 'completed')
+
     def test_status_reports_bounded_state_without_renewal(self):
         data = b'status probe'
         transfer_id = self.register(data)['result']['transferId']
