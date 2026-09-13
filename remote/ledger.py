@@ -290,6 +290,17 @@ def attach_identity(root, resource_id, identity):
     return {'resourceId': resource_id, 'identity': identity}
 
 
+def find_by_path(root, path):
+    """Read-only lookup: ids of resources registered for exactly this path.
+
+    Callers use it to find their own crash leftovers before re-registering a
+    temp; it never mutates and holds no lock while iterating.
+    """
+    ledger = load(root)
+    return [resource_id for resource_id, entry in sorted(ledger['resources'].items())
+            if entry.get('path') == path]
+
+
 def release(root, resource_id):
     """Remove a resource from the ledger; idempotent.
 

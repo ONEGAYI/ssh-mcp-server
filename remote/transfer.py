@@ -220,6 +220,16 @@ def register(root, request):
 
 def _materialize(root, record):
     """Register the temp in the ledger, then create it exclusively."""
+    # The temp path is named after this transfer alone and a prepared record
+    # has never accepted a block, so anything already registered or on disk
+    # under that name is this very transaction's leftover from a crash
+    # between registration and the first save -- clear it before retrying.
+    for stale in ledger.find_by_path(root, record['tempPath']):
+        ledger.release(root, stale)
+    try:
+        os.unlink(record['tempPath'])
+    except FileNotFoundError:
+        pass
     resource_id = ledger.register_temp(root, record['tempPath'], record['totalBytes'],
                                        record['sessionId'], 'transfer-upload')
     try:

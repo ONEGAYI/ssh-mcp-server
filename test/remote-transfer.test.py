@@ -209,6 +209,30 @@ class RemoteTransferTest(unittest.TestCase):
         resource = list(ledger['resources'].values())[0]
         self.assertEqual(resource['bytes'], len(data))
 
+    def test_start_clears_its_own_crash_leftovers_before_materializing(self):
+        # start 在 register_temp + O_EXCL 创建 temp 之后、保存 transferring
+        # 之前崩溃会留下：账本残留登记 + 已存在 temp + record 仍 prepared。
+        # 重试 start 必须清掉自己（tempPath 命名唯一属本事务，prepared 态
+        # 从未接收任何块）的残留后再登记，而不是 O_EXCL 撞上旧文件裸崩。
+        data = b'crash window'
+        transfer_id = self.register(data)['result']['transferId']
+        temp = self.temp_path(transfer_id)
+        temp.write_bytes(b'')
+        stale = self.call('resource_register', {'path': str(temp), 'bytes': len(data),
+                                                'origin': 'transfer-upload'})['result']['resourceId']
+        started = self.start(transfer_id)
+        self.assertTrue(started['ok'], started)
+        self.assertEqual(started['result']['state'], 'transferring')
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(len(resources), 1)
+        self.assertNotIn(stale, resources)
+        # 清理后传输照常完成。
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
     def test_blocks_persist_verify_and_advance_the_confirmed_offset(self):
         data = bytes(range(256)) * 300  # 76800 bytes: one full chunk plus a short tail
         transfer_id = self.register(data)['result']['transferId']
