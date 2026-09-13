@@ -189,6 +189,80 @@ class RemoteReclaimTest(unittest.TestCase):
         replay = self.call('task_start', {'protocol': 2, 'jobId': job_id})
         self.assertEqual(replay['error']['code'], 'REQUEST_EXPIRED_OR_UNKNOWN')
 
+    # --- legacy (v1) records: observable migration, activation-gated removal ---
+
+    def _plant_legacy_v1_record(self, job_id, state_overrides):
+        """A first-version task directory: request.json + state.json and NO
+        registration.json -- the shape the retired legacy 'start' entry
+        created before the register-then-execute protocol."""
+        directory = self.job_dir(job_id)
+        directory.mkdir(parents=True)
+        request = {'jobId': job_id, 'command': 'sleep 5', 'cwd': str(self.work), 'env': {},
+                   'executionTimeoutMs': None, 'maxOutputBytes': 268435456}
+        (directory / 'request.json').write_text(json.dumps(request))
+        state = {'schemaVersion': 1, 'jobId': job_id, 'state': 'running',
+                 'createdAt': time.time() - 2 * DAY, 'requestHash': '0' * 64,
+                 'startedAt': time.time() - 2 * DAY, 'workerPid': 999999,
+                 'workerIdentity': 'legacy-boot:1', 'pid': 999998,
+                 'processIdentity': 'legacy-boot:2'}
+        state.update(state_overrides)
+        (directory / 'state.json').write_text(json.dumps(state))
+
+    def test_legacy_v1_terminal_record_waits_for_activation_and_expires_from_original_time(self):
+        finished_at = time.time() - 29 * DAY
+        self._plant_legacy_v1_record('v1-exited', {'state': 'exited', 'exitCode': 0,
+                                                   'completedAt': finished_at})
+        # Before activation the legacy start entry can still create tasks, so
+        # deleting the v1 record would let its replayed request rerun through
+        # the upgrade window (contracts: v1 records are only removed once the
+        # v2 protocol is active).
+        blocked = self.maintenance(clock=finished_at + 30.1 * DAY)['result']
+        self.assertEqual(blocked['removedJobs'], [], blocked)
+        self.assertTrue(self.job_dir('v1-exited').exists())
+        # Activation ends the creation window; the record then expires against
+        # its ORIGINAL completion time, not a fresh 30 days from activation.
+        self.assertTrue(self.call('handshake', {'protocol': 2})['ok'])
+        kept = self.maintenance(clock=finished_at + 29.9 * DAY)['result']
+        self.assertEqual(kept['removedJobs'], [], kept)
+        expired = self.maintenance(clock=finished_at + 30.1 * DAY)['result']
+        self.assertEqual(expired['removedJobs'], ['v1-exited'], expired)
+        self.assertFalse(self.job_dir('v1-exited').exists())
+        # The migration is idempotent: another round changes nothing.
+        self.assertEqual(self.maintenance(clock=finished_at + 30.2 * DAY)['result']['removedJobs'], [])
+        # And the retired legacy creation entry stays refused after activation.
+        replay = self.call('start', {'jobId': 'v1-exited', 'cwd': str(self.work), 'command': 'printf x'})
+        self.assertEqual(replay['error']['code'], 'PROTOCOL_UPGRADE_REQUIRED')
+
+    def test_legacy_v1_unfinished_record_is_observable_and_removal_gates_on_activation(self):
+        # A v1 record whose worker is gone cannot prove how the task ended.
+        # It stays observable, enters the unknown phase from the first
+        # maintenance observation (the migration observation time), and is
+        # only removed after activation -- never while the legacy creation
+        # window is still open.
+        self._plant_legacy_v1_record('v1-lost', {})
+        observed = self.call('status', {'jobId': 'v1-lost'})['result']
+        self.assertEqual(observed['state'], 'unknown')
+        self.maintenance(clock=time.time())
+        marker = self.job_dir('v1-lost') / 'unknown.json'
+        self.assertTrue(marker.is_file())
+        first_observed = json.loads(marker.read_text())['firstObservedAt']
+        # Past the 30-day unknown expiry but BEFORE activation: nothing is
+        # deleted and the record remains queryable.
+        kept = self.maintenance(clock=first_observed + 30.1 * DAY)['result']
+        self.assertEqual(kept['removedJobs'], [], kept)
+        still_there = self.call('status', {'jobId': 'v1-lost'})['result']
+        self.assertEqual(still_there['state'], 'unknown')
+        # A dead worker cannot write anything anymore, so it must not block
+        # the protocol switch forever (live legacy tasks still do); after
+        # activation the record expires from its first observation and the
+        # legacy creation entry is refused for the removed identifier.
+        activated = self.call('handshake', {'protocol': 2})
+        self.assertTrue(activated['ok'], activated)
+        expired = self.maintenance(clock=first_observed + 30.2 * DAY)['result']
+        self.assertEqual(expired['removedJobs'], ['v1-lost'], expired)
+        replay = self.call('start', {'jobId': 'v1-lost', 'cwd': str(self.work), 'command': 'printf x'})
+        self.assertEqual(replay['error']['code'], 'PROTOCOL_UPGRADE_REQUIRED')
+
     # --- transfers -------------------------------------------------------------
 
     def test_interrupted_transfer_data_and_records_expire_3_days_after_last_progress(self):
