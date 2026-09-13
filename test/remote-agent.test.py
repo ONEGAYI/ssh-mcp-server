@@ -182,6 +182,26 @@ class RemoteAgentTest(unittest.TestCase):
         self.assertFalse(legacy['ok'])
         self.assertEqual(legacy['error']['code'], 'PROTOCOL_UPGRADE_REQUIRED')
 
+    def test_task_start_recovers_from_a_crash_between_the_two_startup_writes(self):
+        # 崩溃窗口：request.json 已写、state.json 未写。该窗口内 worker 必然
+        # 从未 spawn（state.json 写在 spawn 之前），task_start 必须补写状态并
+        # 启动 worker，而不是永远回报 prepared 让任务既不执行也不报错。
+        registered = self.call('task_register', {'protocol': 2, 'cwd': str(self.root),
+                                                 'command': 'printf once >> crash-counter'})
+        self.assertTrue(registered['ok'], registered)
+        job_id = registered['result']['jobId']
+        job = self.root / 'state' / 'jobs' / job_id
+        registration = json.loads((job / 'registration.json').read_text())
+        request = {'jobId': job_id, 'command': registration['command'], 'cwd': registration['cwd'],
+                   'env': registration['env'], 'executionTimeoutMs': registration['executionTimeoutMs'],
+                   'maxOutputBytes': registration['maxOutputBytes']}
+        (job / 'request.json').write_text(json.dumps(request))
+        started = self.call('task_start', {'protocol': 2, 'jobId': job_id})
+        self.assertTrue(started['ok'], started)
+        ended = self.wait_exit(job_id)
+        self.assertEqual(ended['exitCode'], 0)
+        self.assertEqual((self.root / 'crash-counter').read_text(), 'once')
+
     def test_protocol_handshake_blocks_activation_until_legacy_tasks_drain(self):
         # Before activation the legacy entry still works (upgrade window).
         started = self.call('start', {'jobId': 'legacy-running', 'cwd': str(self.root), 'command': 'sleep 30'})

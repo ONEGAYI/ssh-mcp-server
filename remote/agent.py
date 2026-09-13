@@ -193,6 +193,18 @@ def task_start(root, request):
                              'No registration for this task identifier; register it explicitly first')
         if (path / 'request.json').is_file():
             # At most one execution per registration, including lost responses.
+            if not (path / 'state.json').is_file():
+                # Crash between the two writes: request.json was persisted but
+                # state.json was not, so the worker was never spawned (the
+                # state write precedes the spawn). Finish the startup here
+                # instead of reporting prepared forever.
+                registration = read_json(path / 'registration.json')
+                state = {'schemaVersion': 1, 'jobId': job_id, 'state': 'starting', 'createdAt': time.time(),
+                         'requestHash': registration['requestHash']}
+                atomic_json(path / 'state.json', state)
+                with (path / 'launcher.log').open('ab') as log:
+                    subprocess.Popen([sys.executable, os.path.abspath(__file__), '--root', str(root), '_worker', '--job-id', job_id],
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
             return describe(root, job_id)
         if (path / 'state.json').is_file():
             raise AgentError('START_STATE_UNKNOWN', 'Existing task has an incomplete startup record; do not rerun')
