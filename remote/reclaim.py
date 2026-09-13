@@ -1,4 +1,6 @@
-"""Bounded expiry reclamation for task and transfer records (issue #16).
+"""Bounded expiry reclamation for task and transfer records (issue #16), plus
+expired read credentials, stale helper images and crash-leftover temp
+resources (issue #17).
 
 Retention rules (spec 7.1 / ADR 0010), evaluated against an injectable
 clock so tests never wait real days:
@@ -12,6 +14,14 @@ clock so tests never wait real days:
                                 (queries never renew it)
   interrupted transfer data     3 days from the last real progress (or the
   and their records               registration, when nothing ever moved)
+  read credentials              their own recorded expiry (the same
+                                expiresAt the read path enforces); a fresh
+                                read never revives dead ranges
+  helper images                 everything except the running image and the
+                                images live processes still reference
+  crash-leftover temps          verified by ownership (the ledger
+                                registration), object identity and occupancy;
+                                unknown occupancy keeps management fields only
 
 Deleting a record never reopens execution: task_start without a
 registration is REQUEST_EXPIRED_OR_UNKNOWN and every transfer action
@@ -21,9 +31,7 @@ Every round is bounded by an item budget and a wall-clock budget, persists
 a cursor after each considered entry, and holds the workspace maintenance
 flock so two processes never reclaim the same workspace concurrently.
 Query actions trigger a throttled lazy attempt (lazy_attempt) on top of the
-hourly online maintenance driven by the local end. Ledger entries left
-pointing at orphaned temps by older crashes are #17's verified-reclamation
-domain; this module only releases what a per-transfer lock proves stopped.
+hourly online maintenance driven by the local end.
 Python 3.6 standard library only.
 """
 from contextlib import contextmanager
@@ -31,6 +39,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 
@@ -50,6 +59,8 @@ DEFAULT_TIME_BUDGET_MS = 2000
 LAZY_THROTTLE_SECONDS = 60
 TRANSFER_TERMINAL = frozenset(('completed', 'failed', 'cancelled', 'interrupted'))
 TASK_TERMINAL = frozenset(('exited', 'cancelled', 'interrupted'))
+HELPER_DIGEST = re.compile(r'[0-9a-f]{64}')
+HELPER_DIGEST_BYTES = re.compile(rb'[0-9a-f]{64}')
 # Query actions that opportunistically trigger the throttled lazy round.
 LAZY_ACTIONS = frozenset(('status', 'output', 'transfer_status',
                           'file_read', 'file_list', 'file_find', 'file_search'))
@@ -68,24 +79,27 @@ def _maintenance_state_path(root):
 def _load_maintenance_state(root):
     path = _maintenance_state_path(root)
     if not path.is_file():
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
+        return _empty_maintenance_state()
     try:
         state = read_json(path)
     except (OSError, ValueError):
         # A corrupt bookkeeping file must never block reclamation.
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
+        return _empty_maintenance_state()
     if not isinstance(state, dict):
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
-    state.setdefault('schemaVersion', 1)
-    state.setdefault('lastRunAt', 0)
-    state.setdefault('lastCompletedAt', 0)
-    state.setdefault('jobsCursor', None)
-    state.setdefault('transfersCursor', None)
-    state.setdefault('lastLazyAt', 0)
+        return _empty_maintenance_state()
+    for key, default in _cursor_defaults().items():
+        state.setdefault(key, default)
     return state
+
+
+def _cursor_defaults():
+    return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
+            'jobsCursor': None, 'transfersCursor': None, 'readsCursor': None,
+            'helpersCursor': None, 'resourcesCursor': None, 'lastLazyAt': 0}
+
+
+def _empty_maintenance_state():
+    return dict(_cursor_defaults())
 
 
 def _save_maintenance_state(root, state):
@@ -345,6 +359,214 @@ def _sorted_names(directory):
                   if not candidate.is_symlink())
 
 
+def _process_read_entry(root, name, now, summary):
+    """Reclaim one expired read credential or its dangling index (issue #17).
+
+    The expiry verdict is the same expiresAt the read path itself enforces,
+    so an accelerated test clock moves both in lockstep. Sorted order puts
+    every token file (<32 hex>.json) before its index-... twin, so a token
+    removed here leaves the index dangling for the same round to collect."""
+    reads = Path(root) / 'reads'
+    path = reads / name
+    if name.startswith('index-'):
+        try:
+            token_key = read_json(path).get('readToken')
+        except (OSError, ValueError):
+            return
+        if not isinstance(token_key, str):
+            return
+        token_path = reads / (token_key + '.json')
+        if token_path.is_file():
+            try:
+                record = read_json(token_path)
+            except (OSError, ValueError):
+                return
+            if now <= record.get('expiresAt', 0):
+                return  # live credential: its index stays
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        summary['removedReadIndexes'].append(name)
+        return
+    try:
+        record = read_json(path)
+    except (OSError, ValueError):
+        return
+    if now > record.get('expiresAt', 0):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        summary['removedReadTokens'].append(name[:-len('.json')])
+
+
+def _current_helper_digest():
+    """Digest of the helper image this maintenance process itself runs from.
+
+    Images are deployed as <stateRoot>/helpers/<digest>/<module>.py, and this
+    module lives inside the running image, so its own directory name is the
+    current version. Returns None in development layouts (repo checkout)."""
+    name = Path(os.path.abspath(__file__)).parent.name
+    return name if HELPER_DIGEST.fullmatch(name) else None
+
+
+def _referenced_helper_digests(root):
+    """Digests that any live process still references through its command line.
+
+    Running task workers are spawned as <image>/agent.py --root ... _worker,
+    concurrent helper exchanges run <image>/agent.py <action>, and even the
+    image installer passes the target path as an argument -- all of them show
+    up in /proc/<pid>/cmdline. The helpers directory is mode 0o700 under a
+    private state root, so another user's process cannot legally reference an
+    image; a cmdline we cannot read therefore never hides a real dependency.
+    """
+    prefix = (str(Path(root) / 'helpers') + os.sep).encode('utf8')
+    referenced = set()
+    try:
+        processes = os.listdir('/proc')
+    except OSError:
+        return referenced
+    for entry in processes:
+        if not entry.isdigit():
+            continue
+        try:
+            raw = Path('/proc', entry, 'cmdline').read_bytes()
+        except OSError:
+            continue
+        for argument in raw.split(b'\0'):
+            if not argument.startswith(prefix):
+                continue
+            digest = argument[len(prefix):].split(b'/')[0]
+            if HELPER_DIGEST_BYTES.fullmatch(digest):
+                referenced.add(digest.decode('ascii'))
+    return referenced
+
+
+def _reclaim_stale_helper(root, digest, summary):
+    """Remove one unreferenced helper image directory (issue #17)."""
+    keep = _referenced_helper_digests(root)
+    current = _current_helper_digest()
+    if current:
+        keep.add(current)
+    if digest in keep:
+        return
+    shutil.rmtree(str(Path(root) / 'helpers' / digest), ignore_errors=False)
+    summary['removedHelpers'].append(digest)
+
+
+def _transfer_managed_resource_ids(root):
+    """Resource ids whose reclamation belongs to their transfer records.
+
+    A transfer's temp and its ledger entry live across many short helper
+    processes, so the recorded holder is always a dead process while the
+    transfer itself is perfectly alive. Living transfer records manage their
+    resources with transfer-specific evidence (the slot lock plus their own
+    TTL in _process_transfer); the generic resource pass must never race
+    them. A record already gone leaves its entry to the generic pass, which
+    is exactly the crash-leftover case."""
+    transfers = Path(root) / 'transfers'
+    managed = set()
+    if not transfers.is_dir():
+        return managed
+    for directory in transfers.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        try:
+            resource_id = read_json(directory / 'record.json').get('resourceId')
+        except (OSError, ValueError):
+            continue
+        if isinstance(resource_id, str) and resource_id:
+            managed.add(resource_id)
+    return managed
+
+
+def _process_resource(root, resource_id, summary, managed):
+    """Verify and reclaim one crash-leftover ledger registration (issue #17).
+
+    Evidence model (spec 7.2): ownership is the ledger registration itself,
+    occupancy is the holder PID plus its boot-anchored start identity (a
+    reused PID or a missing process never passes as the holder, and age never
+    enters the verdict), and the object at the registered path must match the
+    recorded dev:ino identity before the file is deleted. Anything that
+    cannot be verified -- a holder that was never anchored, or a file whose
+    identity was never attached -- stays behind as management fields only;
+    files without any registration are never this function's business.
+    """
+    if resource_id in managed:
+        return  # a living transfer record owns this entry and its evidence
+    import ledger
+    with ledger.ledger_lock(root):
+        data = ledger.load(root)
+        entry = data['resources'].get(resource_id)
+        if not isinstance(entry, dict):
+            return
+        holder_identity = entry.get('holderIdentity')
+        if not holder_identity:
+            summary['unknownResources'].append(resource_id)
+            return
+        observed = ledger.process_identity(entry.get('holderPid'))
+        if observed is not None and observed == holder_identity:
+            summary['activeResources'] += 1
+            return
+        path = entry.get('path')
+        if isinstance(path, str) and os.path.exists(path):
+            registered_identity = entry.get('identity')
+            if not registered_identity:
+                # The object was never identity-anchored: unverifiable.
+                summary['unknownResources'].append(resource_id)
+                return
+            try:
+                info = os.stat(path)
+            except OSError:
+                summary['unknownResources'].append(resource_id)
+                return
+            if '{}:{}'.format(info.st_dev, info.st_ino) == registered_identity:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            # A mismatching identity means the name no longer denotes our
+            # object: release the registration but never delete the file.
+        del data['resources'][resource_id]
+        ledger.save(root, data)
+        summary['reclaimedResources'].append(resource_id)
+
+
+def _ledger_resource_ids(root):
+    import ledger
+    try:
+        data = ledger.load(root)
+    except AgentError:
+        return []
+    resources = data.get('resources')
+    if not isinstance(resources, dict):
+        return []
+    # Real registrations are always 32-hex ids; anything else is not ours.
+    return sorted(name for name in resources if ledger.ID_PATTERN.fullmatch(name))
+
+
+def _run_cursor_section(root, state, cursor_key, names, process,
+                        items, options, deadline):
+    """One budgeted, cursor-persisted pass; returns (items, exhausted)."""
+    cursor = state.get(cursor_key)
+    for name in names:
+        if cursor is not None and name <= cursor:
+            continue
+        if items >= options['maxItemsPerRun'] or time.monotonic() >= deadline:
+            return items, True
+        try:
+            process(name)
+        except OSError:
+            pass  # one unreadable entry never aborts the round
+        items += 1
+        state[cursor_key] = name
+        _save_maintenance_state(root, state)
+    state[cursor_key] = None
+    _save_maintenance_state(root, state)
+    return items, False
+
+
 def _run_round(root, request):
     """One bounded round; the caller already holds the maintenance lock."""
     periods = _resolve_periods(root, request)
@@ -353,49 +575,40 @@ def _run_round(root, request):
     deadline = time.monotonic() + options['timeBudgetMs'] / 1000.0
     state = _load_maintenance_state(root)
     summary = {'removedJobs': [], 'purgedLogs': [], 'markedUnknown': [],
-               'removedTransfers': [], 'itemsConsidered': 0}
+               'removedTransfers': [], 'removedReadTokens': [],
+               'removedReadIndexes': [], 'removedHelpers': [],
+               'reclaimedResources': [], 'unknownResources': [],
+               'activeResources': 0, 'itemsConsidered': 0}
     items = 0
-    exhausted = False
 
-    jobs_cursor = state.get('jobsCursor')
-    for name in _sorted_names(Path(root) / 'jobs'):
-        if jobs_cursor is not None and name <= jobs_cursor:
-            continue
-        if items >= options['maxItemsPerRun'] or time.monotonic() >= deadline:
-            exhausted = True
-            break
-        try:
-            _process_job(root, name, periods, now, summary)
-        except OSError:
-            pass  # one unreadable entry never aborts the round
-        items += 1
-        jobs_cursor = name
-        state['jobsCursor'] = jobs_cursor
-        _save_maintenance_state(root, state)
+    items, exhausted = _run_cursor_section(
+        root, state, 'jobsCursor', _sorted_names(Path(root) / 'jobs'),
+        lambda name: _process_job(root, name, periods, now, summary),
+        items, options, deadline)
     if not exhausted:
-        jobs_cursor = None
-        state['jobsCursor'] = None
-        _save_maintenance_state(root, state)
-
-    transfers_cursor = state.get('transfersCursor')
+        items, exhausted = _run_cursor_section(
+            root, state, 'transfersCursor', _sorted_names(Path(root) / 'transfers'),
+            lambda name: _process_transfer(root, name, periods, now, summary),
+            items, options, deadline)
     if not exhausted:
-        for name in _sorted_names(Path(root) / 'transfers'):
-            if transfers_cursor is not None and name <= transfers_cursor:
-                continue
-            if items >= options['maxItemsPerRun'] or time.monotonic() >= deadline:
-                exhausted = True
-                break
-            try:
-                _process_transfer(root, name, periods, now, summary)
-            except OSError:
-                pass
-            items += 1
-            transfers_cursor = name
-            state['transfersCursor'] = transfers_cursor
-            _save_maintenance_state(root, state)
-        if not exhausted:
-            state['transfersCursor'] = None
-            _save_maintenance_state(root, state)
+        items, exhausted = _run_cursor_section(
+            root, state, 'readsCursor',
+            [name for name in _sorted_names(Path(root) / 'reads') if name.endswith('.json')],
+            lambda name: _process_read_entry(root, name, now, summary),
+            items, options, deadline)
+    if not exhausted:
+        items, exhausted = _run_cursor_section(
+            root, state, 'helpersCursor',
+            [name for name in _sorted_names(Path(root) / 'helpers')
+             if HELPER_DIGEST.fullmatch(name)],
+            lambda name: _reclaim_stale_helper(root, name, summary),
+            items, options, deadline)
+    if not exhausted:
+        managed = _transfer_managed_resource_ids(root)
+        items, exhausted = _run_cursor_section(
+            root, state, 'resourcesCursor', _ledger_resource_ids(root),
+            lambda name: _process_resource(root, name, summary, managed),
+            items, options, deadline)
 
     summary['itemsConsidered'] = items
     summary['completed'] = not exhausted
