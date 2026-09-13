@@ -241,4 +241,13 @@ node scripts/package-offline.mjs --output D:/Packages/ssh-mcp-preview
 
 以后每次离线打包都会把本 README 放在包根目录，连同 docs、examples 和运行程序一起写入校验清单。包中不复制工作区 profile、SSH 凭据或测试产物。
 
+日常分发用轻量包（联网环境下 `npm install --omit=dev` 后即可运行）：
+
+```powershell
+node scripts/package-dist.mjs            # 产出 dist/ssh-mcp-server-<version>.tar.gz
+node scripts/package-dist.mjs --no-build # 复用现有 build/ 跳过编译
+```
+
+包内含本 README、英文 README、LICENSE、package.json 与 build/（含远端 Python 脚本）；不含 node_modules、凭据与工作区 profile。
+
 保留原版同步模式，可通过 `build/index.js --help` 查看入口；它不承担本工作区模式的持久任务保证。
