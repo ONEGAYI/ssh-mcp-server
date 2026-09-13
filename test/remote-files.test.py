@@ -288,8 +288,8 @@ class RemoteFilesTest(unittest.TestCase):
         token = self.call('file_read', {'path': 'post-image'})['result']['readToken']
 
         class ExternalReplacement(FileService):
-            def commit(inner, target, data, info=None, version=None):
-                written = super(ExternalReplacement, inner).commit(target, data, info, version)
+            def commit(inner, target, data, info=None, version=None, origin='file'):
+                written = super(ExternalReplacement, inner).commit(target, data, info, version, origin)
                 other = target.with_name('external-temp')
                 other.write_bytes(data)  # Same content, but a different file identity.
                 other.replace(target)

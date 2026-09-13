@@ -95,14 +95,19 @@ class RemoteLedgerTest(unittest.TestCase):
         # A fully consumed reservation no longer exists and cannot be referenced again.
         drained = self.call('resource_register', {'path': str(self.work / 'more.part'), 'bytes': 2596,
                                                   'origin': 'test', 'reservationId': reservation})
-        self.assertFalse(drained['ok'])
-        self.assertEqual(drained['error']['code'], 'RESOURCE_NOT_FOUND')
+        self.assertTrue(drained['ok'], drained)
+        self.assertEqual(self.call('resource_usage', {})['result']['reservedBytes'], 0)
+        expired = self.call('resource_register', {'path': str(self.work / 'final.part'), 'bytes': 10,
+                                                  'origin': 'test', 'reservationId': reservation})
+        self.assertFalse(expired['ok'])
+        self.assertEqual(expired['error']['code'], 'RESOURCE_NOT_FOUND')
         self.assertEqual(self.call('resource_usage', {})['result']['usedBytes'], before['usedBytes'])
-        forgot = self.call('resource_forget', {'resourceId': resource['result']['resourceId']})
-        self.assertTrue(forgot['ok'], forgot)
+        for payload in (resource, drained):
+            forgot = self.call('resource_forget', {'resourceId': payload['result']['resourceId']})
+            self.assertTrue(forgot['ok'], forgot)
         final = self.call('resource_usage', {})['result']
         self.assertEqual(final['tempBytes'], 0)
-        self.assertEqual(final['usedBytes'], before['usedBytes'] - 1500)
+        self.assertEqual(final['usedBytes'], before['usedBytes'] - 4096)
 
     def test_invalid_ledger_requests_and_policy_are_rejected(self):
         for request in ({'bytes': 0}, {'bytes': -5}, {'bytes': 'big'}, {}):
@@ -163,7 +168,8 @@ class RemoteLedgerTest(unittest.TestCase):
         finally:
             fcntl.flock(guard, fcntl.LOCK_UN)
             guard.close()
-        output, _ = process.communicate(timeout=15)
+        output = process.stdout.read()
+        process.wait(timeout=15)
         self.assertEqual(process.returncode, 0)
         self.assertTrue(json.loads(base64.b64decode(output.split(' ', 1)[1]))['ok'], output)
 
@@ -187,7 +193,11 @@ class RemoteLedgerTest(unittest.TestCase):
                     break
                 time.sleep(0.001)
             if observed is None:
-                process.communicate(timeout=15)
+                process.stdin.close()
+                process.stdout.read()
+                process.wait(timeout=15)
+                process.stdout.close()
+                process.stderr.close()
                 continue
             registered = self.ledger_json()['resources']
             entry = next((value for value in registered.values() if value['path'] == str(observed)), None)
@@ -195,7 +205,10 @@ class RemoteLedgerTest(unittest.TestCase):
                 # The writer may finish between observation and the kill; that is
                 # fine - the invariant under test is registration-before-existence.
                 os.kill(process.pid, signal.SIGKILL)
-                process.communicate(timeout=15)
+                process.stdout.read()
+                process.wait(timeout=15)
+                process.stdout.close()
+                process.stderr.close()
                 self.assertEqual(entry['bytes'], 14 * 1024 * 1024)
                 self.assertEqual(entry['kind'], 'temp-file')
                 usage = self.call('resource_usage', {})['result']
@@ -257,7 +270,11 @@ class RemoteLedgerTest(unittest.TestCase):
             ledger_module.save(self.state, state)
         confirmed = self.call('resource_inspect', {'resourceId': resource['resourceId']})['result']
         self.assertTrue(confirmed['identityMatches'])
-        target.write_bytes(b'replaced externally')
+        # Object identity is dev:ino: an in-place rewrite keeps it, a
+        # replacement through a new inode must not match anymore.
+        replacement = self.work / 'identity.replacement'
+        replacement.write_bytes(b'a different object')
+        os.replace(str(replacement), str(target))
         replaced = self.call('resource_inspect', {'resourceId': resource['resourceId']})['result']
         self.assertFalse(replaced['identityMatches'])
         target.unlink()
@@ -271,7 +288,7 @@ class RemoteLedgerTest(unittest.TestCase):
     def test_lock_switch_refused_until_legacy_locks_drain(self):
         target = self.work / 'switch.txt'
         target.write_text('content\n')
-        legacy = self.state / 'file-locks' / hashlib.sha256(str(target.resolve())).hexdigest()
+        legacy = self.state / 'file-locks' / hashlib.sha256(str(target.resolve()).encode('utf8')).hexdigest()
         legacy.parent.mkdir(parents=True, exist_ok=True)
         holder = legacy.open('a')
         try:
@@ -289,7 +306,8 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(marker['protocol'], 'fixed-slots')
         self.assertEqual(marker['slots'], 256)
         names = sorted(path.name for path in (self.state / 'file-locks').iterdir())
-        self.assertTrue(all(name.startswith('slot-') or name in ('slots.json', '.switch.lock') for name in names), names)
+        self.assertTrue(all(name.startswith('slot-') or name in ('slots.json', '.switch.lock')
+                            or name == legacy.name for name in names), names)
         # The only 64-hex file may be the legacy lock this test created itself.
         self.assertEqual([name for name in names if len(name) == 64], [legacy.name],
                          'per-path lock files must not be recreated')
