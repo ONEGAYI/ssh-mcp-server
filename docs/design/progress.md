@@ -1,5 +1,81 @@
 # 实施进展与验证证据
 
+## 2026-09-13 #21 合并注记：终验工作区状态重置与分段预算特征
+
+合并 #21 时 VM job-cli-remote 首跑失败（TRANSFER_LIMIT_REACHED，工作区已有 2 个活动传输；维护轮 itemsConsidered=100 不止）。核实为终验代理开发迭代在 wt21 工作区累积的 125 条任务记录与 35 条传输记录（测试时钟下未到期、故障注入用例留下的中断传输占满并发槽），非代码缺陷；删除该工作区 jobs/transfers/reads/ledger/maintenance.json（保留 helper 与 protocol.json）后三文件串行 5/5、8/8、4/4 全绿，且 largefile→job-cli 顺序复验 8/8 无交叉污染。两点启示：一是探针工作区多轮大文件调试后需重置状态目录再验收（VM 测试不重置远端状态）；二是维护轮五段共享同一预算，jobs 段大量积压时会推迟 transfers/reads 等段回收多轮（游标逐轮推进，设计内行为），现场运维若见回收滞后可连续多轮 maintain 或清理积压任务。
+
+
+## 2026-09-13 票据 #21：200 MiB、续传与清理的终验（跨功能验收）
+
+分支 `ticket/21-final-acceptance`（基于 5b20bf9，即 #6–#20 全部合入后的基线），按规格第 10 节完成跨功能终验。本票不改产品行为，交付三件事：覆盖盘点矩阵、三项缺失的跨功能证据（20/200 MiB 内存对比、局部操作网络字节、故障恢复端到端）、三档套件汇总。新增 `test/largefile-acceptance.test.js`（`SSH_MCP_TEST_WORKSPACE` 门控，与另两个 VM 套件分开串行运行）与既有 200 MiB 用例中的响应字节冒烟断言；断言机制以非门控负例用例常驻锁定（违规输入必须抛错，绿运行才代表真实测量满足规格）。
+
+### 覆盖矩阵（规格第 10 节逐条）
+
+| 规格验收点 | 覆盖票与代表性测试 | 本次新增 |
+|---|---|---|
+| 200 MiB 首中末读取、跨块 UTF-8/CRLF、超长行、重复替换、外部改写、不回传前文 | #9 `remote-files.test.py`：`test_200mib_file_reads_first_middle_and_last_with_cursor_continuation`、`test_line_requests_scan_to_boundaries_without_transmitting_the_prefix`、`test_overlong_line_chunks_report_line_metadata_and_resume`、`test_utf8_pages_never_split_multibyte_characters`；#10：`test_edit_locates_matches_across_stream_chunk_boundaries`、`test_multi_edit_failure_never_partially_commits`、`test_large_edit_preserves_bom_crlf_and_permissions`；外部改写：`test_external_change_rejects_stale_cursor_and_old_credentials`；VM：`workspace-mcp-remote` 200 MiB 流式编辑用例 | 该 VM 用例补响应字节冒烟（窗口读与编辑回执 ≤128 KiB 序列化）；`largefile-acceptance` 用例 1 补字节量级证据 |
+| 20/200 MiB 增量峰值内存 ≤64 MiB 且非 10 倍缩放 | #9 `test_streamed_reads_keep_helper_memory_bounded`、#10 `test_large_edit_splices_streaming_and_keeps_memory_bounded`（WSL 单侧自证） | `largefile-acceptance` 用例 2：五类操作 × 两尺寸 × 两端真机对比（方法与数字见下） |
+| 搜索分页命中与顺序、三后端、隐藏/忽略、预算与超时续扫、不跳过大文件 | #11 `remote-discovery.test.py`：`test_results_are_identical_across_backends_including_real_ones`、`test_pagination_returns_all_hits_in_order_without_rescanning_finished_files`、`test_budget_exhaustion_reports_partial_with_resumable_cursor`、`test_time_budget_is_reported_as_partial`、`test_gitignore_semantics_when_explicitly_enabled`、`test_64mib_file_search_across_blocks_long_lines_and_pagination`、`test_200mib_file_is_searchable`；#12 find 系列（`test_find_backends_agree_across_glob_hidden_and_ignore_matrices` 等）；VM：`workspace-mcp-remote` 基础用例的 engine 断言与分页往返 | 用例 1 补 200 MiB 搜索的通道字节证据 |
+| 上传/下载块边界、半块、校验、提交前后断线/杀进程；摘要一致、无半成品、未知提交不盲重做、续传仅发未确认部分+至多一个不完整块 | #13 `remote-transfer.test.py`：`test_corrupt_or_misordered_blocks_never_advance_the_offset`、`test_resume_rereads_persisted_chunks_and_keeps_only_trusted_prefix`、`test_resume_tolerates_a_torn_manifest_tail`、`test_lost_commit_response_reconciles_by_identity_not_by_content`、`test_commit_post_publish_failure_keeps_committing_and_reconciles`；#14：`test_download_fetch_allows_rewinding_to_a_served_boundary`、`test_download_verify_compares_the_asserted_receiver_digest`；#15：`test_cancel_in_the_commit_window_reconciles_by_evidence`、`test_cancel_is_idempotent_and_never_rolls_back_committed_targets`；VM：`workspace-mcp-remote` #13/#14（200 MiB 真机 budget 停止与按块续传）、#15；`job-cli-remote` #15（跨进程 wait） | `largefile-acceptance` 用例 3：128 MiB 真机 SIGKILL 本机驱动 + 两端半块/损坏块注入 + 新进程恢复（规模与既有 64/200 MiB 用例区分） |
+| 删除记录后旧标识无副作用；跨会话/工作区伪造拒绝 | #7 `remote-agent.test.py`：`test_deleted_task_records_reject_old_ids_and_new_ids_differ`、`test_protocol_v2_registers_before_executing_and_rejects_unregistered_ids`；#13：`test_operations_on_unknown_identifiers_never_fall_back_to_creation`、`test_actions_reject_a_foreign_session`；VM：`job-cli-remote` #16 回收后重放拒绝用例 | 无（既有覆盖充分） |
+| 加速时钟覆盖所有期限；unknown 也清理；占用中/正式/无归属文件不删 | #16/#17 `remote-reclaim.test.py` 全套（3/30 天、unknown 首次观察 30 天、预算游标、互斥）；`test_live_and_unverifiable_temp_registrations_are_kept`、`test_files_without_a_ledger_registration_are_never_deleted`、`test_regular_operation_temps_are_cleaned_up_immediately`；VM：`job-cli-remote` #16 三用例 + #17 真机维护轮 | 无（既有覆盖充分） |
+| 配额并发预留、满额日志、ENOSPC、崩溃遗留、PID 重用、helper 依赖、锁碰撞与迁移 | #8 `space-ledger.test.js`（并发预留）、`remote-files` 锁槽用例；#16 `test_task_log_writes_stop_at_the_workspace_quota`；ENOSPC 映射：`remote-transfer.test.py` 磁盘写满注入（OSError ENOSPC side_effect）；#17 崩溃遗留/持有进程证据；#20 锁切换门槛与 legacy 收尾 | 无（既有覆盖充分） |
+| 二次配置保留认证、并发拒绝、无需重启、旧 expiresAt 不变、新记录新值 | #18 `setup-mcp.test.js`：`update changes only named fields and preserves everything else`、`update rejects stale revisions and concurrent changes without half-writes`、`update preserves authentication files byte-for-byte and never echoes them`；无需重启：`maintenance-service.test.js`（每轮 loadPolicy）与 `space-ledger` loader 用例；查询不续期（expiresAt 不变）：`remote-reclaim.test.py` `test_interrupted_transfer_data_and_records_expire_3_days_after_last_progress` | 无（既有覆盖充分） |
+| 默认 remote_workspace 无统计；按需有界汇总与 token 成本 | #19 `remote-space-report.test.py`：`test_default_workspace_call_has_no_storage_section`、`test_include_storage_returns_bounded_summary`；`storage-report.test.js`；VM：`workspace-mcp-remote` 基础用例（两端数字 + 4 KiB 预算）；token 近似成本记录于 contracts「工作区空间汇总」节（146/80 token 样例） | 无（既有覆盖充分） |
+| build/Node/Python/VM/ZCode 后台验收；内网现场单独保留 | 三档验证证据见下；ZCode 后台完成/重启续传验收由首版探针与 2026-09-11 用户人工验收覆盖（见下文「人工验收结果」） | 本票汇总 |
+
+### 新增跨功能验收的设计与方法
+
+1. **局部操作无全文网络传输**（用例 1）：包装公共 `HelperTransport` 统计 SSH 通道双向字节（`CountingTransport`），对远端 200 MiB 固定行文件执行 1 MiB base64 窗口读（`grantRead=false` 传输路径，不受 56 KiB 文本预算截断）、64 KiB 文本窗口、行定位读、全文搜索（命中尾部一行）、流式编辑提交，逐项断言双向字节上限并核对交付内容与 oracle 一致。
+2. **20/200 MiB 内存对比**（用例 2）：远端侧经登记任务运行测量器——以子进程方式调用与生产完全相同的 helper 镜像（digest 复算自 `build/remote/`），每个计划（基线/读/搜/编辑/上传/下载）读 `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`（Linux 单位 KiB；wait4 语义使 helper 自身 spawn 的扫描子进程折叠进同一峰值）；增量 = 操作峰值 − metadataOnly 基线。本机侧用正式 `TransferService` 经真实 SSH 驱动上传/下载，期间每 50 ms 采样 `process.memoryUsage()` 取 rss/heapUsed 峰值并扣基线。判定：每活动操作增量 ≤64 MiB，且 200 MiB 增量 ≤ max(20 MiB 增量 ×5, 4 MiB)（噪声地板防止 20 MiB 侧小数值伪造违规；负例机制用例常驻锁定该判定会红）。
+3. **故障恢复端到端**（用例 3，128 MiB——与既有 #13/#14/#15 的 64/200 MiB 规模区分）：独立进程 `transfer start`（3 s 预算部分完成）→ 注入撕裂半块（下载：本机接收 temp 追加 400,000 字节垃圾，模拟块写一半进程被杀；上传：远端 temp 末确认块内翻转 16 字节 + 追加 300,000 字节）→ 新进程 resume 1.5 s 后 SIGKILL → 再一新进程 resume 至完成。断言：终态摘要与独立 oracle 一致、中断期间正式目标从未出现、完成后 temp 释放、完成前记录的续传块数 ≤ 剩余块数 +1、完成后重放 resume 幂等不再驱动（未知/已确认提交不盲重做的可测部分；committing 窗口证据由 WSL `test_cancel_in_the_commit_window_reconciles_by_evidence` 等承担）。
+
+### 真机测量数字（2026-09-13，CentOS 7.9 VM / Python 3.6.8，profile wt21-largefile）
+
+**局部操作通道字节（200 MiB 固定行文件，SSH 通道双向计数）**：
+
+| 操作 | 发送 B | 接收 B | 上限 |
+|---|---|---|---|
+| base64 窗口读 1 MiB（grantRead=false） | 313,686 | 1,864,670 | 4 MiB |
+| 文本窗口读 64 KiB | 207 | 77,056 | 512 KiB |
+| 行定位读（后半文件） | 208 | 768 | 512 KiB |
+| 全文搜索（命中尾部一行） | 194 | 572 | 512 KiB |
+| 编辑前置读 64 字节窗口 | 204 | 688 | 512 KiB |
+| 流式编辑提交 | 354 | 524 | 512 KiB |
+
+最重的 1 MiB 窗口读双向合计约 2.08 MiB（base64/JSON 信封两重编码开销），其余全部在 KiB 量级——与 200 MiB 全文传输相差两个数量级以上，局部操作无全文网络传输成立。
+
+**20/200 MiB 增量峰值内存（判定：每活动操作 ≤64 MiB 且 200 MiB 增量 ≤ max(20 MiB 增量×5, 4 MiB)）**：
+
+| 操作 | 远端 helper（含扫描子进程）20 / 200 MiB | 本机 Node 驱动 20 / 200 MiB |
+|---|---|---|
+| 片段读取（1 MiB base64 窗口） | +7,172 / +7,448 KiB | —（走 helper 直测） |
+| 全文搜索 | +3,432 / +5,020 KiB | — |
+| 替换提交（等长流式编辑） | +724 / +728 KiB | — |
+| 上传（全事务） | +2,880 / +2,880 KiB | rss +9,456 / +3,548 KiB，heap +412 / +0 KiB |
+| 下载（全事务） | +912 / +920 KiB | rss +5,284 / +2,072 KiB，heap +1,632 / +1,580 KiB |
+
+远端空闲基线 12,248 KiB；所有增量 ≤7.5 MiB（远端）/ ≤9.5 MiB（本机 rss），最大 200/20 比例约 1.5（搜索），10 倍文件未导致近似 10 倍内存，规格判定以一个数量级的余量满足。测量方法见上文设计节；本机 rss 的 20 MiB 侧偶高于 200 MiB 侧属 V8 分配复用的正常现象，不影响双向判定。
+
+**故障恢复端到端（128 MiB，默认 1 MiB 块）**：
+
+- 下载：独立进程 start（3 s 预算）停于 11,534,336 B → 本机接收 temp 注入 400,000 字节撕裂尾 → 新进程 resume 1.5 s 后 SIGKILL → 再一新进程 resume 至 completed；kill 后续传点仍为 11,534,336 B，重取 117 块（上限 = 剩余 118 − 已含 1 块），最终摘要与独立 oracle 一致，正式目标在中断期间从未出现、完成后 temp 释放，完成后重放 resume 幂等（不再驱动）。
+- 上传：独立进程 start 停于 11,534,336 B → 远端 temp 末确认块内翻转 16 字节 + 追加 300,000 字节 → resume 进程（heal 截断损坏块并重传）1.5 s 后 SIGKILL → 新进程 resume 至 completed；kill 后可信边界回到 11,534,336 B，重发 118 块（恰好 = 剩余块数，含 1 个损坏块重传），远端 `sha256sum` 与本机摘要一致，temp 释放、无半成品目标。
+
+### 验证证据（2026-09-13，worktree ticket-21，profile wt21-largefile 与其他 worktree 隔离）
+
+- 断言机制红验证：`node --test test/largefile-acceptance.test.js` 的非门控用例 `the memory budget assertion rejects violations (mechanism red check)` 对 64 MiB 超限、10 倍缩放两类违规输入断言抛错（常驻锁定，非一次性证据）。
+- Windows Node 24.15：`npm test` 276 项（259 通过、17 门控跳过、0 失败）。
+- WSL Ubuntu / Python 3.12 七套件全 OK：remote-agent、remote-discovery、remote-files、remote-ledger、remote-reclaim、remote-space-report、remote-transfer。
+- CentOS 7.9 VM 真实 SSH（三文件分开串行）：`workspace-mcp-remote.test.js` 5/5（200 MiB 上传 62.5 s、下载 67.9 s、编辑 9.9 s，含本票冒烟断言）；`job-cli-remote.test.js` 8/8；`largefile-acceptance.test.js` 4/4（窗口字节 + 内存对比 + 故障恢复 + 机制自检，288.8 s 复跑全绿；复跑前首跑亦全绿，仅修日志格式）。VM 命令（三档之第三档，逐文件串行）：
+  ```
+  SSH_MCP_TEST_WORKSPACE=D:/CODE/Project/_VibeCoding/ssh-mcp-wt/profiles/wt21-workspace.json node --test test/workspace-mcp-remote.test.js
+  SSH_MCP_TEST_WORKSPACE=D:/CODE/Project/_VibeCoding/ssh-mcp-wt/profiles/wt21-workspace.json node --test test/job-cli-remote.test.js
+  SSH_MCP_TEST_WORKSPACE=D:/CODE/Project/_VibeCoding/ssh-mcp-wt/profiles/wt21-workspace.json node --test test/largefile-acceptance.test.js
+  ```
+- 已知边界与本票未做：ZCode 后台通知机制本身未在 #21 重测（首版探针与 2026-09-11 人工验收已覆盖，#15 已说明传输等待器复用同一机制）；`largefile-acceptance` 的内存测量把 helper 每动作独立进程的峰值取 wait4 语义的最大值（与生产逐块进程模型一致，但不叠加多动作）；本机 Node 峰值为 50 ms 周期采样（非精确高水位）。
+- 本票尚未由用户人工验收；**最终内网离线现场验收仍未完成，VM 自动测试不替代**（离线包、真实内网 Python 环境与网络条件需按 usage.md 单独现场验收）。
+
 ## 2026-09-13 票据 #20：移除四项文件管理工具并收缩旧协议
 
 分支 `ticket/20-tool-retirement`（基于 0c6208e），按规格第 9 节与 ADR 0007 实施（TDD，先红后绿，测试与实现分开提交）：

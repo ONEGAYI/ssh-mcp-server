@@ -2,6 +2,8 @@
 
 状态：用户确认的首版行为契约。核心链路已实现；交付限制与待人工验收项见 [usage.md](usage.md) 和 [progress.md](progress.md)。
 
+2026-09-13 票据 [#21](https://github.com/ONEGAYI/ssh-mcp-server/issues/21) 完成跨功能终验（不改行为）：规格第 10 节验收矩阵、20/200 MiB 两端增量峰值内存（实测全部 ≤ 7.2 MiB 远端 / ≤ 11.4 MiB 本机，无 10 倍缩放）、200 MiB 局部操作的通道字节证据（1 MiB 窗口读收发合计约 2.2 MiB，其余操作均在 KiB 量级）、128 MiB 杀进程与半块注入的端到端恢复均已实测；覆盖矩阵与测量方法见 progress.md #21 节。最终内网离线现场验收仍保留为未完成。
+
 2026-09-13 票据 [#20](https://github.com/ONEGAYI/ssh-mcp-server/issues/20) 已实施工具收缩与旧协议收尾（规格第 9 节 / [ADR 0007](../adr/0007-file-management-through-shell.md)）：remote_move/remote_delete/remote_mkdir/remote_rmdir 从 MCP 注册与远端 helper 分发中移除，移动/删除/目录管理改用远端 Shell；仅被这些工具使用的 16 MiB 全文快照链路（snapshot/read_whole_file 等）一并移除，版本观察与 inline 写入预算语义保留。legacy（v1）记录处理补全：unknown 形态到期删除补上激活门槛（与终态一致——v1 记录仅在协议激活后删除，回收后 legacy start 重放拒绝），协议切换的排空判活改与 status 同源（死 worker 的旧记录不再永久阻塞升级，真活动旧任务仍以 LEGACY_TASKS_PENDING 阻塞）。详见「文件接口」「登记后执行与协议切换」「生命周期与回收」各节。
 
 2026-09-13 票据 [#17](https://github.com/ONEGAYI/ssh-mcp-server/issues/17) 已实施过期读取凭据、旧 helper 镜像与遗留临时资源的回收（规格 7.1/7.2）：维护轮在既有期限矩阵上扩展三类——过期 readToken 记录与悬空索引按其自身 `expiresAt` 物理删除（判定与读取路径同一时钟，回收后编辑按 `READ_REQUIRED` 拒绝、重读所需片段即恢复且不复活旧已读范围）；helpers/ 镜像按「当前运行版本 + /proc 命令行仍引用的版本」保留，其余在下轮清理（非 64-hex 命名的目录不是镜像、不删）；崩溃遗留的临时资源按账本归属 + 对象身份 + 持有进程（PID+启动身份）三重证据核实回收，未知占用的登记只保留最小管理字段并计入额度，无账本归属的文件永不触碰。本机维护轮同步回收本机账本的同类遗留（持有进程死亡 + 身份匹配才删临时）。详见「生命周期与回收」与「状态与临时数据的空间额度」两节。

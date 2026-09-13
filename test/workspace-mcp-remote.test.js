@@ -189,6 +189,10 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
     // oldText/newText, so no whole-file transfer happens on the edit path.
     const window = await call('remote_read', { path: remoteName, offset: (target - 1) * 64, maxBytes: 64 });
     assert.equal(window.data.text, lineOf(target));
+    // Issue #21 smoke: the bounded-window exchange itself stays window-scale
+    // (serialized response far below any file-scale traffic on a 200 MiB file).
+    assert.ok(Buffer.byteLength(JSON.stringify(window.data), 'utf8') <= 128 * 1024,
+      'a 64-byte window read must not answer with file-scale bytes');
     const replacement = 'L' + String(target) + ' patched replacement line padding well beyond the original width\n';
     const delta = Buffer.byteLength(replacement) - 64;
     assert.ok(delta > 0, 'the streamed edit must grow the file');
@@ -198,6 +202,10 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
     assert.equal(edited.data.rereadRequired, false);
     assert.equal(edited.data.bytesWritten, 200 * 1024 * 1024 + delta);
     assert.equal(edited.data.editsApplied, 1);
+    // Issue #21 smoke: the streamed edit commit answers with a bounded
+    // receipt, never the rewritten 200 MiB content.
+    assert.ok(Buffer.byteLength(JSON.stringify(edited.data), 'utf8') <= 128 * 1024,
+      'the edit receipt must stay bounded');
     // The spliced file: untouched head, patched line, shifted tail.
     const head = await call('remote_read', { path: remoteName, offset: 0, maxBytes: 64 });
     assert.equal(head.data.text, lineOf(1));
