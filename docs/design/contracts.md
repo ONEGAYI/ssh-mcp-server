@@ -62,24 +62,37 @@
 
 中断且确认无进程占用的传输临时数据，从最后一次实际传输进展起默认保留 3 天，单纯查询不延长期限。到期按 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md) 的清理机制回收；之后明确提示续传过期，需重新传输。该期限不适用于正在使用的临时文件，小型传输记录期限另定。本项已确认、尚未实施。
 
-### 搜索忽略规则（2026-09-12 已确认，尚未实施）
+### 搜索忽略规则（2026-09-13 已实施，票据 #11）
 
-- 默认不按 `.gitignore` 排除搜索候选文件，保留搜索生成网表等被 Git 忽略内容的能力；提供显式开关允许启用 `.gitignore` 过滤。
-- 默认包含点开头的文件和目录，仍排除 `.git/` 内部数据，并提供关闭隐藏文件搜索的开关。此处隐藏按名称定义，Windows 文件隐藏属性的语义随后续平台适配明确。
-- 搜索后端的选择不能隐式改变上述默认行为。开关参数名、后端实现以及其他忽略文件的处理尚未确定。
-- 本项仅决定 `.gitignore` 过滤行为，不解除路径访问限制、二进制处理和结果预算，也不表示当前大文件限制已移除。
+- `remote_search` 默认不按 `.gitignore` 排除候选文件（`respectGitignore=false`），保留搜索生成网表等被 Git 忽略内容的能力；显式传 `respectGitignore=true` 才启用层级 `.gitignore` 过滤。语义子集（纯标准库自写）：否定规则、目录规则（尾 `/`）、转义（`\#`、`\!`、`\ `）、锚定与 basename 模式、嵌套 `.gitignore` 深层覆盖浅层、被忽略父目录不能通过否定重新包含子文件。不读全局 ignore 或其他 `.ignore` 文件。
+- 默认包含点开头的文件和目录（`includeHidden=true`），可显式关闭；`.git/` 内部始终排除——递归枚举剪枝，显式指定 `.git` 内路径也拒绝（`PATH_NOT_ALLOWED`）。隐藏按名称点前缀定义。
+- 三个后端共用同一候选筛选器（同一排序后的文件列表），后端选择不能隐式改变过滤结果。
+- 本项不解除路径访问限制、二进制处理和结果预算。
 
-### 内容搜索后端（2026-09-12 已确认，尚未实施）
+### 内容搜索后端（2026-09-13 已实施，票据 #11）
 
 | 远端操作系统 | 按可用性选择的优先顺序 |
 |---|---|
 | Linux | rg → GNU grep → Python 分块搜索 |
-| Windows | rg → GNU grep → Python 分块搜索 → Windows PowerShell Select-String |
+| Windows | rg → GNU grep → Python 分块搜索 → Windows PowerShell Select-String（未实施，见 #4） |
 
-- 在执行搜索的远端检测工具与兼容版本，不能以本机已安装工具推定远端具备相同工具。Python、Node.js 和 GNU grep 均不作为远端 Windows 的预装前提。
-- 顺序综合性能与可用性，不承诺所有输入上的固定性能排名。搜索在远端执行并只回传有界结果；后端切换仍须遵守调用方选择的 `.gitignore` 过滤行为。
-- 本项针对文件内容搜索，文件名查找需另行适配。能力检测细节、执行失败与后备选择的区分、过滤开关的各后端实现留待实施规格确定。
-- 本轮先完成 CentOS 7；远端 Windows 的完整执行环境适配另行实施，由 [Issue #4](https://github.com/ONEGAYI/ssh-mcp-server/issues/4) 跟踪。当前 helper 依赖 Linux/Python，不能因接受此表而宣称 Windows 远端已可用。
+- 在执行搜索的远端用 `shutil.which` 检测实际可用性，不假定远端已装某工具。当前实现细节：
+  - **统一语义**：字面量、大小写敏感、UTF-8、按字节匹配；`\n` 分行（`\r` 保留在行内）；pattern 含换行或 NUL 报 `INVALID_PATTERN`。外部后端以受控 stdin 流接收行对齐数据块（`-F -a -n`，pattern 经 argv 单参数传递，不拼接 Shell 文本），行号与字节位置由 helper 侧映射，三后端命中集合一致。
+  - **大小文件路径**：≥1 MiB 的文件走外部后端；更小的文件直接用内建扫描（避免每文件 fork 开销）。`engine` 字段报告本页实际使用的后端；外部后端全部失败时如实报告 `python-literal`。
+  - **崩溃不当无匹配**：外部进程退出码 >1 或被信号杀死时，撤销该文件已产出命中、当页计数 `fallbackFiles+1`、文件改用内建扫描重扫；连续 3 个文件失败后本页剩余文件全部内建。
+  - **跳过摘要**：NUL 字节或 UTF-8 解码失败的文件计入 `skippedFiles`（`skippedDetail` 分 binary/encoding/io），不静默消失。超过 8 MiB 无换行的超长行按 1 MiB 片段加 `len(pattern)-1` 字节重叠报告，跨片段匹配不遗漏（重叠区命中极罕见地可能重复报告，行标记 `lineTruncated`）。
+- 能力上报：`file_workspace` 的 `capabilities.searchEngine` 报最高可用后端，`searchBackends` 报有序可用列表（`python-literal` 恒在），`gitignoreSearch: true`，并附默认扫描预算字段。
+- 文件名查找（find）复用同一候选筛选器，其后端适配在 #12。
+
+### 搜索分页与预算（2026-09-13 已实施，票据 #11）
+
+- 每页序列化结果上限 64 KiB（`limit` 条数与字节预算任一满即停，`reason=RESULT_LIMIT`）；默认扫描预算 512 MiB / 10 秒（`reason=SCAN_BYTE_LIMIT` / `SCAN_TIME_LIMIT`；请求可用 `scanBudgetBytes`（64 KiB–2 GiB）、`scanBudgetSeconds`（1–60）钳制内覆盖，该两参数参与游标绑定；#18 policy 合入后改由配置提供）。预算按读取字节记账，单页最多超出一个读取块，小预算也能逐页推进。**无单文件大小排除，200 MiB 网表可搜索**。
+- 预算或页满耗尽返回 `truncated=true`、`reason` 与 `nextCursor`，不冒充"没有匹配"；无匹配且扫完返回 `truncated=false, matches=[]`。
+- 游标（base64 JSON）绑定查询串、文件名过滤、隐藏/ignore 开关、预算参数与**候选文件列表摘要**：列表变化（目录增删文件）→ `STALE_CURSOR`，需新查询；续扫文件版本（stat 元数据哈希）变化 → `CURSOR_CONFLICT`。已扫完的文件不再重扫（按候选列表位置跳过）；当前文件按字节/行位置续扫，回退锚点保证不丢已见未留的命中，行号过滤保证不重复。跨文件目录是尽力枚举，不承诺快照。
+- 喂给扫描进程的输入流带背压（selectors 事件驱动读写，单行输出缓冲有界）；超时后强杀子进程时游标回退到最后一个已喂块，不越过被丢弃的输出。
+- 搜索结果不签发 readToken；Agent 仍须 remote_read 目标片段。
+
+**未实测边界**：上述行为已在 WSL（真 GNU grep + 假 rg/假 grep 后端）与 CentOS 7 VM（GNU grep 降级路径）自动化验证；最终内网离线现场验收仍未完成，见 usage/progress。
 
 ### 读取与版本
 

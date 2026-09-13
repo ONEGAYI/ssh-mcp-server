@@ -25,6 +25,27 @@ it('real workspace MCP protects uploads and transfers binary data without granti
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
     assert.equal((await call('remote_workspace')).data.capabilities.persistentTasks, true);
     assert.equal((await call('remote_write', { path, text: 'hello\nworld\n', create: true })).error, undefined);
+    // Issue #11: multi-backend search end to end. The VM typically lacks rg
+    // but has GNU grep, exercising the fallback order; the reported engine
+    // must be one of the three backends and pagination must round-trip.
+    const searchPath = sessionId + '-search.txt';
+    assert.equal((await call('remote_write', { path: searchPath, create: true, text: 'filler\nneedle one\nmore filler\nneedle two\n' })).error, undefined);
+    const caps = (await call('remote_workspace')).data.capabilities;
+    assert.ok(['ripgrep', 'gnu-grep', 'python-literal'].includes(caps.searchEngine), caps.searchEngine);
+    assert.ok(Array.isArray(caps.searchBackends) && caps.searchBackends.includes('python-literal'));
+    const page1 = await call('remote_search', { path: searchPath, pattern: 'needle', limit: 1 });
+    assert.equal(page1.error, undefined, JSON.stringify(page1));
+    assert.ok(['ripgrep', 'gnu-grep', 'python-literal'].includes(page1.data.engine));
+    assert.equal(page1.data.matches.length, 1);
+    assert.equal(page1.data.truncated, true);
+    assert.ok(page1.data.nextCursor);
+    const page2 = await call('remote_search', { path: searchPath, pattern: 'needle', limit: 1, cursor: page1.data.nextCursor });
+    assert.equal(page2.error, undefined, JSON.stringify(page2));
+    assert.deepEqual(page2.data.matches.map(match => match.line), [4]);
+    assert.equal(page2.data.truncated, false);
+    assert.equal('readToken' in page1.data, false);
+    const searchRead = await call('remote_read', { path: searchPath });
+    await call('remote_delete', { path: searchPath, readToken: searchRead.data.readToken });
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
     const transfer = await call('remote_download', { path, localPath: downloaded });
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));

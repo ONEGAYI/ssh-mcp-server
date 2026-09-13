@@ -55,9 +55,12 @@ if matched:
 
 def make_backend_dir(root, names):
     directory = Path(tempfile.mkdtemp(prefix='ssh-mcp backends ', dir=str(root)))
+    # Absolute interpreter path: the controlled PATH contains no other binaries,
+    # and the rewrite drops CRLF from the checked-out source string.
+    source = FAKE_BACKEND.replace('#!/usr/bin/env python3', '#!' + sys.executable).replace('\r\n', '\n')
     for name in names:
         script = directory / name
-        script.write_text(FAKE_BACKEND)
+        script.write_bytes(source.encode('utf8'))
         script.chmod(0o755)
     return directory
 
@@ -167,8 +170,8 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.write('.hidden.txt', 'hidden {}\n'.format(NEEDLE))
         self.write('crlf.txt', 'line\r\n{} with crlf\r\n'.format(NEEDLE))
         self.write('utf8-deep.txt', '中文首行\n第二{}行\n'.format(NEEDLE))
-        self.write('skipped.bin', b'\x00binary\x00{}\x00'.format(NEEDLE.encode('utf8')))
-        self.write('invalid.utf8', b'ok line\n{} \xff\xfe broken\n'.format(NEEDLE.encode('utf8')))
+        self.write('skipped.bin', b'\x00binary\x00' + NEEDLE.encode('utf8') + b'\x00')
+        self.write('invalid.utf8', b'ok line\n' + NEEDLE.encode('utf8') + b' \xff\xfe broken\n')
         # A multi-megabyte file forces the external-backend path.
         self.big_file('large.log', 3 * 1024 * 1024, {7, 31234})
         request = {'path': '.', 'pattern': NEEDLE, 'limit': 1000}
@@ -237,10 +240,11 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertTrue(first['truncated'])
         self.assertEqual(first['reason'], 'SCAN_BYTE_LIMIT')
         self.assertIsNotNone(first['nextCursor'])
+        # The budget is part of the cursor's query binding: keep it identical.
         collected, cursor, pages = list(self.hits(first)), first['nextCursor'], 1
         while cursor:
             result = self.call('file_search', {'path': 'large.log', 'pattern': NEEDLE,
-                                               'scanBudgetBytes': 1024 * 1024,
+                                               'scanBudgetBytes': 64 * 1024,
                                                'cursor': cursor})['result']
             collected.extend(self.hits(result))
             pages += 1
@@ -263,11 +267,14 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertEqual(stale['error']['code'], 'STALE_CURSOR')
         (self.work / 'new.txt').unlink()
         # Changing the resume file's content while paging is a cursor conflict.
-        fresh = self.call('file_search', {'path': '.', 'pattern': NEEDLE, 'limit': 1})['result']
+        # A single-file query with two hits and limit 1 parks the cursor inside
+        # that file, so rewriting it must be detected on the next page.
+        self.write('two.txt', 'first {}\nsecond {}\n'.format(NEEDLE, NEEDLE))
+        fresh = self.call('file_search', {'path': 'two.txt', 'pattern': NEEDLE, 'limit': 1})['result']
         resumed = fresh['nextCursor']
-        target = self.work / self.hits(fresh)[-1][0]
-        target.write_text('rewritten longer content {}\n'.format(NEEDLE))
-        conflict = self.call('file_search', {'path': '.', 'pattern': NEEDLE, 'cursor': resumed})
+        self.assertTrue(fresh['truncated'])
+        (self.work / 'two.txt').write_text('rewritten longer content {}\n'.format(NEEDLE))
+        conflict = self.call('file_search', {'path': 'two.txt', 'pattern': NEEDLE, 'cursor': resumed})
         self.assertEqual(conflict['error']['code'], 'CURSOR_CONFLICT')
 
     def test_time_budget_is_reported_as_partial(self):
@@ -276,6 +283,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
         import discovery
         from files import FileService
         self.big_file('large.log', 2 * 1024 * 1024, {3})
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
         service = FileService(self.root / 'state', str(self.work), 'session-one')
         original = discovery.time.monotonic
         ticks = [0]
@@ -377,7 +385,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
             stream.write('single-line ' + 'x' * (1536 * 1024) + ' {} '.format(NEEDLE) + 'y' * 64 + '\n')
             expected.append(long_line)
             stream.write('segment-start\n')
-            segment_line = long_line + 1
+            segment_line = long_line + 2  # segment-start occupies its own line
             stream.write('a' * (4 * 1024 * 1024) + ' {} '.format(NEEDLE) + 'b' * (5 * 1024 * 1024))
             expected.append(segment_line)
         collected, texts = [], {}
