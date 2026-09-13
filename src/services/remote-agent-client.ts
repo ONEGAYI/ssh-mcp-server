@@ -92,11 +92,18 @@ export class RemoteAgentClient {
     return target;
   }
 
-  async call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>): Promise<T> {
+  /** One helper protocol exchange with a raw stdin payload (issue #13).
+   *
+   * Same envelope contract as call(), but the caller frames the input bytes:
+   * transfer blocks are a JSON control line plus raw binary, and the options
+   * can extend the per-exchange timeout beyond the 30 s command default. */
+  async exchange<T = Record<string, unknown>>(action: string, input: Buffer,
+    options: { timeoutMs?: number } = {}): Promise<T> {
     if (!/^[a-z][a-z0-9_-]*$/.test(action)) throw new RemoteAgentError("INVALID_ACTION", "Invalid helper action");
     const target = await this.ensureInstalled();
     const command = `${quoteShell(this.python)} ${quoteShell(target)} --root ${quoteShell(this.options.remoteStateDir)} ${quoteShell(action)}`;
-    const response = await this.transport.executeInputCommand(command, Buffer.from(JSON.stringify(request), "utf8"), this.options.connectionName);
+    const response = await this.transport.executeInputCommand(command, input, this.options.connectionName,
+      options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs });
     if (response.exitCode !== 0) throw new RemoteAgentError("HELPER_EXECUTION_FAILED", "Remote helper did not complete its exchange");
     const lines = response.stdout.split(/\r?\n/).filter(line => line.startsWith("SSH_MCP_V1 "));
     if (lines.length !== 1 || !/^SSH_MCP_V1 [A-Za-z0-9+/]+={0,2}$/.test(lines[0])) {
@@ -110,5 +117,9 @@ export class RemoteAgentClient {
     }
     if (!envelope.ok) throw new RemoteAgentError(envelope.error?.code ?? "HELPER_ERROR", envelope.error?.message ?? "Remote helper failed");
     return envelope.result as T;
+  }
+
+  async call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>): Promise<T> {
+    return this.exchange(action, Buffer.from(JSON.stringify(request), "utf8"));
   }
 }

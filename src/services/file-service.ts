@@ -26,7 +26,9 @@ export class FileService {
       allowedRemotePaths: this.config.sshConfigs[this.config.connectionName].allowedRemotePaths ?? [] });
   }
 
-  private async localPath(value: string, writing: boolean): Promise<string> {
+  /** Resolve and boundary-check a local transfer path (shared with the
+   * transfer driver since issue #13; the old buffered upload path is gone). */
+  async localPath(value: string, writing: boolean): Promise<string> {
     const absolute = resolve(this.config.localRoot, value);
     let canonical: string;
     try { canonical = await realpath(absolute); }
@@ -47,30 +49,6 @@ export class FileService {
       }
     }
     throw new RemoteAgentError("PATH_NOT_ALLOWED", "Local transfer path is outside the workspace and configured allowed roots");
-  }
-
-  async upload(sessionId: string, request: { localPath: string; path: string; create?: boolean; overwrite?: boolean; expectedVersion?: string }) {
-    const path = await this.localPath(request.localPath, false);
-    const handle = await open(path, "r");
-    try {
-      const before = await handle.stat();
-      if (!before.isFile() || before.size > 16 * 1024 * 1024) throw new RemoteAgentError("FILE_TOO_LARGE", "Upload requires a regular file up to 16 MiB");
-      const data = Buffer.alloc(before.size + 1);
-      let size = 0;
-      while (size < data.length) {
-        const result = await handle.read(data, size, data.length - size, size);
-        if (!result.bytesRead) break;
-        size += result.bytesRead;
-      }
-      const after = await handle.stat();
-      if (size !== before.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.size !== after.size) {
-        throw new RemoteAgentError("FILE_CONFLICT", "Local upload source changed while reading");
-      }
-      // Issue #10: replacing an existing remote target is explicit and bound to
-      // the metadataOnly-observed version; the readToken path is gone.
-      return this.call("file_write", sessionId, { path: request.path, create: request.create,
-        overwrite: request.overwrite, expectedVersion: request.expectedVersion, data: data.subarray(0, size).toString("base64") });
-    } finally { await handle.close(); }
   }
 
   async download(sessionId: string, request: { localPath: string; path: string; overwrite?: boolean }) {
