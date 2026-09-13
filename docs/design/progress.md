@@ -1,5 +1,23 @@
 # 实施进展与验证证据
 
+## 2026-09-13 票据 #16：任务与传输结果到期回收且拒绝旧请求
+
+分支 `ticket/16-expiry-reclamation`（基于 073d808），按规格 7.1/7.2 与 ADR 0010 实施（TDD，先红后绿）：
+
+1. **远端回收**（`remote/reclaim.py` 新文件 + `agent.py` 分发 `maintenance` 动作）：期限矩阵——已确认任务日志 ack 后 3 天（purged.json 保留 dedup 记录）；已确认任务/传输记录 ack 后 30 天整目录回收；已结束未确认自 completedAt 起 30 天；unknown 形态任务自**首次观察**起 30 天（`unknown.json` 只写一次，查询不续期）；中断传输数据自最后实际进展（无进展则注册）起 3 天，远端在传输槽锁内确认无在途块后删 temp 并注销账本登记（#15 cancel 同款证据）。每轮 maintenance flock 非阻塞互斥（busy 明确 skipped）、逐项持久游标、项数/时长双预算（默认 100/2s），期限与预算参数可由请求覆盖（本机 loadPolicy 每轮传入）> ledger/policy.json 的 retentionMs/maintenance 节 > 规格默认；判定时钟经 `SSH_MCP_TEST_CLOCK` 注入。legacy v1 任务记录仅在 v2 协议激活后删除（避免升级窗口内旧请求经 legacy start 重跑）。
+2. **懒清理**（`agent.py`）：status/output/transfer_status/file_read/file_list/file_find/file_search 七类查询动作在返回结果后顺带触发 60 秒节流的有界清理，失败吞掉不影响查询。
+3. **任务日志额度**（`agent.py` worker）：写日志每满 1 MiB 经 `ledger.usage` 复查工作区额度，耗尽后停止保存新日志、记 `STORAGE_LIMIT` 截断原因并继续排空管道（不杀子进程——首版实现曾误把 STORAGE_LIMIT 并入 killpg 理由，由额度测试暴露后修复）；额度工具故障保守继续写。
+4. **本机维护**（`src/services/maintenance.ts` 新文件）：`maybeMaintain` 按 `policy.maintenance.intervalMs`（默认 1h）节流，maintenance.lock 跨进程互斥（仅核实持有进程死亡才夺回），每轮先有界回收本机登记（同期限矩阵；非终态传输按记录 expiresAt 过期回收并连本机 temp 与账本登记一起释放，缺 expiresAt 保守保留），再带当轮 loadPolicy 期限调用远端 maintenance；远端失败不写 lastCompletedAt，下次触发自动重试。`lastCompletedAt` 持久化在 identity 目录——离线/退出期间到期数据在重连后首个操作补做。触发点：MCP 每工具调用、job CLI 每次运行（pending 保持离线安全不触发）、`ssh-mcp-job maintain` 显式子命令。
+5. **额度每操作重读**（`space-ledger.ts` / `transfer-service.ts`）：SpaceLedger 构造接受固定值或 loader，TransferService 传 `loadPolicy(profilePath)` 的 `limits.localWorkspaceBytes`——保存的 policy 变更下一操作生效（补齐 #8 遗留、contracts 47 段标注的缺口）。
+
+验证证据（2026-09-13，worktree ticket-16，profile wt16-largefile 与其他 worktree 隔离）：
+
+- WSL Ubuntu / Python 3.12：`remote-reclaim.test.py` 13/13 通过（实现前 11 error + 2 fail 红转绿；覆盖 3/30 天加速时钟、unknown 到期删除、回收后重放被拒、查询不续期、预算游标与互斥、懒清理、日志额度截断）；回归 remote-agent 13、remote-transfer 51、remote-files 44、remote-ledger 12 全通过。
+- Windows Node 24.15：`npm test` 252 通过 / 0 失败（新增 maintenance-service 6 用例、space-ledger loader 用例；transfer-service fixture 改真实 profile 文件适配每操作重读；曾暴露非终态传输记录缺 expiresAt 被误删的缺陷，已改保守保留并用离线 pending 用例锁定）。
+- CentOS 7.9 VM 真实 SSH（两文件分开串行）：`workspace-mcp-remote.test.js` 5/5；`job-cli-remote.test.js` 7/7（#16 新增 3 用例：加速期限下日志层 purged → 记录层回收 → status JOB_NOT_FOUND → task_start 重放 REQUEST_EXPIRED_OR_UNKNOWN 且 marker 仅执行一次；中断传输到期回收后 resume/status 拒绝；CLI maintain 真实两端一轮 + lastCompletedAt 节流——伪造 2 小时前的完成时间戳模拟离线补清理）。
+- 已知边界：#17 域（账本遗留登记、无主临时文件、readToken/helper 回收）未动；#19 空间汇总未动；prepared 任务登记规格未设期限、不回收；远端 policy.json 的期限节仅支持手工放置（#18 的 update 不下发远端 policy）；懒清理节流与期限判定共用注入钟，虚拟时钟大幅前跳会重开懒清理窗口（测试依赖此语义）。
+- 本票尚未由用户人工验收；最终内网离线现场验收仍未完成。
+
 ## 2026-09-13 票据 #15：后台传输完成回传、恢复与主动取消
 
 分支 `ticket/15-background-transfers`，按规格 6.3/7.1 实施（TDD，测试先红后绿，测试与实现分开提交）：

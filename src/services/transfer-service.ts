@@ -36,6 +36,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceConfig } from "../config/workspace.js";
+import { loadPolicy } from "../config/policy.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
 import { FileService } from "./file-service.js";
 import { SpaceLedger, workspaceLedgerDirectory } from "./space-ledger.js";
@@ -180,8 +181,11 @@ export class TransferService {
     const identityDirectory = join(config.localStateDir, createHash("sha256").update(config.identity).digest("hex").slice(0, 24));
     this.directory = join(identityDirectory, "transfers");
     // Download temps are local resources; the ledger is the same per-workspace
-    // instrument the file tools use (issue #8).
-    this.ledger = new SpaceLedger(join(identityDirectory, "ledger"), config.policy.limits.localWorkspaceBytes);
+    // instrument the file tools use (issue #8). Since #16 the limit is re-read
+    // from the profile on every quota check (loadPolicy), so saved policy
+    // changes apply from the next operation without a restart.
+    this.ledger = new SpaceLedger(join(identityDirectory, "ledger"),
+      async () => (await loadPolicy(config.profilePath)).limits.localWorkspaceBytes);
   }
 
   /** Issue one transfer action over the raw exchange path with the shared

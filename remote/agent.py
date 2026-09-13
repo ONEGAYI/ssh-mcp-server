@@ -20,6 +20,12 @@ from common import AgentError, atomic_json, read_json
 PROTOCOL = 'SSH_MCP_V1 '
 PROTOCOL_VERSION = 2
 TERMINAL = frozenset(('exited', 'cancelled', 'interrupted'))
+# Task log writes are an unbounded unknown increment: past this many bytes
+# the worker re-checks the workspace quota (spec 7.2) before saving more.
+LOG_QUOTA_CHECK_BYTES = 1024 * 1024
+# Query actions that also trigger a throttled lazy reclamation round (#16).
+LAZY_ACTIONS = frozenset(('status', 'output', 'transfer_status',
+                          'file_read', 'file_list', 'file_find', 'file_search'))
 
 
 def process_identity(pid):
@@ -281,7 +287,7 @@ def worker(root, job_id):
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
             state.update(pid=process.pid, processIdentity=process_identity(process.pid))
             atomic_json(path / 'state.json', state)
-            code, reason, truncated = collect_process(process, path, request, stdout, stderr)
+            code, reason, truncated = collect_process(root, process, path, request, stdout, stderr)
         state.update(state='cancelled' if reason == 'CANCELLED' else 'exited', exitCode=code,
                      completedAt=time.time(), outputTruncated=truncated)
         if reason:
@@ -297,7 +303,22 @@ def worker(root, job_id):
     atomic_json(path / 'state.json', state)
 
 
-def collect_process(process, path, request, stdout, stderr):
+def workspace_log_quota_exceeded(root):
+    """True when the workspace space limit is already consumed.
+
+    Used by the task worker to stop persisting new log bytes (spec 7.2):
+    the pipe keeps draining so the child never blocks, the stoppage is
+    recorded as an explicit STORAGE_LIMIT truncation, and a broken ledger
+    never costs log data -- on doubt, keep writing."""
+    try:
+        import ledger
+        usage = ledger.usage(root)
+        return usage['usedBytes'] > usage['limitBytes']
+    except Exception:
+        return False
+
+
+def collect_process(root, process, path, request, stdout, stderr):
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, stdout)
     selector.register(process.stderr, selectors.EVENT_READ, stderr)
@@ -307,6 +328,8 @@ def collect_process(process, path, request, stdout, stderr):
     killed = False
     truncated = False
     written = 0
+    quota_blocked = False
+    next_quota_check = 0
     deadline = time.monotonic() + request['executionTimeoutMs'] / 1000.0 if request['executionTimeoutMs'] else None
     try:
         while True:
@@ -322,7 +345,10 @@ def collect_process(process, path, request, stdout, stderr):
             elif finished_at is None:
                 finished_at = now
             try:
-                if reason and stopped_at is None:
+                # STORAGE_LIMIT only stops persisting log bytes (the child keeps
+                # running and its output keeps draining, spec 7.2); every other
+                # recorded reason (cancel, timeout, output budget) stops the task.
+                if reason and reason != 'STORAGE_LIMIT' and stopped_at is None:
                     os.killpg(process.pid, signal.SIGTERM)
                     stopped_at = now
                 elif stopped_at is not None and now - stopped_at >= 1 and not killed:
@@ -343,8 +369,15 @@ def collect_process(process, path, request, stdout, stderr):
                 if not data:
                     selector.unregister(key.fileobj)
                     continue
+                if written >= next_quota_check:
+                    # Bounded-block quota admission for the unknown increment.
+                    next_quota_check = written + LOG_QUOTA_CHECK_BYTES
+                    if not quota_blocked and workspace_log_quota_exceeded(root):
+                        quota_blocked = True
+                        truncated = True
+                        reason = reason or 'STORAGE_LIMIT'
                 remaining = max(0, request['maxOutputBytes'] - written)
-                accepted = data[:remaining]
+                accepted = b'' if quota_blocked else data[:remaining]
                 key.data.write(accepted)
                 written += len(accepted)
                 if len(data) > len(accepted):
@@ -493,6 +526,9 @@ def main():
         result = acknowledge(root, request)
     elif args.action == 'cleanup':
         result = cleanup(root, request)
+    elif args.action == 'maintenance':
+        from reclaim import run_maintenance
+        result = run_maintenance(root, request)
     elif args.action.startswith('resource_'):
         from ledger import resource_action
         result = resource_action(root, args.action, request)
@@ -505,6 +541,11 @@ def main():
                              request.get('allowedRemotePaths'), request.get('directoryScope') or 'restricted').call(args.action, request)
     else:
         raise AgentError('UNSUPPORTED_ACTION', 'Unknown helper action')
+    if args.action in LAZY_ACTIONS:
+        # Opportunistic bounded reclamation after the query's own result is
+        # settled (spec 7.2): cleanup must never fail or delay the answer.
+        from reclaim import lazy_attempt
+        lazy_attempt(root)
     emit({'ok': True, 'result': result})
 
 

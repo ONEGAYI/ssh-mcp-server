@@ -183,3 +183,20 @@ it('local inspect reports object identity and holder evidence without age judgme
     assert.equal(missing.identityMatches, null);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+it('resolves the limit from a loader on every quota check (per-operation policy reload, #16)', async () => {
+  assert.ok(SpaceLedger);
+  const root = await fixture();
+  try {
+    let limit = 1 << 20;
+    const ledger = new SpaceLedger(join(root, 'ledger'), async () => limit);
+    await ledger.register(join(root, 'first.part'), 1024, 'test');
+    // Shrinking the policy takes effect on the next operation, without
+    // rebuilding the ledger or restarting the service.
+    limit = 2048;
+    await assert.rejects(ledger.register(join(root, 'second.part'), 4096, 'test'),
+      error => error.code === 'WORKSPACE_QUOTA_EXCEEDED');
+    assert.equal((await ledger.usage()).limitBytes, 2048);
+    assert.equal((await ledger.reserve(4, 'late')).limitBytes, 2048);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

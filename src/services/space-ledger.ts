@@ -122,16 +122,30 @@ async function measureStateBytes(identityDirectory: string): Promise<number> {
   return total;
 }
 
+/** Limit source: a fixed number, or a loader invoked on every quota check so
+ * saved policy changes apply from the next operation without a restart
+ * (spec section 8; the reload point is loadPolicy). */
+export type SpaceLimitSource = number | (() => number | Promise<number>);
+
 export class SpaceLedger {
   private readonly identityDirectory: string;
   private readonly directory: string;
 
-  constructor(directory: string, private readonly limitBytes: number = DEFAULT_SPACE_LIMIT_BYTES) {
-    if (!Number.isInteger(limitBytes) || limitBytes < 1) {
+  constructor(directory: string, private readonly limitSource: SpaceLimitSource = DEFAULT_SPACE_LIMIT_BYTES) {
+    if (typeof limitSource === "number" && (!Number.isInteger(limitSource) || limitSource < 1)) {
       throw new RemoteAgentError("INVALID_CONFIG", "Workspace space limit must be a positive integer");
     }
     this.directory = directory;
     this.identityDirectory = dirname(directory);
+  }
+
+  /** Resolve the effective limit for this operation. */
+  private async resolveLimit(): Promise<number> {
+    const value = typeof this.limitSource === "function" ? await this.limitSource() : this.limitSource;
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RemoteAgentError("INVALID_CONFIG", "Workspace space limit must be a positive integer");
+    }
+    return value;
   }
 
   private lockPath(): string {
@@ -227,19 +241,20 @@ export class SpaceLedger {
 
   private async summary(state: LedgerState): Promise<UsageSummary> {
     const stateBytes = await measureStateBytes(this.identityDirectory);
+    const limitBytes = await this.resolveLimit();
     let tempBytes = 0, reservedBytes = 0;
     for (const resource of Object.values(state.resources)) tempBytes += resource.bytes;
     for (const reservation of Object.values(state.reservations)) reservedBytes += reservation.bytes;
     return { stateBytes, tempBytes, reservedBytes,
-      usedBytes: stateBytes + tempBytes + reservedBytes, limitBytes: this.limitBytes,
+      usedBytes: stateBytes + tempBytes + reservedBytes, limitBytes,
       resourceCount: Object.keys(state.resources).length,
       reservationCount: Object.keys(state.reservations).length };
   }
 
   private requireQuota(summary: UsageSummary, requested: number): void {
-    if (summary.usedBytes + requested > this.limitBytes) {
+    if (summary.usedBytes + requested > summary.limitBytes) {
       throw new RemoteAgentError("WORKSPACE_QUOTA_EXCEEDED",
-        `Workspace space limit is ${this.limitBytes} bytes (used ${summary.usedBytes}, requesting ${requested}); rejecting the new usage`);
+        `Workspace space limit is ${summary.limitBytes} bytes (used ${summary.usedBytes}, requesting ${requested}); rejecting the new usage`);
     }
   }
 
@@ -253,7 +268,7 @@ export class SpaceLedger {
       const summary = await this.summary(state);
       this.requireQuota(summary, bytes);
       state.reservations[reservationId] = { bytes, holderPid: process.pid, note, createdAt: Date.now() };
-      return { reservationId, usedBytes: summary.usedBytes + bytes, limitBytes: this.limitBytes };
+      return { reservationId, usedBytes: summary.usedBytes + bytes, limitBytes: summary.limitBytes };
     });
   }
 
@@ -301,7 +316,7 @@ export class SpaceLedger {
       }
       state.resources[resourceId] = { kind: "temp-file", path, bytes, identity: null,
         holderPid: process.pid, origin, reservationId: reservationId ?? null, createdAt: Date.now() };
-      return { resourceId, usedBytes: summary.usedBytes + net, limitBytes: this.limitBytes };
+      return { resourceId, usedBytes: summary.usedBytes + net, limitBytes: summary.limitBytes };
     });
   }
 
