@@ -151,6 +151,60 @@ it('expires local transfer records by terminal retention and stalled TTL, releas
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+it('expires stalled upload mirror records by their recorded TTL like downloads (review R1)', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const staleUpload = hex32();
+  const liveUpload = hex32();
+  const untimestampedUpload = hex32();
+  try {
+    // Upload mirrors carry no state of their own; the expiry is the recorded
+    // TTL, exactly like a stalled download receiver record.
+    await writeTransfer(fixture.identityDir, staleUpload, {
+      schemaVersion: 1, transferId: staleUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now() - 4 * DAY, expiresAt: Date.now() - DAY,
+    });
+    await writeTransfer(fixture.identityDir, liveUpload, {
+      schemaVersion: 1, transferId: liveUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now(), expiresAt: Date.now() + 3 * DAY,
+    });
+    // Pre-R1 upload records have no expiresAt: kept conservatively.
+    await writeTransfer(fixture.identityDir, untimestampedUpload, {
+      schemaVersion: 1, transferId: untimestampedUpload, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', registeredAt: Date.now() - 40 * DAY,
+    });
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', staleUpload)).then(() => true, () => false), false,
+      'an expired upload mirror must be reclaimed');
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', liveUpload)).then(() => true, () => false), true);
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', untimestampedUpload)).then(() => true, () => false), true);
+    assert.deepEqual(result.local.removedTransfers, [staleUpload]);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+it('unknown download records are non-terminal: they expire by their TTL, not the terminal retention (review R2)', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  const expiredUnknown = hex32();
+  const freshUnknown = hex32();
+  try {
+    for (const [id, offset] of [[expiredUnknown, -DAY], [freshUnknown, 3 * DAY]]) {
+      await writeTransfer(fixture.identityDir, id, {
+        schemaVersion: 1, transferId: id, workspaceId: 'maint-test', sessionId: 's',
+        direction: 'download', state: 'unknown', tempPath: null, resourceId: null,
+        completedAt: Date.now() - DAY, error: { code: 'TRANSFER_STATE_UNKNOWN', message: 'inspect manually' },
+        registeredAt: Date.now() - 4 * DAY, expiresAt: Date.now() + offset,
+      });
+    }
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', expiredUnknown)).then(() => true, () => false), false,
+      'an unknown record past its TTL is reclaimed with the retention window');
+    assert.equal(await stat(join(fixture.identityDir, 'transfers', freshUnknown)).then(() => true, () => false), true,
+      'a fresh unknown record stays for manual inspection');
+    assert.deepEqual(result.local.removedTransfers, [expiredUnknown]);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 it('throttles by the persisted maintenance interval', async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();
