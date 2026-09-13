@@ -140,12 +140,25 @@ export class SpaceLedger {
 
   /** Steal the lock only from a holder proven dead; never on timeout alone. */
   private async reclaimDeadHolder(): Promise<void> {
+    let holderPid: unknown;
     try {
-      const holder = JSON.parse(await readFile(this.lockPath(), "utf8"));
-      if (typeof holder.pid === "number" && processAlive(holder.pid)) return;
-    } catch (error) {
-      if (isMissing(error)) return; // released between the check and the read
-      return; // unreadable holder: treat as held and keep waiting
+      holderPid = JSON.parse(await readFile(this.lockPath(), "utf8"))?.pid;
+    } catch {
+      return; // released between the check and the read, or unreadable: keep waiting
+    }
+    if (typeof holderPid === "number" && processAlive(holderPid)) return;
+    // TOCTOU narrowing: between the death verdict above and the unlink below,
+    // another process may have reclaimed the lock already and written its own
+    // pid; unlinking then would delete the new holder's lock file and let two
+    // processes hold the ledger at once. Re-read and unlink only while the
+    // file still names the pid we just judged dead. A millisecond-scale
+    // window remains (this read and the unlink are separate steps); the
+    // complete fix is a unique lock name per attempt plus an atomic rename,
+    // deliberately deferred.
+    try {
+      if (JSON.parse(await readFile(this.lockPath(), "utf8"))?.pid !== holderPid) return;
+    } catch {
+      return; // released or unreadable meanwhile: keep waiting
     }
     await unlink(this.lockPath()).catch(error => { if (!isMissing(error)) throw error; });
   }

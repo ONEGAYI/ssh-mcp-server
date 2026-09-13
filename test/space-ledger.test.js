@@ -143,6 +143,21 @@ it('a stale lock left by a dead holder is reclaimed, never while the holder live
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+it('a lock held by a live process times out to LEDGER_BUSY without being stolen', async () => {
+  assert.ok(SpaceLedger);
+  const root = await fixture();
+  const directory = join(root, 'ledger');
+  try {
+    await mkdir(directory, { recursive: true });
+    // This test process is alive: its lock must be respected, never stolen.
+    await writeFile(join(directory, 'ledger.lock'), JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+    const ledger = new SpaceLedger(directory, 1 << 20);
+    await assert.rejects(ledger.reserve(512, 'locked out'), error => error.code === 'LEDGER_BUSY');
+    const holder = JSON.parse(await readFile(join(directory, 'ledger.lock'), 'utf8'));
+    assert.equal(holder.pid, process.pid); // untouched, not deleted by the waiter
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it('local inspect reports object identity and holder evidence without age judgments', async () => {
   assert.ok(SpaceLedger);
   const root = await fixture();
