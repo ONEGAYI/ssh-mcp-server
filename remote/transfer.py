@@ -136,6 +136,12 @@ def _match_source(record, source_identity):
                          'The local source changed since registration; refuse to mix versions, register a new transfer')
 
 
+def _require_session(record, request):
+    """Every action (not just block exchange) belongs to the registering session."""
+    if request.get('sessionId') != record['sessionId']:
+        raise AgentError('TRANSFER_SCOPE_MISMATCH', 'Transfer belongs to a different session')
+
+
 def _active_transfer_count(root):
     count = 0
     for candidate in sorted(transfers_directory(root).iterdir()):
@@ -220,6 +226,16 @@ def register(root, request):
 
 def _materialize(root, record):
     """Register the temp in the ledger, then create it exclusively."""
+    # The temp path is named after this transfer alone and a prepared record
+    # has never accepted a block, so anything already registered or on disk
+    # under that name is this very transaction's leftover from a crash
+    # between registration and the first save -- clear it before retrying.
+    for stale in ledger.find_by_path(root, record['tempPath']):
+        ledger.release(root, stale)
+    try:
+        os.unlink(record['tempPath'])
+    except FileNotFoundError:
+        pass
     resource_id = ledger.register_temp(root, record['tempPath'], record['totalBytes'],
                                        record['sessionId'], 'transfer-upload')
     try:
@@ -237,7 +253,14 @@ def _materialize(root, record):
 
 
 def _read_manifest(root, transfer_id):
-    """Stream the chunk manifest one line at a time; never a whole-file load."""
+    """Stream the chunk manifest one line at a time; never a whole-file load.
+
+    A process killed mid-append leaves a torn final line: the first line that
+    fails to parse ends the manifest (the torn line and anything after it is
+    not trusted). The record for that chunk advances only after the manifest
+    append, so dropping the torn tail equals treating the chunk as
+    unconfirmed and _heal's truncation rewinds accordingly.
+    """
     path = transfer_path(root, transfer_id) / 'chunks.jsonl'
     if not path.is_file():
         return
@@ -245,7 +268,10 @@ def _read_manifest(root, transfer_id):
         for line in stream:
             line = line.strip()
             if line:
-                yield json.loads(line)
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    return
 
 
 def _truncate_manifest(root, transfer_id, keep):
@@ -288,8 +314,8 @@ def _heal(root, transfer_id, record):
     to that boundary. A deleted temp restarts from zero.
     """
     temp = Path(record['tempPath'])
-    chunk_size = record['chunkSize']
     trusted = 0
+    trusted_offset = 0
     if temp.exists():
         for entry in _read_manifest(root, transfer_id):
             size = entry['size']
@@ -300,7 +326,11 @@ def _heal(root, transfer_id, record):
             if current != entry['sha256']:
                 break
             trusted += 1
-        trusted_offset = trusted * chunk_size
+            # The trusted boundary is the sum of the verified entries' sizes
+            # (the final block may be short), never trusted * chunk_size --
+            # that would extend the temp past the real content when every
+            # block is already confirmed.
+            trusted_offset += size
         if trusted_offset != temp.stat().st_size:
             with temp.open('r+b') as stream:
                 stream.truncate(trusted_offset)
@@ -328,6 +358,7 @@ def start(root, request):
     source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         _match_source(record, source)
         if record['state'] == 'prepared':
             _materialize(root, record)
@@ -350,6 +381,7 @@ def resume(root, request):
     source = _validate_source_identity(request.get('sourceIdentity'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         _match_source(record, source)
         if record['state'] == 'prepared':
             raise AgentError('INVALID_STATE', 'This transfer never started; call transfer_start first')
@@ -377,9 +409,7 @@ def receive_block(root, transfer_id, control, payload):
         raise AgentError('INVALID_REQUEST', 'Blocks must carry at least one byte')
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
-        session = control.get('sessionId')
-        if session != record['sessionId']:
-            raise AgentError('TRANSFER_SCOPE_MISMATCH', 'Transfer belongs to a different session')
+        _require_session(record, control)
         if record['state'] != 'transferring':
             raise AgentError('INVALID_STATE', 'This transfer is not accepting blocks in state {}'.format(record['state']))
         if index != record['chunkCount'] or offset != record['confirmedOffset']:
@@ -422,6 +452,7 @@ def verify(root, request):
     transfer_id = _transfer_id(request.get('transferId'))
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         if record['state'] == 'verifying':
             return describe(record)
         if record['state'] in ('committing', 'completed'):
@@ -431,6 +462,11 @@ def verify(root, request):
         temp = Path(record['tempPath'])
         actual_size = temp.stat().st_size
         if actual_size != record['totalBytes']:
+            record.update(state='failed',
+                          error={'code': 'VERIFY_MISMATCH',
+                                 'message': 'Received size {} does not match {}'.format(actual_size, record['totalBytes'])},
+                          completedAt=_now())
+            _save_record(root, transfer_id, record)
             raise AgentError('VERIFY_MISMATCH', 'Received size {} does not match {}'.format(actual_size, record['totalBytes']))
         digest = hashlib.sha256()
         with temp.open('rb') as stream:
@@ -473,6 +509,7 @@ def commit(root, request):
     record = None
     with acquire_slots(root, [transfer_id]):
         record = _load_record(root, transfer_id)
+        _require_session(record, request)
         directory = transfer_path(root, transfer_id)
         if record['state'] in ('completed', 'committing'):
             receipt_path = directory / 'receipt.json'
@@ -495,6 +532,10 @@ def commit(root, request):
                                  'Commit outcome cannot be reconciled with the persisted intent; inspect the target manually')
             receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': intent['totalBytes'],
                        'targetIdentity': intent['tempIdentity']}
+            if record['resourceId']:
+                # Same cleanup as the regular publish path: the committed
+                # target must leave space measurement.
+                ledger.release(root, record['resourceId'])
             atomic_json(receipt_path, receipt)
             record.update(state='completed', completedAt=receipt['committedAt'])
             _save_record(root, transfer_id, record)
@@ -552,6 +593,18 @@ def commit(root, request):
             record.update(state='failed', error={'code': error.code, 'message': str(error)}, completedAt=_now())
             _save_record(root, transfer_id, record)
             raise
+        except OSError as error:
+            # Publication-stage OS failures (vanished overwrite target, a
+            # create target appearing concurrently, permission errors, ...)
+            # must leave the same failed trail instead of stranding the state
+            # in committing with a raw HELPER_ERROR on every retry.
+            record.update(state='failed',
+                          error={'code': 'FILE_CONFLICT',
+                                 'message': 'Commit publish failed before the target took effect: {}'.format(error)},
+                          completedAt=_now())
+            _save_record(root, transfer_id, record)
+            raise AgentError('FILE_CONFLICT',
+                             'Commit publish failed before the target took effect: {}'.format(error))
         if record['resourceId']:
             ledger.release(root, record['resourceId'])
         receipt = {'schemaVersion': 1, 'committedAt': _now(), 'bytes': record['totalBytes'],
@@ -566,6 +619,7 @@ def status(root, request):
     """Read-only bounded observation; starts nothing, renews nothing."""
     transfer_id = _transfer_id(request.get('transferId'))
     record = _load_record(root, transfer_id)
+    _require_session(record, request)
     return describe(record)
 
 

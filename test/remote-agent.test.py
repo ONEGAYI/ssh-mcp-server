@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 HELPER = Path(__file__).resolve().parents[1] / 'remote' / 'agent.py'
@@ -159,6 +160,19 @@ class RemoteAgentTest(unittest.TestCase):
         self.assertTrue(self.call('start', request)['ok'])
         self.assertEqual((self.root / 'counter').read_text(), 'x')
 
+    def test_atomic_json_syncs_the_parent_directory_entry(self):
+        # os.replace 之后的目录项掉电持久性需要父目录 fsync 兜底；
+        # atomic_json 必须经过该辅助（打开失败时静默跳过不影响调用）。
+        sys.path.insert(0, str(HELPER.parent))
+        import common as common_module
+        target = self.root / 'state' / 'nested' / 'state.json'
+        target.parent.mkdir(parents=True)
+        with mock.patch.object(common_module, '_sync_parent_directory',
+                               wraps=common_module._sync_parent_directory) as observed:
+            common_module.atomic_json(target, {'b': 2, 'a': 1})
+        observed.assert_called_once_with(target)
+        self.assertEqual(json.loads(target.read_text()), {'a': 1, 'b': 2})
+
     def test_protocol_v2_registers_before_executing_and_rejects_unregistered_ids(self):
         registered = self.call('task_register', {'protocol': 2, 'cwd': str(self.root),
                                                  'command': 'printf once >> v2-counter'})
@@ -181,6 +195,26 @@ class RemoteAgentTest(unittest.TestCase):
         legacy = self.call('start', {'jobId': 'legacy-fresh', 'cwd': str(self.root), 'command': 'printf x'})
         self.assertFalse(legacy['ok'])
         self.assertEqual(legacy['error']['code'], 'PROTOCOL_UPGRADE_REQUIRED')
+
+    def test_task_start_recovers_from_a_crash_between_the_two_startup_writes(self):
+        # 崩溃窗口：request.json 已写、state.json 未写。该窗口内 worker 必然
+        # 从未 spawn（state.json 写在 spawn 之前），task_start 必须补写状态并
+        # 启动 worker，而不是永远回报 prepared 让任务既不执行也不报错。
+        registered = self.call('task_register', {'protocol': 2, 'cwd': str(self.root),
+                                                 'command': 'printf once >> crash-counter'})
+        self.assertTrue(registered['ok'], registered)
+        job_id = registered['result']['jobId']
+        job = self.root / 'state' / 'jobs' / job_id
+        registration = json.loads((job / 'registration.json').read_text())
+        request = {'jobId': job_id, 'command': registration['command'], 'cwd': registration['cwd'],
+                   'env': registration['env'], 'executionTimeoutMs': registration['executionTimeoutMs'],
+                   'maxOutputBytes': registration['maxOutputBytes']}
+        (job / 'request.json').write_text(json.dumps(request))
+        started = self.call('task_start', {'protocol': 2, 'jobId': job_id})
+        self.assertTrue(started['ok'], started)
+        ended = self.wait_exit(job_id)
+        self.assertEqual(ended['exitCode'], 0)
+        self.assertEqual((self.root / 'crash-counter').read_text(), 'once')
 
     def test_protocol_handshake_blocks_activation_until_legacy_tasks_drain(self):
         # Before activation the legacy entry still works (upgrade window).

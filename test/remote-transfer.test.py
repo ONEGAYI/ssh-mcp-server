@@ -209,6 +209,30 @@ class RemoteTransferTest(unittest.TestCase):
         resource = list(ledger['resources'].values())[0]
         self.assertEqual(resource['bytes'], len(data))
 
+    def test_start_clears_its_own_crash_leftovers_before_materializing(self):
+        # start 在 register_temp + O_EXCL 创建 temp 之后、保存 transferring
+        # 之前崩溃会留下：账本残留登记 + 已存在 temp + record 仍 prepared。
+        # 重试 start 必须清掉自己（tempPath 命名唯一属本事务，prepared 态
+        # 从未接收任何块）的残留后再登记，而不是 O_EXCL 撞上旧文件裸崩。
+        data = b'crash window'
+        transfer_id = self.register(data)['result']['transferId']
+        temp = self.temp_path(transfer_id)
+        temp.write_bytes(b'')
+        stale = self.call('resource_register', {'path': str(temp), 'bytes': len(data),
+                                                'origin': 'transfer-upload'})['result']['resourceId']
+        started = self.start(transfer_id)
+        self.assertTrue(started['ok'], started)
+        self.assertEqual(started['result']['state'], 'transferring')
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(len(resources), 1)
+        self.assertNotIn(stale, resources)
+        # 清理后传输照常完成。
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
     def test_blocks_persist_verify_and_advance_the_confirmed_offset(self):
         data = bytes(range(256)) * 300  # 76800 bytes: one full chunk plus a short tail
         transfer_id = self.register(data)['result']['transferId']
@@ -366,6 +390,61 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertEqual(self.call('transfer_commit', {'transferId': second_id})['error']['code'],
                          'TRANSFER_STATE_UNKNOWN')
 
+    def test_reconciliation_success_releases_the_ledger_resource(self):
+        # 对账成功（rename 已发生、receipt 丢失）补 receipt 的路径同样要
+        # 释放账本资源：否则 totalBytes 量级的登记永久留在 resources 里，
+        # 配额永久泄漏（正常发布路径有 release，这里曾缺失）。
+        data = b'reconcile release'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        # 模拟崩溃窗口：rename 已发布、intent 已持久化、receipt 未写、
+        # state 停在 committing。
+        temp = self.temp_path(transfer_id)
+        info = temp.stat()
+        intent = {'schemaVersion': 1, 'targetPath': str(self.work / 'target.bin'),
+                  'expectedVersion': None, 'overwrite': False, 'create': False,
+                  'tempIdentity': '{}:{}'.format(info.st_dev, info.st_ino),
+                  'totalSha256': hashlib.sha256(data).hexdigest(), 'totalBytes': len(data),
+                  'plannedAt': time.time()}
+        directory = self.state / 'transfers' / transfer_id
+        (directory / 'intent.json').write_text(json.dumps(intent))
+        record = self.record(transfer_id)
+        record['state'] = 'committing'
+        (directory / 'record.json').write_text(json.dumps(record))
+        os.replace(str(temp), str(self.work / 'target.bin'))
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(len(resources), 1)
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual(committed['result']['state'], 'completed')
+        resources = json.loads((self.state / 'ledger' / 'ledger.json').read_text())['resources']
+        self.assertEqual(resources, {})
+
+    def test_commit_on_vanished_overwrite_target_records_failed(self):
+        # 发布段的 OSError（如 overwrite 目标被外部删除）必须落 failed
+        # 留痕并转成 FILE_CONFLICT，而不是裸抛 HELPER_ERROR 把 state 卡死
+        # 在 committing（重试永远 TRANSFER_STATE_UNKNOWN）。
+        target = self.work / 'vanish.bin'
+        target.write_bytes(b'original')
+        observed = self.call('file_read', {'path': 'vanish.bin', 'metadataOnly': True})['result']['version']
+        data = b'replacement'
+        transfer_id = self.register(data, target='vanish.bin', overwrite=True,
+                                    expectedVersion=observed)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        target.unlink()  # commit 前目标被外部删除
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(committed['error']['code'], 'FILE_CONFLICT')
+        record = self.record(transfer_id)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['error']['code'], 'FILE_CONFLICT')
+        # failed 留痕后重试得到明确的 INVALID_STATE，不再无限循环。
+        again = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertEqual(again['error']['code'], 'INVALID_STATE')
+
     def test_commit_is_idempotent_after_completion(self):
         data = b'idempotent'
         transfer_id, first = self.deliver(data)
@@ -414,6 +493,56 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertEqual(resumed['result']['confirmedOffset'], CHUNK)
         self.assertEqual(self.temp_path(transfer_id).stat().st_size, CHUNK)
 
+    def test_resume_after_full_confirmation_keeps_a_short_tail_intact(self):
+        # 短尾块传输（totalBytes 非 chunkSize 整除）全部确认后断线，resume
+        # 不得把可信偏移当作“满块数 × chunkSize”：那会零扩展 temp 并让
+        # verify 永远尺寸不符。
+        data = b't' * (CHUNK + 10)  # 块0：65536 字节满块；块1：10 字节短块
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data[:CHUNK])
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': self.source(len(data))})
+        self.assertTrue(resumed['ok'], resumed)
+        self.assertEqual(resumed['result']['confirmedOffset'], len(data))
+        self.assertEqual(resumed['result']['chunkCount'], 2)
+        self.assertEqual(self.temp_path(transfer_id).stat().st_size, len(data))
+        verified = self.call('transfer_verify', {'transferId': transfer_id})
+        self.assertTrue(verified['ok'], verified)
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
+    def test_resume_tolerates_a_torn_manifest_tail(self):
+        # 进程在 manifest 行追加中途被杀会留下撕裂半行：resume 必须把它
+        # 视为清单结束并回到可信边界，而不是裸抛 JSON 解析错误。
+        data = b'x' * (CHUNK + 10)
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data[:CHUNK])
+        with (self.state / 'transfers' / transfer_id / 'chunks.jsonl').open('a') as stream:
+            stream.write('{"ind')  # 崩溃留下的撕裂片段
+        resumed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                                'sourceIdentity': self.source(len(data))})
+        self.assertTrue(resumed['ok'], resumed)
+        self.assertEqual(resumed['result']['confirmedOffset'], CHUNK)
+        self.assertEqual(resumed['result']['chunkCount'], 1)
+        # 半行之后追加的块会与撕裂行粘连成不可解析的行，同样不可信：
+        # resume 回退到块0，重传即可完成。
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        healed = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                               'sourceIdentity': self.source(len(data))})
+        self.assertTrue(healed['ok'], healed)
+        self.assertEqual(healed['result']['confirmedOffset'], CHUNK)
+        self.assertEqual(len(self.chunks(transfer_id)), 1)
+        self.assertEqual(self.temp_path(transfer_id).stat().st_size, CHUNK)
+        self.block(transfer_id, 1, CHUNK, data[CHUNK:])
+        self.call('transfer_verify', {'transferId': transfer_id})
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual((self.work / 'target.bin').read_bytes(), data)
+
     def test_resume_refuses_prepared_transfers_that_never_started(self):
         transfer_id = self.register(b'never started')['result']['transferId']
         response = self.call('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
@@ -434,6 +563,30 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertTrue(sent['ok'], sent)
 
     # --- status: bounded, read-only, non-renewing ---------------------------------
+
+    def test_actions_reject_a_foreign_session(self):
+        # 会话归属不只由 receive_block 核对：start/resume/verify/commit/
+        # status（含 verify/commit 的幂等分支）都必须核对 sessionId。
+        data = b'session bound'
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        self.call('transfer_verify', {'transferId': transfer_id})
+        cases = (('transfer_start', {'protocol': 2, 'transferId': transfer_id,
+                                     'sourceIdentity': self.source(len(data))}),
+                 ('transfer_resume', {'protocol': 2, 'transferId': transfer_id,
+                                      'sourceIdentity': self.source(len(data))}),
+                 ('transfer_verify', {'transferId': transfer_id}),
+                 ('transfer_commit', {'transferId': transfer_id}),
+                 ('transfer_status', {'transferId': transfer_id}))
+        for action, request in cases:
+            response = self.call(action, request, session='session-other')
+            self.assertEqual(response['ok'], False, action)
+            self.assertEqual(response['error']['code'], 'TRANSFER_SCOPE_MISMATCH', action)
+        # 正确会话不受影响，传输照常完成。
+        committed = self.call('transfer_commit', {'transferId': transfer_id})
+        self.assertTrue(committed['ok'], committed)
+        self.assertEqual(committed['result']['state'], 'completed')
 
     def test_status_reports_bounded_state_without_renewal(self):
         data = b'status probe'
@@ -477,6 +630,21 @@ class RemoteTransferTest(unittest.TestCase):
             response = self.call(action, {'transferId': transfer_id})
             self.assertEqual(response['ok'], False)
             self.assertEqual(response['error']['code'], 'UNSUPPORTED_ACTION')
+
+    def test_verify_size_mismatch_records_failed_state(self):
+        # 尺寸不符与摘要不符同样致命：该分支也必须落 failed 留痕，
+        # 而不是让 record 停在 transferring。
+        data = b's' * 100
+        transfer_id = self.register(data)['result']['transferId']
+        self.start(transfer_id)
+        self.block(transfer_id, 0, 0, data)
+        with self.temp_path(transfer_id).open('r+b') as stream:
+            stream.truncate(150)  # 外部扩展
+        verified = self.call('transfer_verify', {'transferId': transfer_id})
+        self.assertEqual(verified['error']['code'], 'VERIFY_MISMATCH')
+        record = self.record(transfer_id)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['error']['code'], 'VERIFY_MISMATCH')
 
     def test_empty_file_transfers_with_no_blocks(self):
         transfer_id, committed = self.deliver(b'')

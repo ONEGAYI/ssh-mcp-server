@@ -81,17 +81,23 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertFalse(self.call('resource_release', {'reservationId': accepted[0]['result']['reservationId']})['ok'])
 
     def test_reservation_consumption_avoids_double_counting(self):
-        self.set_limit(1 << 20)
+        # 额度收紧到“刚好被预留占满”（state 目录自身不计量）：
+        # 引用预留的登记净增 0，必须放行，配额与返回值都不得重复叠加。
+        self.set_limit(4096)
         reservation = self.call('resource_reserve', {'bytes': 4096})['result']['reservationId']
         before = self.call('resource_usage', {})['result']
         self.assertEqual(before['reservedBytes'], 4096)
+        self.assertEqual(before['usedBytes'], before['stateBytes'] + 4096)
+        self.assertEqual(before['usedBytes'], before['limitBytes'])
         resource = self.call('resource_register', {'path': str(self.work / 'transfer.part'), 'bytes': 1500,
                                                    'origin': 'test', 'reservationId': reservation})
         self.assertTrue(resource['ok'], resource)
+        self.assertEqual(resource['result']['usedBytes'], before['usedBytes'])
         after = self.call('resource_usage', {})['result']
         self.assertEqual(after['tempBytes'], 1500)
         self.assertEqual(after['reservedBytes'], 4096 - 1500)
         self.assertEqual(after['usedBytes'], before['usedBytes'])
+        self.assertLessEqual(after['usedBytes'], after['limitBytes'])
         # A fully consumed reservation no longer exists and cannot be referenced again.
         drained = self.call('resource_register', {'path': str(self.work / 'more.part'), 'bytes': 2596,
                                                   'origin': 'test', 'reservationId': reservation})
@@ -108,6 +114,20 @@ class RemoteLedgerTest(unittest.TestCase):
         final = self.call('resource_usage', {})['result']
         self.assertEqual(final['tempBytes'], 0)
         self.assertEqual(final['usedBytes'], before['usedBytes'] - 4096)
+
+    def test_register_quota_checks_the_net_increase_over_a_partial_reservation(self):
+        # 预留只覆盖一部分时，quota 检查与返回的 usedBytes 都按净增量
+        # （超出预留的部分）核算：预留占满剩余额度后仍可兑现更大登记。
+        self.set_limit(1500)
+        reservation = self.call('resource_reserve', {'bytes': 1000})['result']['reservationId']
+        resource = self.call('resource_register', {'path': str(self.work / 'grow.part'), 'bytes': 1500,
+                                                   'origin': 'test', 'reservationId': reservation})
+        self.assertTrue(resource['ok'], resource)
+        usage = self.call('resource_usage', {})['result']
+        self.assertEqual(usage['tempBytes'], 1500)
+        self.assertEqual(usage['reservedBytes'], 0)
+        self.assertEqual(resource['result']['usedBytes'], usage['usedBytes'])
+        self.assertLessEqual(usage['usedBytes'], usage['limitBytes'])
 
     def test_invalid_ledger_requests_and_policy_are_rejected(self):
         for request in ({'bytes': 0}, {'bytes': -5}, {'bytes': 'big'}, {}):
