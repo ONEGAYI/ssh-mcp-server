@@ -117,7 +117,14 @@ def read_protocol_state(root):
 
 
 def legacy_pending_jobs(root):
-    """Legacy (v1) task directories that have not reached a terminal state."""
+    """Legacy (v1) task directories that have not reached a terminal state.
+
+    A record that only LOOKS unfinished but whose worker is already gone
+    (describe: unknown) cannot write anything anymore and must not block the
+    protocol switch forever -- it stays observable and is reclaimed by the
+    maintenance rounds once the protocol is active (issue #20). Live legacy
+    tasks still block the switch: never kill them silently, and never let
+    both protocols accept new writes at once."""
     jobs = root / 'jobs'
     pending = []
     if not jobs.exists():
@@ -133,8 +140,17 @@ def legacy_pending_jobs(root):
             finished = isinstance(state, dict) and state.get('state') in TERMINAL
         except (OSError, ValueError):
             finished = False
-        if not finished:
-            pending.append(candidate.name)
+        if finished:
+            continue
+        try:
+            # The live/dead verdict comes from the same observation the status
+            # entry uses, so a switch can never be blocked by a dead record.
+            observed = describe(root, candidate.name)
+        except AgentError:
+            observed = {}
+        if observed.get('state') == 'unknown':
+            continue
+        pending.append(candidate.name)
     return pending
 
 

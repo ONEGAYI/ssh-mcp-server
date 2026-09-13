@@ -16,10 +16,15 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', join(directory, 'workspace.json')], stderr: 'pipe' }));
     const tools = await client.listTools();
-    for (const name of ['remote_read', 'remote_edit', 'remote_write', 'remote_upload', 'remote_download', 'remote_move', 'remote_delete', 'remote_pending', 'remote_wait']) {
+    for (const name of ['remote_read', 'remote_edit', 'remote_write', 'remote_upload', 'remote_download', 'remote_pending', 'remote_wait']) {
       assert.ok(tools.tools.some(tool => tool.name === name), name);
     }
     assert.ok(!tools.tools.some(tool => tool.name === 'upload' || tool.name === 'execute_command'));
+    // Issue #20 / ADR 0007: move/delete/mkdir/rmdir retired from the tool
+    // list; directory management goes through remote shell commands instead.
+    for (const retired of ['remote_move', 'remote_delete', 'remote_mkdir', 'remote_rmdir']) {
+      assert.ok(!tools.tools.some(tool => tool.name === retired), retired + ' must no longer be advertised');
+    }
     const read = tools.tools.find(tool => tool.name === 'remote_read');
     assert.ok(read.inputSchema.properties.metadataOnly, 'remote_read exposes metadataOnly');
     assert.ok(read.inputSchema.properties.expectedVersion, 'remote_read exposes expectedVersion');

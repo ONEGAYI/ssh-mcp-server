@@ -6,7 +6,7 @@ status: accepted
 
 ## 状态
 
-2026-09-12 用户明确接受。决策已确认，尚未实施；当前四个 MCP 工具仍存在。
+2026-09-12 用户明确接受。2026-09-13 已随 [票据 #20](https://github.com/ONEGAYI/ssh-mcp-server/issues/20) 实施：四个 MCP 工具与远端 helper 动作分发已移除，专用调用路径不再存在。
 
 本决策调整 [ADR 0003](0003-file-tool-write-protection.md) 中移动与删除的专用文件工具保护范围，其他文件工具的保护规则不因此改变。
 

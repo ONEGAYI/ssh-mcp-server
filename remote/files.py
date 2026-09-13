@@ -5,6 +5,10 @@ version observation (metadata-only since issue #9, spec 4.1), content reading
 (bounded streaming windows since issue #9, spec 4.2), replacement planning
 (chunked whole-file matching since issue #10, spec 4.3), and commit (streamed
 same-directory splicing with directory fsync since issue #10).
+
+Issue #20 retired the whole-file snapshot planning path (16 MiB in-memory
+reads for delete/move) together with those tools (ADR 0007); version
+observation above is metadata-only and stays.
 """
 from contextlib import contextmanager
 import base64
@@ -23,7 +27,7 @@ import ledger
 from locks import acquire_slots
 
 
-MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_FILE_BYTES = 16 * 1024 * 1024  # inline write request budget (spec 4.3), not a file-size cap
 MAX_STREAM_CHUNK = 256 * 1024
 READ_BUDGET = 65536 - 8192
 READ_TOKEN_TTL_SECONDS = 3 * 24 * 3600
@@ -56,16 +60,6 @@ def require_regular_file(info):
         raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
 
 
-def require_snapshot_size(info):
-    """Whole-file gate for the mutation paths that still buffer full content.
-
-    Since issue #10 edit and whole-file write stream instead; the bound now
-    only guards delete/move, which keep their first-version snapshot planning.
-    """
-    if info.st_size > MAX_FILE_BYTES:
-        raise AgentError('FILE_TOO_LARGE', 'Guarded mutations currently support files up to 16 MiB')
-
-
 def content_version(info):
     """Version string binding Linux metadata alone (spec 4.1).
 
@@ -89,43 +83,10 @@ def current_version(path):
     return content_version(info)
 
 
-def verify_stable_read(before, after, data, path):
-    """Post-read stability check across the three observed stats."""
-    if len(data) > MAX_FILE_BYTES or metadata(before) != metadata(after) or metadata(after) != metadata(path.stat()):
-        raise AgentError('FILE_CONFLICT', 'File changed while reading')
-
-
 # --- Content reading ------------------------------------------------------------
 # Turns the file into delivered windows through bounded streaming buffers
 # (spec 4.2): line requests scan to their boundaries sequentially, byte
 # cursors read directly, and nothing buffers or returns the whole file.
-
-def read_whole_file(stream, expected):
-    """Read the entire file between two descriptor identity checks.
-
-    Snapshot-only helper for the mutation paths that still plan in memory.
-    """
-    if metadata(os.fstat(stream.fileno())) != metadata(expected):
-        raise AgentError('FILE_CONFLICT', 'File identity changed while reading')
-    data = stream.read(MAX_FILE_BYTES + 1)
-    return data, os.fstat(stream.fileno())
-
-
-def snapshot(path):
-    """Observe the metadata version and read the whole current content.
-
-    Couples version observation with a whole-file read under three-way stat
-    identity checks. Edit and whole-file write moved to their streaming paths
-    in issue #10; delete and move still plan through this boundary.
-    """
-    before = path.stat()
-    require_regular_file(before)
-    require_snapshot_size(before)
-    with path.open('rb') as stream:
-        data, after = read_whole_file(stream, before)
-    verify_stable_read(before, after, data, path)
-    return data, after, content_version(after)
-
 
 def read_window(stream, start, length, chunk_size=MAX_STREAM_CHUNK):
     """Read up to `length` bytes at `start` through bounded chunks."""
@@ -867,11 +828,6 @@ class FileService:
                 splice_stream(source, replacements, sink)
         return self.publish(path, info, version, origin, produce, output_size)
 
-    def full_read(self, request, path, version, size, field='readToken'):
-        token = self.token(request.get(field), path, version)
-        if not covers(token['ranges'], 0, size):
-            raise AgentError('READ_REQUIRED', 'This operation requires a complete read of the current file')
-
     def write(self, request):
         path = self.path(request.get('path'), writing=True)
         if 'readToken' in request:
@@ -952,52 +908,6 @@ class FileService:
             return {'path': str(path), 'written': True, 'created': creating, 'overwritten': overwriting,
                     'bytesWritten': len(data)}
 
-    def delete(self, request):
-        path = self.path(request.get('path'), writing=True)
-        with self.lock(path):
-            data, info, version = snapshot(path)
-            self.full_read(request, path, version, len(data))
-            replaceable(info)
-            if current_version(path) != version:
-                raise AgentError('FILE_CONFLICT', 'File changed before deletion')
-            path.unlink()
-            return {'path': str(path), 'deleted': True}
-
-    def move(self, request):
-        source = self.path(request.get('path'), writing=True)
-        target = self.path(request.get('target'), writing=True)
-        if source == target:
-            raise AgentError('INVALID_PATH', 'Source and destination must differ')
-        left, right = sorted((source, target), key=str)
-        with self.lock(left, right):
-            data, info, version = snapshot(source)
-            self.full_read(request, source, version, len(data))
-            replaceable(info)
-            if info.st_dev != target.parent.stat().st_dev:
-                raise AgentError('CROSS_DEVICE_MOVE', 'Cross-filesystem moves are not supported')
-            target_version = None
-            if target.exists():
-                if not request.get('targetReadToken'):
-                    raise AgentError('FILE_CONFLICT', 'Destination exists; read it before requesting replacement')
-                target_data, target_info, target_version = snapshot(target)
-                self.full_read(request, target, target_version, len(target_data), 'targetReadToken')
-                replaceable(target_info)
-            if current_version(source) != version:
-                raise AgentError('FILE_CONFLICT', 'Source changed before move')
-            if target_version is not None:
-                if current_version(target) != target_version:
-                    raise AgentError('FILE_CONFLICT', 'Destination changed before move')
-                os.replace(str(source), str(target))
-            else:
-                try:
-                    os.link(str(source), str(target))
-                except FileExistsError:
-                    raise AgentError('FILE_CONFLICT', 'Destination appeared before move')
-                # link+unlink never overwrites a destination. A crash between the two
-                # leaves both names, explicitly detectable as a multi-link file.
-                source.unlink()
-            return {'path': str(source), 'target': str(target), 'moved': True}
-
     def call(self, action, request):
         if action == 'file_workspace':
             if 'includeStorage' in request:
@@ -1043,24 +953,13 @@ class FileService:
         if action in ('file_list', 'file_find', 'file_search'):
             from discovery import discover
             return discover(self, action, request)
-        if action in ('file_mkdir', 'file_rmdir'):
-            path = self.path(request.get('path'), writing=True)
-            if path == self.workspace:
-                raise AgentError('PATH_NOT_ALLOWED', 'Cannot create or remove the workspace root')
-            with self.lock(path):
-                if action == 'file_mkdir':
-                    path.mkdir(mode=0o700)
-                else:
-                    path.rmdir()
-            return {'path': str(path), 'changed': True}
         if action == 'file_read':
             return self.read(request)
         if action == 'file_edit':
             return self.edit(request)
         if action == 'file_write':
             return self.write(request)
-        if action == 'file_delete':
-            return self.delete(request)
-        if action == 'file_move':
-            return self.move(request)
+        # file_delete/file_move/file_mkdir/file_rmdir were retired with their
+        # tools (issue #20, ADR 0007); directory management goes through the
+        # remote shell and falls through to UNSUPPORTED_ACTION here.
         raise AgentError('UNSUPPORTED_ACTION', 'Unknown file operation')

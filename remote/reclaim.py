@@ -249,7 +249,10 @@ def _process_job(root, name, periods, now, summary):
             first_observed = read_json(marker).get('firstObservedAt', 0)
         except (OSError, ValueError):
             return
-        if now - first_observed >= periods['unknownRecordMs']:
+        if now - first_observed >= periods['unknownRecordMs'] and _record_deletion_allowed(root, path):
+            # Legacy (v1) records wait for protocol activation like terminal
+            # ones (issue #20): removing one earlier would let its replayed
+            # request rerun through the still-open legacy creation window.
             _remove_tree(path)
             summary['removedJobs'].append(name)
 
