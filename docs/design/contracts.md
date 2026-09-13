@@ -24,11 +24,25 @@
 - `directoryScope` 不参与 identity 计算；切换模式不得使旧任务或已签发凭据的归属键失效。unrestricted 绑定仍需存在的 remoteRoot 作为默认执行目录，不引入 `~` 记号。
 - setup 服务可用 `--config-file` 预存 SSH 连接库；缺项响应只暴露连接名列表，永不回传凭据。单次调用出现任一显式 SSH 字段即整体改用显式信息，不做字段级合并。
 
-### 已有绑定二次配置（2026-09-13 已确认，尚未实施）
+### 已有绑定二次配置（2026-09-13 扩展契约）
 
-更新前读取已有绑定配置，只修改用户指定字段，保留其余字段及认证信息；保存时检查并发配置冲突，结果明确说明生效方式。额度、保留期限等普通策略允许通过该入口调整。更换服务器或状态目录本轮通过新建绑定处理，保留旧绑定完成旧任务并清理旧状态，不做自动迁移，不能直接覆盖旧配置令记录失联。
+remote_setup 增加可选 action 字段：缺省或 configure 保持首次配置语义不变（缺项询问、重复相同配置幂等、内容不同仍返回 SETUP_CONFLICT）。首次配置也可随调用提供初始 policy 覆盖。
 
-普通策略参数（额度、保留期限、搜索选项等）保存后无需重启，在下一次操作或维护周期读取新值，不打断已经执行中的任务或传输。保留期限变更不追溯已有记录：已有记录保持原定到期时间，新生成的记录使用新期限。其他字段的重载边界留待规格确定，详见 [ADR 0011](../adr/0011-binding-reconfiguration.md)。当前 remote_setup 遇到不同 profile 内容仍会报冲突，不应将重复相同配置表述为已有增量更新能力。
+action='inspect' 定位绑定（localRoot + 可选 bindingName），返回：脱敏 config（生效值，缺省字段以默认值呈现，含解析后的 policy）、authentication（凭据所在文件与连接名，只说明来源，不读取、不回显密码/私钥内容）、revision（profile 文本内容的 SHA-256）、updatable 与 identityLocked 字段清单。绑定不存在返回 SETUP_PROFILE_NOT_FOUND；inspect 不发起 SSH 连接。
+
+action='update' 必须携带 inspect 返回的 revision（乐观并发）：缺 revision 返回 SETUP_REVISION_REQUIRED；revision 过期或保存时文件已变化返回 SETUP_CONFLICT，不产生半写（沿用 writeAtomic 原子写，失败不遗留临时文件）。update 只修改显式提供的字段：
+
+- policy：组内深合并，只写提到的叶子；未提及的叶子与组原样保留，空结果不落键。
+- directoryScope：可原位更新（不参与 identity，任务归属不变）；restricted 规范化为缺省（不落键）。
+- pythonPath：可更新，须为绝对 POSIX 路径。
+
+身份与认证字段在 update 中显式出现即拒绝（SETUP_IDENTITY_LOCKED，指引用新 bindingName 新建绑定、保留旧绑定跟进清理）：sshConfigFile、connectionName、host、port、username、privateKey、sshAgent、remoteRoot、remoteStateDir、localStateDir、workspaceId。update 不读取、不回显、不重写认证文件（预存库或生成的 .ssh-mcp-connection.json）。校验失败（SETUP_INVALID_POLICY / SETUP_INVALID_SCOPE / SETUP_INVALID_PATH）在写入前拒绝，profile 保持原样。
+
+policy 配置节 schema 与规格默认值：limits（本机/远端每工作区各 10737418240 字节）、retention（确认任务日志 3 天；确认结果、未确认结果、unknown 记录各 30 天；中断传输临时数据 3 天；readToken 3 天）、search（respectGitignore=false、includeHidden=true、扫描预算 536870912 字节、时间预算 10000 ms、每页 65536 字节）、maintenance（间隔 3600000 ms、每轮 100 项、时间预算 2000 ms）。profile 中未写的叶子按默认值生效，不物化进文件。
+
+生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留、清理、搜索预算等策略执行方分别由后续票据 #8/#16/#19 接入；接入前 policy 仅完成存储、校验与重读，不得表述为已强制执行。
+
+其余边界沿用 [ADR 0011](../adr/0011-binding-reconfiguration.md)：更换服务器或状态目录通过新建绑定处理，不做自动迁移。
 
 ## 文件接口
 

@@ -63,6 +63,33 @@ setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，�
 
 已知边界：无边界绑定的搜索从 `/` 等挂载点根开始时，`/proc`、`/sys` 下的伪文件（如 environ、cmdline）同样会被扫描命中——这与文件工具可直读任意路径的 unrestricted 语义一致；如不希望搜索噪声，把搜索路径收窄到具体目录。手工运行 `build/cli/recovery.js` 不带 `--workspace` 时只向上寻找旧无名 profile，命名绑定依赖 setup 登记的显式钩子参数。新版生成的 profile 含 `bindingName`/`directoryScope` 字段，旧版本程序回退后不识别（解析报错）；回退需删除对应 profile 并重新 setup。
 
+### 调整已有绑定（inspect / update）
+
+已有绑定无需重新填写 SSH 信息即可调整策略参数。对 Agent 说明：
+
+> 请用 remote_setup 的 action=inspect 查看这个项目的绑定配置和 revision，然后按我要调整的字段执行 action=update。
+
+- `action: "inspect"`（提供 `localRoot`，多绑定时加 `bindingName`）返回脱敏配置、生效策略（含默认值）、凭据来源说明和 `revision`。凭据永不回显，inspect 不连接 SSH。
+- `action: "update"` 必须带上 inspect 返回的 `revision`：只改显式提供的字段，其余原样保留；revision 过期或配置已被并发修改会返回 SETUP_CONFLICT，重新 inspect 后再试。
+- 可更新字段：`policy`（组内深合并，见下表）、`directoryScope`、`pythonPath`。首次配置时也可以直接随调用提供 `policy`。
+- 服务器连接、认证、remoteRoot、remoteStateDir、localStateDir、workspaceId 属身份字段，update 显式修改即拒绝（SETUP_IDENTITY_LOCKED）：换目标请用新 `bindingName` 新建绑定，旧绑定保留到任务和状态清理完成。
+
+policy 组与默认值（未写的字段按默认生效）：
+
+| 组 | 字段 | 默认值 |
+|---|---|---|
+| limits | localWorkspaceBytes / remoteWorkspaceBytes | 各 10737418240（10 GiB，两端每工作区） |
+| retention | confirmedTaskLogMs | 259200000（3 天，自 ack 起） |
+| retention | confirmedResultMs / unconfirmedResultMs / unknownRecordMs | 各 2592000000（30 天） |
+| retention | interruptedTransferDataMs / readTokenMs | 各 259200000（3 天） |
+| search | respectGitignore / includeHidden | false / true（.git 内部始终排除） |
+| search | scanBudgetBytes / timeBudgetMs / pageSizeBytes | 536870912 / 10000 / 65536 |
+| maintenance | intervalMs / maxItemsPerRun / timeBudgetMs | 3600000 / 100 / 2000 |
+
+生效时点：策略保存后由消费方在下一次操作或维护周期读取新值，无需重启；运行中的操作沿用启动时快照。保留期限变更只影响新生成记录，已有记录的到期时间不变。`directoryScope` 与 `pythonPath` 在工作区 MCP 服务下次启动时生效。额度预留、到期清理、搜索预算的强制执行分别由后续票据接入；当前版本完成存储、校验与按次重读，尚不据此拒绝操作。
+
+手工编辑 profile 中的 policy 节同样受 schema 校验：未知字段、非正整数或布尔类型错误会让配置加载失败并明确报出字段位置。
+
 ### 手工入口（保留兼容）
 
 在本机为一个远端项目建立专用目录，例如 `D:\RemoteWork\example`。该目录保存接入配置和本机输出，Linux 源码不会自动同步到这里。
