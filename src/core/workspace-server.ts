@@ -5,6 +5,7 @@ import { createWorkspaceRuntime } from "../services/workspace-runtime.js";
 import { FileService } from "../services/file-service.js";
 import { TransferService } from "../services/transfer-service.js";
 import { MaintenanceService } from "../services/maintenance.js";
+import { buildStorageReport } from "../services/storage-report.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
@@ -37,7 +38,12 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       }
     });
   };
-  register("remote_workspace", "Inspect remote workspace capabilities, directory scope, and rule-file locations. Read rules using remote_read before development.", { sessionId }, async input => files.call("file_workspace", input.sessionId));
+  register("remote_workspace", "Inspect remote workspace capabilities, directory scope, and rule-file locations. Read rules using remote_read before development. Pass includeStorage=true to get, instead of the capabilities, a bounded (< 4 KiB) space summary of both ends: usedBytes/reservedBytes/limitBytes, category usage (state + registered temps incl. sibling files next to targets), resource counts, and the last maintenance round's time and counters. An unreachable remote end reports status=unknown instead of numbers; maintenance never involves the model.",
+    { sessionId, includeStorage: z.boolean().optional().describe("Opt in to the bounded two-end storage summary; defaults to false with zero extra work") },
+    async input => {
+      if (input.includeStorage) return buildStorageReport(runtime.config, files, input.sessionId);
+      return files.call("file_workspace", input.sessionId);
+    });
   register("remote_read", "Read UTF-8 text by lines or byte cursor, or base64 binary, streamed from any file size; text delivery stays within ~56 KiB. Line reads return lineStart/lineEnd/lineEndComplete and overlong lines chunk with nextOffset continuation. Only returned ranges authorize later modifications. metadataOnly=true returns just the observed version (or exists=false) without content and without granting read coverage, for overwrite prechecks.",
     { sessionId, path, fromLine: z.number().int().positive().optional(), toLine: z.number().int().positive().optional(), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().min(1).max(1048576).optional(), encoding: z.enum(["utf8", "base64"]).optional(), metadataOnly: z.boolean().optional(), expectedVersion: z.string().optional().describe("Version the cursor was issued under; refuse with FILE_CONFLICT if the file changed since") },
     input => files.call("file_read", input.sessionId, input));

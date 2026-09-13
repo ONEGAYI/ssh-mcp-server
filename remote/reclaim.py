@@ -21,7 +21,9 @@ Every round is bounded by an item budget and a wall-clock budget, persists
 a cursor after each considered entry, and holds the workspace maintenance
 flock so two processes never reclaim the same workspace concurrently.
 Query actions trigger a throttled lazy attempt (lazy_attempt) on top of the
-hourly online maintenance driven by the local end. Ledger entries left
+hourly online maintenance driven by the local end. Each round persists its
+counters (lastSummary, #19) so last_round_summary can feed the on-demand
+storage report without re-walking anything. Ledger entries left
 pointing at orphaned temps by older crashes are #17's verified-reclamation
 domain; this module only releases what a per-transfer lock proves stopped.
 Python 3.6 standard library only.
@@ -61,6 +63,12 @@ def _now():
     return float(clock) if clock is not None else time.time()
 
 
+def _empty_maintenance_state():
+    return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
+            'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0,
+            'lastSummary': None}
+
+
 def _maintenance_state_path(root):
     return Path(root) / 'maintenance.json'
 
@@ -68,23 +76,16 @@ def _maintenance_state_path(root):
 def _load_maintenance_state(root):
     path = _maintenance_state_path(root)
     if not path.is_file():
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
+        return _empty_maintenance_state()
     try:
         state = read_json(path)
     except (OSError, ValueError):
         # A corrupt bookkeeping file must never block reclamation.
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
+        return _empty_maintenance_state()
     if not isinstance(state, dict):
-        return {'schemaVersion': 1, 'lastRunAt': 0, 'lastCompletedAt': 0,
-                'jobsCursor': None, 'transfersCursor': None, 'lastLazyAt': 0}
-    state.setdefault('schemaVersion', 1)
-    state.setdefault('lastRunAt', 0)
-    state.setdefault('lastCompletedAt', 0)
-    state.setdefault('jobsCursor', None)
-    state.setdefault('transfersCursor', None)
-    state.setdefault('lastLazyAt', 0)
+        return _empty_maintenance_state()
+    for key, value in _empty_maintenance_state().items():
+        state.setdefault(key, value)
     return state
 
 
@@ -404,6 +405,13 @@ def _run_round(root, request):
     state['lastRunAt'] = now
     if not exhausted:
         state['lastCompletedAt'] = now
+    # The persisted round summary keeps counters only (#19): the in-memory
+    # summary's per-item name lists must never grow the state file.
+    state['lastSummary'] = {'removedJobs': len(summary['removedJobs']),
+                            'purgedLogs': len(summary['purgedLogs']),
+                            'markedUnknown': len(summary['markedUnknown']),
+                            'removedTransfers': len(summary['removedTransfers']),
+                            'itemsConsidered': items}
     _save_maintenance_state(root, state)
     return summary
 
@@ -416,6 +424,26 @@ def run_maintenance(root, request):
         if not held:
             return {'skipped': 'busy', 'reason': 'Another process is maintaining this workspace'}
         return _run_round(root, request)
+
+
+def last_round_summary(root):
+    """Bounded view of the last reclamation round for the space report (#19).
+
+    Times and counters come straight from the persisted maintenance state;
+    a workspace that never ran a round reports zeros, never a guess. The
+    counters describe the LAST round only -- a round stopped by a budget
+    resumes in the next one, so totals across rounds are not implied.
+    """
+    state = _load_maintenance_state(root)
+    summary = state.get('lastSummary')
+    if not isinstance(summary, dict):
+        summary = {}
+    view = {'lastCompletedAt': state.get('lastCompletedAt', 0),
+            'lastRunAt': state.get('lastRunAt', 0)}
+    for key in ('removedJobs', 'purgedLogs', 'markedUnknown', 'removedTransfers', 'itemsConsidered'):
+        value = summary.get(key, 0)
+        view[key] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return view
 
 
 def lazy_attempt(root):

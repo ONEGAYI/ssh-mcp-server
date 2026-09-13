@@ -1000,6 +1000,25 @@ class FileService:
 
     def call(self, action, request):
         if action == 'file_workspace':
+            if 'includeStorage' in request:
+                # Issue #19: the opt-in, bounded space summary replaces the
+                # capability reply. It reuses the ledger's accounting (never a
+                # full-disk du: one bounded state-directory walk plus the
+                # registered resources) and the persisted maintenance counters.
+                flag = request.get('includeStorage')
+                if not isinstance(flag, bool):
+                    raise AgentError('INVALID_REQUEST', 'includeStorage must be a boolean')
+                if flag:
+                    import ledger as ledger_module
+                    import reclaim as reclaim_module
+                    usage = ledger_module.usage(self.root)
+                    return {'storage': {
+                        'stateBytes': usage['stateBytes'], 'tempBytes': usage['tempBytes'],
+                        'reservedBytes': usage['reservedBytes'], 'usedBytes': usage['usedBytes'],
+                        'limitBytes': usage['limitBytes'],
+                        'resourceCount': usage['resourceCount'],
+                        'reservationCount': usage['reservationCount'],
+                        'maintenance': reclaim_module.last_round_summary(self.root)}}
             import platform
             import shutil
             from discovery import search_capabilities, DEFAULT_SCAN_BUDGET_BYTES, DEFAULT_SCAN_BUDGET_SECONDS
