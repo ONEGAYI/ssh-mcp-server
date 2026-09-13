@@ -1,15 +1,23 @@
-import { link, lstat, open, realpath, rename, unlink } from "node:fs/promises";
+import { FileHandle, link, lstat, open, realpath, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WorkspaceConfig } from "../config/workspace.js";
 import { RemoteAgentClient, RemoteAgentError } from "./remote-agent-client.js";
+import { SpaceLedger, workspaceLedgerDirectory } from "./space-ledger.js";
 
 interface ReadResult {
   data: string; version: string; nextOffset: number | null; readToken: string; size: number;
 }
 
 export class FileService {
-  constructor(private readonly remote: Pick<RemoteAgentClient, "call">, private readonly config: WorkspaceConfig) {}
+  private readonly ledger: SpaceLedger;
+
+  constructor(private readonly remote: Pick<RemoteAgentClient, "call">, private readonly config: WorkspaceConfig) {
+    // Issue #8: one local space ledger per workspace. Since #18 the limit comes
+    // from the resolved unified policy (limits.localWorkspaceBytes, default 10 GiB).
+    this.ledger = new SpaceLedger(workspaceLedgerDirectory(config.localStateDir, config.identity),
+      config.policy.limits.localWorkspaceBytes);
+  }
 
   call(action: string, sessionId: string, request: Record<string, unknown> = {}) {
     if (!sessionId || sessionId.length > 256 || sessionId.includes("\0")) throw new RemoteAgentError("INVALID_SESSION", "Use the actual session identifier supplied by the recovery hook");
@@ -65,8 +73,11 @@ export class FileService {
   async download(sessionId: string, request: { localPath: string; path: string; overwrite?: boolean }) {
     const path = await this.localPath(request.localPath, true);
     const temporary = join(dirname(path), `.ssh-mcp-download-${randomUUID()}`);
-    const handle = await open(temporary, "wx", 0o600);
     let offset = 0, version: string | undefined;
+    // Issue #8: the temp file is registered (and quota-checked) before it can
+    // exist on disk; a crash therefore never leaves an untracked temp behind.
+    let resourceId: string | undefined;
+    let handle: FileHandle | undefined;
     try {
       for (;;) {
         const result = await this.call("file_read", sessionId, { path: request.path, encoding: "base64", offset, maxBytes: 262144, grantRead: false }) as unknown as ReadResult;
@@ -74,13 +85,25 @@ export class FileService {
         version = result.version;
         const data = Buffer.from(result.data, "base64");
         if (offset + data.length > 16 * 1024 * 1024) throw new RemoteAgentError("FILE_TOO_LARGE", "Download exceeds 16 MiB");
-        await handle.writeFile(data);
+        if (resourceId === undefined) {
+          resourceId = (await this.ledger.register(temporary, result.size, "local-download")).resourceId;
+          handle = await open(temporary, "wx", 0o600);
+        }
+        try { if (handle) await handle.writeFile(data); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
+            throw new RemoteAgentError("STORAGE_FULL", "Local filesystem reported ENOSPC while downloading");
+          }
+          throw error;
+        }
         offset += data.length;
         if (result.nextOffset === null) break;
         if (result.nextOffset !== offset || !data.length) throw new RemoteAgentError("INVALID_HELPER_RESPONSE", "Invalid download cursor");
       }
+      if (!handle) throw new RemoteAgentError("INVALID_HELPER_RESPONSE", "Download delivered no chunks");
       await handle.sync();
       await handle.close();
+      handle = undefined;
       if (await this.localPath(request.localPath, true) !== path) throw new RemoteAgentError("FILE_CONFLICT", "Local destination changed");
       if (request.overwrite) await rename(temporary, path);
       else {
@@ -92,8 +115,9 @@ export class FileService {
       }
       return { localPath: path, remotePath: request.path, bytesWritten: offset, version };
     } finally {
-      await handle.close();
+      if (handle) await handle.close().catch(() => undefined);
       await unlink(temporary).catch(error => { if (error.code !== "ENOENT") throw error; });
+      if (resourceId !== undefined) await this.ledger.release(resourceId).catch(() => undefined);
     }
   }
 }

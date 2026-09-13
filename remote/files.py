@@ -7,17 +7,18 @@ version observation (metadata-only since issue #9, spec 4.1), content reading
 """
 from contextlib import contextmanager
 import base64
-import fcntl
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
-import tempfile
 import time
 import uuid
 from common import AgentError, atomic_json, read_json
+import ledger
+from locks import acquire_slots
 
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -377,15 +378,17 @@ def compose_content(request, old):
 # Materializes and atomically publishes new content. Today one buffered write;
 # #10 swaps it for streamed splicing into the same flow.
 
-def write_temporary(directory, data, info):
-    """Materialize content through a same-directory temp file.
+def write_temporary(path, data, info):
+    """Materialize content at a pre-registered same-directory temp path.
 
-    Preserves group and mode, fsyncs, and reports the written identity.
-    Removes the temp file on failure; publication stays with commit.
+    The caller registers the exact path in the resource ledger before calling
+    (issue #8), so a crash can never leave an untracked temp file behind. This
+    creates the file exclusively, preserves group and mode, fsyncs, and
+    reports the written identity; publication stays with commit.
     """
-    fd, temporary = tempfile.mkstemp(prefix='.ssh-mcp-', dir=str(directory))
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(fd, 'wb') as stream:
+        with os.fdopen(descriptor, 'wb') as stream:
             stream.write(data)
             if info is not None:
                 os.fchown(stream.fileno(), -1, info.st_gid)
@@ -394,10 +397,10 @@ def write_temporary(directory, data, info):
             os.fsync(stream.fileno())
             written_info = os.fstat(stream.fileno())
     except BaseException:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if os.path.exists(str(path)):
+            os.unlink(str(path))
         raise
-    return temporary, written_info
+    return written_info
 
 
 def verify_committed_image(observed, observed_info, updated, written_info):
@@ -443,12 +446,10 @@ class FileService:
         return resolved
 
     @contextmanager
-    def lock(self, path):
-        locks = self.root / 'file-locks'
-        locks.mkdir(mode=0o700, exist_ok=True)
-        key = hashlib.sha256(str(path).encode('utf8')).hexdigest()
-        with (locks / key).open('a') as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+    def lock(self, *paths):
+        """Guard targets through fixed lock slots, deduplicated and acquired
+        in one global order (issue #8); slot files are never deleted."""
+        with acquire_slots(self.root, [str(path) for path in paths]):
             yield
 
     def token(self, value, path, version):
@@ -635,7 +636,7 @@ class FileService:
             text = decode_edit_text(data)
             replacements, byte_edits = locate_replacements(text, data, request.get('edits'), token['ranges'])
             updated = apply_replacements(data, text, replacements)
-            written_info = self.commit(path, updated, info, version)
+            written_info = self.commit(path, updated, info, version, origin='file-edit')
             result = {'path': str(path), 'written': True, 'bytesWritten': len(updated), 'editsApplied': len(replacements)}
             return self.renew_after_edit(path, token, byte_edits, updated, written_info, result)
 
@@ -657,29 +658,40 @@ class FileService:
                           message='Edit committed, but read-token renewal could not be confirmed. Read the current file before further editing.')
         return result
 
-    def commit(self, path, data, info=None, version=None):
+    def commit(self, path, data, info=None, version=None, origin='file'):
         """Atomically install data at path through a same-directory temp file.
 
-        Owns the output size gate, the pre-replace version re-check and
-        replace-versus-link publication.
+        Owns the output size gate, the workspace quota gate, the pre-replace
+        version re-check and replace-versus-link publication. The temp file is
+        registered in the resource ledger (and quota-checked) before it can
+        exist; a successful publication releases the registration so the
+        committed target leaves the space measurement (issue #8).
         """
         if len(data) > MAX_FILE_BYTES:
             raise AgentError('FILE_TOO_LARGE', 'Content exceeds 16 MiB')
-        temporary, written_info = write_temporary(path.parent, data, info)
+        temporary = path.parent / ('.ssh-mcp-' + uuid.uuid4().hex)
+        resource_id = ledger.register_temp(self.root, str(temporary), len(data), self.session, origin)
         try:
+            written_info = write_temporary(temporary, data, info)
+            ledger.attach_identity(self.root, resource_id, '{}:{}'.format(written_info.st_dev, written_info.st_ino))
             self.path(str(path), writing=True)
             if version is not None:
                 if current_version(path) != version:
                     raise AgentError('FILE_CONFLICT', 'File changed before committing the write')
-                os.replace(temporary, str(path))
+                os.replace(str(temporary), str(path))
             else:
                 try:
-                    os.link(temporary, str(path))
+                    os.link(str(temporary), str(path))
                 except FileExistsError:
                     raise AgentError('FILE_CONFLICT', 'Creation target already exists')
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                raise AgentError('STORAGE_FULL', 'Remote filesystem reported ENOSPC while committing the write')
+            raise
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            if os.path.exists(str(temporary)):
+                os.unlink(str(temporary))
+            ledger.release(self.root, resource_id)
         return written_info
 
     def full_read(self, request, path, version, size, field='readToken'):
@@ -702,7 +714,7 @@ class FileService:
                 self.full_read(request, path, version, len(old))
                 replaceable(info)
             data = compose_content(request, old)
-            self.commit(path, data, info, version)
+            self.commit(path, data, info, version, origin='file-write')
             return {'path': str(path), 'written': True, 'created': creating, 'bytesWritten': len(data)}
 
     def delete(self, request):
@@ -722,7 +734,7 @@ class FileService:
         if source == target:
             raise AgentError('INVALID_PATH', 'Source and destination must differ')
         left, right = sorted((source, target), key=str)
-        with self.lock(left), self.lock(right):
+        with self.lock(left, right):
             data, info, version = snapshot(source)
             self.full_read(request, source, version, len(data))
             replaceable(info)

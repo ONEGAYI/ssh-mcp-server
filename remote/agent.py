@@ -459,6 +459,9 @@ def main():
         result = acknowledge(root, request)
     elif args.action == 'cleanup':
         result = cleanup(root, request)
+    elif args.action.startswith('resource_'):
+        from ledger import resource_action
+        result = resource_action(root, args.action, request)
     elif args.action.startswith('file_'):
         from files import FileService
         result = FileService(root, request.get('workspaceRoot'), request.get('sessionId'),

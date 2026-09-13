@@ -25,6 +25,7 @@ export const profileSchema = z.object({
   localRoot: z.string().min(1).optional(),
   pythonPath: remotePath.default("/usr/bin/python3"),
   // Absent leaves keep spec defaults; consumers resolve per operation via loadPolicy.
+  // Ticket #8's quota reads limits.localWorkspaceBytes from this resolved policy.
   policy: policySectionSchema.optional(),
 }).strict();
 
