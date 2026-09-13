@@ -604,11 +604,17 @@ class FileService:
         index_path = self.read_index(path)
         key, previous = None, []
         if index_path.exists():
-            candidate = read_json(index_path)['readToken']
-            old = read_json(self.reads / (candidate + '.json'))
-            if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
-                    and _now() <= old.get('expiresAt', 0)):
-                key, previous = candidate, old['ranges']
+            # A dangling or corrupt index must not kill the read (contrast
+            # token(), which refuses unknown credentials): issue a fresh
+            # credential from this window alone, like a first read.
+            try:
+                candidate = read_json(index_path)['readToken']
+                old = read_json(self.reads / (candidate + '.json'))
+                if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
+                        and _now() <= old.get('expiresAt', 0)):
+                    key, previous = candidate, old['ranges']
+            except (OSError, ValueError):
+                key, previous = None, []
         ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
         return self.save_read(path, version, size, ranges, key)
 

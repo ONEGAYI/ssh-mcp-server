@@ -334,6 +334,29 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertIsNone(result['readToken'])
         self.assertEqual((self.work / 'record-failure').read_text(), 'after')
 
+    def test_grant_read_survives_missing_stale_credential_records(self):
+        # index-*.json 存在但指向的 token 文件被删/损坏：签发新凭据继续
+        # 服务（对比 token() 同场景防护并报 READ_REQUIRED），而不是
+        # read_json 裸抛 OSError 让整个读取 HELPER_ERROR。
+        path = self.work / 'stale-index.txt'
+        path.write_text('first\nsecond\n')
+        first = self.call('file_read', {'path': 'stale-index.txt', 'fromLine': 1, 'toLine': 1})['result']
+        reads = self.root / 'state' / 'reads'
+        token_files = [item for item in reads.iterdir() if not item.name.startswith('index-')]
+        self.assertEqual(len(token_files), 1)
+        token_files[0].unlink()  # index 现在指向缺失文件
+        second = self.call('file_read', {'path': 'stale-index.txt', 'fromLine': 2, 'toLine': 2})
+        self.assertTrue(second['ok'], second)
+        self.assertNotEqual(second['result']['readToken'], first['readToken'])
+        # 新凭据只覆盖第二行：第一行回到未读状态，第二行可直接编辑。
+        denied = self.call('file_edit', {'path': 'stale-index.txt', 'readToken': second['result']['readToken'],
+                                         'edits': [{'oldText': 'first', 'newText': 'unread'}]})
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+        allowed = self.call('file_edit', {'path': 'stale-index.txt', 'readToken': second['result']['readToken'],
+                                          'edits': [{'oldText': 'second', 'newText': 'edited'}]})
+        self.assertTrue(allowed['ok'], allowed)
+        self.assertEqual(path.read_text(), 'first\nedited\n')
+
     def test_size_gate_rejects_directories_but_streams_oversized_reads_and_edits(self):
         directory = self.call('file_read', {'path': '.'})
         self.assertEqual(directory['error']['code'], 'UNSUPPORTED_FILE')
