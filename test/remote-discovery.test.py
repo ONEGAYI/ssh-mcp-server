@@ -646,6 +646,38 @@ class RemoteDiscoveryTest(unittest.TestCase):
         self.assertEqual(result['reason'], 'SCAN_TIME_LIMIT')
         self.assertIsNotNone(result['nextCursor'])
 
+    def test_find_rg_enumeration_time_budget_returns_partial_not_helper_error(self):
+        # rg --files enumeration is eager: its BudgetStop must surface as a
+        # normal time-budget partial page (empty entries, resumable cursor),
+        # never escape to the agent fallback as HELPER_ERROR.
+        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        saved_which = discovery.shutil.which
+        saved_list = discovery.rg_list
+        discovery.shutil.which = lambda name: '/usr/bin/rg' if name == 'rg' else saved_which(name)
+
+        def exhausted(*args, **kwargs):
+            raise discovery.BudgetStop('time')
+        try:
+            discovery.rg_list = exhausted
+            result = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*'})
+        finally:
+            discovery.shutil.which = saved_which
+            discovery.rg_list = saved_list
+        self.assertEqual(result['entries'], [])
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['reason'], 'SCAN_TIME_LIMIT')
+        self.assertEqual(result['engine'], 'ripgrep-files')
+        self.assertIsNotNone(result['nextCursor'])
+        cursor = json.loads(base64.b64decode(result['nextCursor']).decode('utf8'))
+        self.assertEqual(cursor['v'], 2)
+        # 首页的游标保持 after=None：重启枚举而不是声称完成。
+        self.assertIsNone(cursor['after'])
+
     def test_find_cursor_rejects_changed_query(self):
         self.write('a.txt', 'a\n')
         self.write('b.txt', 'b\n')

@@ -1034,14 +1034,24 @@ def file_find(service, root, request):
         try:
             files = filter_rg_lines(root, rg_list(rg_binary, root, budget),
                                     include_hidden, respect_gitignore)
-            skeleton = stream_paths(root, include_hidden, respect_gitignore,
-                                    skip_files=True, budget=budget)
-            stream = dedupe_merge(files, skeleton)
-            engine = 'ripgrep-files'
+        except BudgetStop:
+            # rg --files enumeration is eager and shares the page's time
+            # budget: exhausting it before any candidate was considered is a
+            # normal budget stop (empty partial page, cursor unchanged from
+            # the request), not a helper error. It must not reach the
+            # BackendFailure fallback either -- a timeout is not a crash.
+            return {'entries': [], 'nextCursor': encode_cursor({'v': 2, 'q': query, 'after': after}),
+                    'truncated': True, 'totalEntries': None, 'engine': 'ripgrep-files',
+                    'reason': 'SCAN_TIME_LIMIT'}
         except (BackendFailure, OSError):
             # A crashed or unspawnable rg must not look like an empty tree:
             # fall back to the plain Python walk for this page.
             stream = None
+        else:
+            skeleton = stream_paths(root, include_hidden, respect_gitignore,
+                                    skip_files=True, budget=budget)
+            stream = dedupe_merge(files, skeleton)
+            engine = 'ripgrep-files'
     if stream is None:
         stream = stream_paths(root, include_hidden, respect_gitignore, budget=budget)
 
