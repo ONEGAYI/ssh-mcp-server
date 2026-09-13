@@ -912,6 +912,8 @@ class FileService:
                     stream = path.open('rb')
                 except FileNotFoundError:
                     raise AgentError('FILE_CONFLICT', 'Overwrite target does not exist; keep overwrite bound to an existing observed version or create instead')
+                except IsADirectoryError:
+                    raise AgentError('UNSUPPORTED_FILE', 'Only regular files are supported')
                 with stream:
                     info = os.fstat(stream.fileno())
                     require_regular_file(info)

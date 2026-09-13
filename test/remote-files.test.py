@@ -408,6 +408,17 @@ class RemoteFilesTest(unittest.TestCase):
             self.assertIn('remote_upload', str(refused.exception))
             self.assertFalse((self.work / request['path']).exists())
 
+    def test_overwrite_target_became_a_directory_reports_unsupported_file(self):
+        # 目标在观察与写入之间变成目录时，IsADirectoryError 归一为
+        # UNSUPPORTED_FILE（与 read/observe 一致），而非 HELPER_ERROR。
+        # 直调 write handler 绕过 metadataOnly 观察侧对目录的拦截。
+        files = self.helper_module()
+        service = self.service()
+        with self.assertRaises(files.AgentError) as caught:
+            service.write({'path': '.', 'text': 'x', 'overwrite': True, 'expectedVersion': 'm1-anything'})
+        self.assertEqual(caught.exception.code, 'UNSUPPORTED_FILE')
+        self.assertEqual(str(caught.exception), 'Only regular files are supported')
+
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
         import files
