@@ -1100,6 +1100,15 @@ def file_find(service, root, request):
         else:
             exhausted = True
     except BudgetStop as stop:
+        # A continuation page that spent its whole budget skipping already
+        # returned candidates would hand back the request cursor unchanged:
+        # every retry re-enumerates and times out the same way, so the query
+        # could never finish. Fail explicitly instead. First pages (no
+        # cursor) keep the plain partial semantics.
+        if last == after and after is not None:
+            raise AgentError('SCAN_TIME_LIMIT',
+                             'Time budget exhausted before advancing past already returned '
+                             'entries; narrow the search directory')
         reason = {'bytes': 'SCAN_BYTE_LIMIT', 'time': 'SCAN_TIME_LIMIT'}[stop.reason]
     # A stop always leaves a continuable cursor: `after` anchors the resume
     # point (None restarts the enumeration, e.g. a time stop before any

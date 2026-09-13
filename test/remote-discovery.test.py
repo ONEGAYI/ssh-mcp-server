@@ -678,6 +678,43 @@ class RemoteDiscoveryTest(unittest.TestCase):
         # 首页的游标保持 after=None：重启枚举而不是声称完成。
         self.assertIsNone(cursor['after'])
 
+    def test_find_second_page_zero_advance_raises_instead_of_repeating_cursor(self):
+        # 续页把整个时间预算耗在跳过已返回候选上时，返回同游标的
+        # partial 会让每页重新全量枚举又同样超时，查询永久不可完成：
+        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。
+        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from common import AgentError
+        from files import FileService
+        self.write('a.txt', 'a\n')
+        self.write('b.txt', 'b\n')
+        self.write('c.txt', 'c\n')
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        saved_which = discovery.shutil.which
+        discovery.shutil.which = lambda name: None  # 确定性走 python-walk
+        try:
+            first = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*', 'limit': 1})
+            self.assertTrue(first['truncated'])
+            cursor = first['nextCursor']
+            original = discovery.time.monotonic
+            ticks = [0]
+
+            def fast_clock():
+                ticks[0] += 10.0
+                return ticks[0]
+            try:
+                discovery.time.monotonic = fast_clock
+                with self.assertRaises(AgentError) as caught:
+                    discovery.discover(service, 'file_find',
+                                       {'path': '.', 'pattern': '*', 'limit': 1, 'cursor': cursor})
+            finally:
+                discovery.time.monotonic = original
+        finally:
+            discovery.shutil.which = saved_which
+        self.assertEqual(caught.exception.code, 'SCAN_TIME_LIMIT')
+        self.assertIn('narrow the search directory', str(caught.exception))
+
     def test_find_cursor_rejects_changed_query(self):
         self.write('a.txt', 'a\n')
         self.write('b.txt', 'b\n')
