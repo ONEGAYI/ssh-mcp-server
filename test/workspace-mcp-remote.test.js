@@ -24,6 +24,17 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
     assert.equal((await call('remote_workspace')).data.capabilities.persistentTasks, true);
+    // metadataOnly observes the version (or absence) without content or a credential.
+    const meta = await call('remote_read', { path, metadataOnly: true });
+    assert.equal(meta.error, undefined, JSON.stringify(meta));
+    assert.equal(meta.data.exists, true);
+    assert.ok(String(meta.data.version).startsWith('m1-'));
+    assert.equal('readToken' in meta.data, false);
+    assert.equal('text' in meta.data, false);
+    const absent = await call('remote_read', { path: 'never-created-' + sessionId, metadataOnly: true });
+    assert.equal(absent.error, undefined, JSON.stringify(absent));
+    assert.equal(absent.data.exists, false);
+    assert.equal(absent.data.version, null);
     assert.equal((await call('remote_write', { path, text: 'hello\nworld\n', create: true })).error, undefined);
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
     const transfer = await call('remote_download', { path, localPath: downloaded });
@@ -50,7 +61,14 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal(upload.error, undefined, JSON.stringify(upload));
     const binaryRead = await call('remote_read', { path, encoding: 'base64' });
     assert.deepEqual(Buffer.from(binaryRead.data.data, 'base64'), binary);
-    assert.equal((await call('remote_delete', { path, readToken: binaryRead.data.readToken })).error, undefined);
+    // Stale cursors bound to an old version are rejected after a new write.
+    const beforeWrite = await call('remote_read', { path, offset: 0, maxBytes: 4, encoding: 'base64' });
+    const overwritten = await call('remote_write', { path, text: 'changed content\n', readToken: binaryRead.data.readToken });
+    assert.equal(overwritten.error, undefined, JSON.stringify(overwritten));
+    const staleCursor = await call('remote_read', { path, offset: beforeWrite.data.nextOffset, expectedVersion: beforeWrite.data.version });
+    assert.equal(staleCursor.data.code, 'FILE_CONFLICT');
+    const finalRead = await call('remote_read', { path });
+    assert.equal((await call('remote_delete', { path, readToken: finalRead.data.readToken })).error, undefined);
   } finally {
     await client.close();
     for (const target of [localPath, downloaded]) await unlink(target).catch(error => { if (error.code !== 'ENOENT') throw error; });
