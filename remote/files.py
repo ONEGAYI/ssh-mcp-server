@@ -801,6 +801,7 @@ class FileService:
         """
         temporary = path.parent / ('.ssh-mcp-' + uuid.uuid4().hex)
         resource_id = ledger.register_temp(self.root, str(temporary), output_size, self.session, origin)
+        committed = False
         try:
             written_info = write_temporary(temporary, info, produce)
             ledger.attach_identity(self.root, resource_id, '{}:{}'.format(written_info.st_dev, written_info.st_ino))
@@ -814,16 +815,41 @@ class FileService:
                     os.link(str(temporary), str(path))
                 except FileExistsError:
                     raise AgentError('FILE_CONFLICT', 'Creation target already exists')
+            committed = True
             sync_directory(path.parent)
             return written_info
         except OSError as error:
+            if committed:
+                # The name is already published: the write happened, and the
+                # caller must neither retry it as new nor read it as failed.
+                raise AgentError('COMMITTED_UNCONFIRMED',
+                                 'The write was committed at {}; post-commit bookkeeping failed ({}). '
+                                 'Do not retry as a new write; re-read the current file first.'.format(path, error))
             if error.errno == errno.ENOSPC:
                 raise AgentError('STORAGE_FULL', 'Remote filesystem reported ENOSPC while committing the write')
             raise
         finally:
-            if os.path.exists(str(temporary)):
-                os.unlink(str(temporary))
-            ledger.release(self.root, resource_id)
+            # Cleanup failures after the commit are bookkeeping problems, not
+            # write problems: report them as committed-unconfirmed. Before the
+            # commit they keep the bare OSError semantics; an exception already
+            # in flight (the sys.exc_info check) is never masked by them.
+            failure = None
+            try:
+                if os.path.exists(str(temporary)):
+                    os.unlink(str(temporary))
+            except OSError as error:
+                failure = error
+            try:
+                ledger.release(self.root, resource_id)
+            except OSError as error:
+                failure = failure or error
+            if failure is not None:
+                if committed:
+                    raise AgentError('COMMITTED_UNCONFIRMED',
+                                     'The write was committed at {}; post-commit bookkeeping failed ({}). '
+                                     'Do not retry as a new write; re-read the current file first.'.format(path, failure))
+                if sys.exc_info()[0] is None:
+                    raise failure
 
     def commit(self, path, data, info=None, version=None, origin='file'):
         """Publish buffered content (whole-file writes)."""

@@ -1,4 +1,5 @@
 import base64
+import errno
 import json
 import os
 from pathlib import Path
@@ -1050,6 +1051,45 @@ class RemoteFilesTest(unittest.TestCase):
         finally:
             files.sync_directory = original
         self.assertEqual(synced, [str(self.work)] * 3)
+
+    def test_post_commit_failure_reports_committed_unconfirmed_not_storage_full(self):
+        # 契约：写入已完成时不得把它当成未写入。replace/link 已完成后，
+        # 目录 fsync 或收尾簿记失败必须报 COMMITTED_UNCONFIRMED（已提交、
+        # 别按新写重试），而不是 STORAGE_FULL 掩盖已提交的事实。
+        files = self.helper_module()
+        service = self.service()
+        (self.work / 'committed.txt').write_text('before')
+        original = files.sync_directory
+
+        def enospc(directory):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        files.sync_directory = enospc
+        try:
+            observed = service.read({'path': 'committed.txt', 'metadataOnly': True})
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'committed.txt', 'text': 'after',
+                               'overwrite': True, 'expectedVersion': observed['version']})
+        finally:
+            files.sync_directory = original
+        self.assertEqual(caught.exception.code, 'COMMITTED_UNCONFIRMED')
+        self.assertIn(str(self.work / 'committed.txt'), str(caught.exception))
+        # 目标文件已是新内容：写入确实发生了，未被误报掩盖。
+        self.assertEqual((self.work / 'committed.txt').read_text(), 'after')
+        # 收尾簿记（ledger.release）失败同样不得把已提交的写当失败。
+        original_release = files.ledger.release
+
+        def broken_release(*args, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        files.ledger.release = broken_release
+        try:
+            observed = service.read({'path': 'committed.txt', 'metadataOnly': True})
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'committed.txt', 'text': 'again',
+                               'overwrite': True, 'expectedVersion': observed['version']})
+        finally:
+            files.ledger.release = original_release
+        self.assertEqual(caught.exception.code, 'COMMITTED_UNCONFIRMED')
+        self.assertEqual((self.work / 'committed.txt').read_text(), 'again')
 
 
 if __name__ == '__main__':
