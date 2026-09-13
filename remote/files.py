@@ -803,9 +803,13 @@ class FileService:
         resource_id = ledger.register_temp(self.root, str(temporary), output_size, self.session, origin)
         committed = False
         try:
+            # Re-check the symlink rules before any byte reaches the temp
+            # file: if the parent turned into an outside symlink after the
+            # entry check, the data must never be written through it, not
+            # even briefly before the rejection deletes it again.
+            self.path(str(path), writing=True)
             written_info = write_temporary(temporary, info, produce)
             ledger.attach_identity(self.root, resource_id, '{}:{}'.format(written_info.st_dev, written_info.st_ino))
-            self.path(str(path), writing=True)
             if version is not None:
                 if current_version(path) != version:
                     raise AgentError('FILE_CONFLICT', 'File changed before committing the write')

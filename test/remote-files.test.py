@@ -419,6 +419,50 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'UNSUPPORTED_FILE')
         self.assertEqual(str(caught.exception), 'Only regular files are supported')
 
+    def test_publish_rechecks_symlink_parent_before_writing_the_temp_file(self):
+        # 入口检查与临时文件写入之间父目录被换成指向外部的 symlink：
+        # publish 的复查必须发生在 write_temporary 之前，数据不得短暂
+        # 写入外部目录（随后拒绝+删除的窗口仍是泄漏）。注入点选
+        # compose_content（write() 入口检查后、publish 前的最后一步），
+        # 模拟复查前的目录替换；现有 symlink 用例只覆盖入口检查。
+        files = self.helper_module()
+        service = self.service()
+        realdir = self.work / 'realdir'
+        realdir.mkdir()
+        # 外部目标仍在 workspace 内：复查要命中 symlink 检查而不是
+        # 更早的 workspace 边界检查。
+        outside = self.work / 'outside-leak'
+        outside.mkdir()
+        seen_leak = []
+        original_compose = files.compose_content
+
+        def swap_then_compose(request, has_bom, census):
+            # 在 publish 之前制造 TOCTOU 窗口：父目录换成外部 symlink。
+            realdir.rename(self.work / 'moveddir')
+            (self.work / 'realdir').symlink_to(outside)
+            return original_compose(request, has_bom, census)
+        files.compose_content = swap_then_compose
+        original_write_temporary = files.write_temporary
+
+        def observing_write_temporary(path, info, produce):
+            result = original_write_temporary(path, info, produce)
+            if any(outside.iterdir()):  # publish 的 finally 删除前观测
+                seen_leak.append('temp file written through the symlink')
+            return result
+        files.write_temporary = observing_write_temporary
+        try:
+            with self.assertRaises(files.AgentError) as caught:
+                service.write({'path': 'realdir/new.txt', 'text': 'payload', 'create': True})
+        finally:
+            files.compose_content = original_compose
+            files.write_temporary = original_write_temporary
+        self.assertEqual(caught.exception.code, 'UNSUPPORTED_LINK')
+        self.assertEqual(seen_leak, [])
+        # 核心断言：外部目录自始至终未收到任何字节（目录替换本身是
+        # 注入的既成事实，与写入无关），目标名也未发布。
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((outside / 'new.txt').exists())
+
     def helper_module(self):
         sys.path.insert(0, str(HELPER.parent))
         import files
