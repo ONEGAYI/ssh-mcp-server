@@ -649,7 +649,8 @@ class FileService:
         if not isinstance(metadata_only, bool):
             raise AgentError('INVALID_REQUEST', 'metadataOnly must be boolean')
         if metadata_only:
-            if any(key in request for key in ('offset', 'fromLine', 'toLine', 'maxBytes')) or 'encoding' in request:
+            if any(key in request for key in ('offset', 'fromLine', 'toLine', 'maxBytes',
+                                              'expectedVersion', 'readToken')) or 'encoding' in request:
                 raise AgentError('INVALID_REQUEST', 'metadataOnly observes the version; drop the content selectors')
             return self.observe_metadata(path)
         limit = validate_read_request(request)

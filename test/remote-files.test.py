@@ -424,6 +424,11 @@ class RemoteFilesTest(unittest.TestCase):
         # Content selectors are meaningless without content: reject mixing.
         mixed = self.call('file_read', {'path': 'meta.txt', 'metadataOnly': True, 'offset': 0})
         self.assertEqual(mixed['error']['code'], 'INVALID_REQUEST')
+        # expectedVersion / readToken contradict observing metadata alone.
+        for request in ({'path': 'meta.txt', 'metadataOnly': True, 'expectedVersion': 'm1-anything'},
+                        {'path': 'meta.txt', 'metadataOnly': True, 'readToken': '0' * 32}):
+            refused = self.call('file_read', request)
+            self.assertEqual(refused['error']['code'], 'INVALID_REQUEST', request)
 
     def test_capabilities_report_streamed_read_and_streamed_write(self):
         capabilities = self.call('file_workspace', {})['result']['capabilities']
