@@ -113,10 +113,10 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
     });
-  register("remote_move", "Move a completely read file on the same filesystem. Existing destination requires its own complete read token.",
-    { sessionId, path, readToken, target: path, targetReadToken: readToken }, input => files.call("file_move", input.sessionId, input));
-  register("remote_delete", "Delete one completely read regular file if its version is unchanged. No recursive deletion.", { sessionId, path, readToken }, input => files.call("file_delete", input.sessionId, input));
-  for (const action of ["mkdir", "rmdir"]) register("remote_" + action, action === "mkdir" ? "Create one new directory." : "Remove one empty directory; never recursive.", { sessionId, path }, input => files.call("file_" + action, input.sessionId, input));
+  // Issue #20 / ADR 0007: remote_move/delete/mkdir/rmdir are retired. Moving,
+  // deleting and directory management go through remote shell commands
+  // (execute tasks); those shell paths never had the file tools' readToken
+  // protection, and retiring the tools does not authorize future deletions.
   const job = { sessionId, jobId: z.string().min(1).max(80) };
   const own = async (input: Record<string, any>) => {
     if ((await runtime.tasks.record(input.jobId)).sessionId !== input.sessionId) throw new RemoteAgentError("TASK_SCOPE_MISMATCH", "Task belongs to another conversation");
