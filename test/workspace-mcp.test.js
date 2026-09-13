@@ -24,6 +24,17 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     assert.ok(read.inputSchema.properties.metadataOnly, 'remote_read exposes metadataOnly');
     assert.ok(read.inputSchema.properties.expectedVersion, 'remote_read exposes expectedVersion');
     assert.ok(!/16 MiB/.test(read.description), 'remote_read no longer caps file size');
+    // Issue #10: whole-file writes take an explicit overwrite bound to the
+    // observed version instead of a read credential.
+    const write = tools.tools.find(tool => tool.name === 'remote_write');
+    assert.ok(write.inputSchema.properties.overwrite, 'remote_write exposes overwrite');
+    assert.ok(write.inputSchema.properties.expectedVersion, 'remote_write exposes expectedVersion');
+    assert.ok(!('readToken' in write.inputSchema.properties), 'remote_write no longer takes readToken');
+    assert.match(write.description, /metadataOnly/);
+    const upload = tools.tools.find(tool => tool.name === 'remote_upload');
+    assert.ok(upload.inputSchema.properties.overwrite, 'remote_upload exposes overwrite');
+    assert.ok(upload.inputSchema.properties.expectedVersion, 'remote_upload exposes expectedVersion');
+    assert.ok(!('readToken' in upload.inputSchema.properties), 'remote_upload no longer takes readToken');
     const pending = await client.callTool({ name: 'remote_pending', arguments: { sessionId: 'new-session' } });
     assert.equal(pending.isError, undefined);
     assert.doesNotMatch(JSON.stringify(pending), /must-not-leak/);
