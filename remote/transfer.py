@@ -892,15 +892,21 @@ def status(root, request):
 
 
 def _release_temp(root, record):
-    """Delete the uncommitted temp and release its ledger registration."""
-    if record.get('resourceId'):
-        ledger.release(root, record['resourceId'])
-        record['resourceId'] = None
+    """Delete the uncommitted temp, then release its ledger registration.
+
+    File first, ledger second (same order as reclaim.py's
+    _release_transfer_temp and the local end's resetLocalTemp): an unlink
+    failure or a crash between the two steps keeps the registration alive,
+    so the retry re-releases idempotently instead of stranding an ownerless
+    temp the ledger-driven generic resource pass would never revisit."""
     if record.get('tempPath'):
         try:
             os.unlink(record['tempPath'])
         except FileNotFoundError:
             pass
+    if record.get('resourceId'):
+        ledger.release(root, record['resourceId'])
+        record['resourceId'] = None
 
 
 def _publish_evidence_matches(record, intent):

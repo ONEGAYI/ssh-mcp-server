@@ -330,6 +330,99 @@ class RemoteReclaimTest(unittest.TestCase):
         self.assertEqual(result['removedTransfers'], [])
         self.assertTrue((self.state / 'transfers' / transfer_id / 'record.json').is_file())
 
+    def test_agent_error_in_one_entry_is_skipped_and_the_round_continues(self):
+        # A transfer whose processing raises AgentError must be skipped with
+        # the cursor advancing -- never abort the round and stall every other
+        # section on the same broken entry forever. Reaching that path for
+        # real: a live process still holding a legacy per-path lock makes
+        # ensure_slot_protocol refuse with LOCK_SWITCH_BLOCKED (issue #8's
+        # upgrade gate), which _process_transfer does not catch itself.
+        transfers = self.state / 'transfers'
+        expired = time.time() - 4 * DAY
+        names = ['0' * 32, 'f' * 32]
+        for name in names:
+            directory = transfers / name
+            directory.mkdir(parents=True)
+            (directory / 'record.json').write_text(json.dumps(
+                {'schemaVersion': 1, 'state': 'transferring', 'lastProgressAt': expired,
+                 'registeredAt': expired, 'resourceId': None, 'tempPath': None}))
+        # The reads section runs after transfers: an expired credential there
+        # proves the later sections were not stalled by the poison entry.
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        token = 'd' * 32
+        (reads / (token + '.json')).write_text(json.dumps(
+            {'session': 'session-one', 'path': str(self.work / 'x'), 'version': 1,
+             'ranges': [[0, 1]], 'size': 1, 'lastSuccessAt': expired,
+             'expiresAt': expired}))
+        locks = self.state / 'file-locks'
+        locks.mkdir(parents=True)
+        with (locks / 'legacy-a').open('a') as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            result = self.maintenance(clock=time.time())
+            self.assertTrue(result['ok'], result)  # the round survives the entry
+        body = result['result']
+        self.assertEqual(body['removedTransfers'], [], body)  # every transfer hit the refusal
+        for name in names:
+            self.assertTrue((transfers / name).is_dir())  # skipped, kept
+        self.assertEqual(body['removedReadTokens'], [token], body)  # later sections ran
+        self.assertFalse((reads / (token + '.json')).exists())
+
+    def test_interrupted_transfer_release_deletes_the_file_before_the_ledger_entry(self):
+        # R7（reclaim 侧）：维护释放同样先删文件、后注销账本——与 transfer
+        # 侧 _release_temp 及本机 resetLocalTemp 统一。unlink 失败（非
+        # FileNotFoundError 的 OSError，此处 EACCES）时登记必须保留供重试，
+        # 不得留下无主孤儿临时文件；unlink 成功而 release 失败时文件已删，
+        # False-on-doubt 让下一轮幂等重试注销。in-process 驱动以注入故障。
+        sys.path.insert(0, str(HELPER.parent))
+        try:
+            import reclaim as reclaim_module
+            import ledger as ledger_module
+            from common import AgentError
+        finally:
+            sys.path.remove(str(HELPER.parent))
+        temp = self.work / '.ssh-mcp-stuck'
+        temp.write_bytes(b'stuck upload temp')
+        registered = self.call('resource_register', {'path': str(temp), 'bytes': 16,
+                                                     'origin': 'transfer'})['result']
+        resource_id = registered['resourceId']
+        record = {'resourceId': resource_id, 'tempPath': str(temp)}
+
+        # 场景一：unlink 失败——账本登记原样保留，失败可重试而非孤儿。
+        original_unlink = os.unlink
+
+        def denied(path):
+            raise PermissionError(13, 'Permission denied')
+        os.unlink = denied
+        try:
+            with self.assertRaises(OSError):
+                reclaim_module._release_transfer_temp(self.state, record)
+        finally:
+            os.unlink = original_unlink
+        self.assertTrue(temp.exists())
+        ledger_data = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        self.assertIn(resource_id, ledger_data['resources'])
+
+        # 场景二：unlink 成功而账本注销失败（STORAGE_FULL 等 AgentError）。
+        original_release = ledger_module.release
+
+        def failing_release(root, resource_id):
+            raise AgentError('STORAGE_FULL', 'ledger cannot be persisted')
+        ledger_module.release = failing_release
+        try:
+            self.assertFalse(reclaim_module._release_transfer_temp(self.state, record))
+        finally:
+            ledger_module.release = original_release
+        self.assertFalse(temp.exists())
+        ledger_data = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        self.assertIn(resource_id, ledger_data['resources'])
+
+        # 场景三（正常路径）：删文件与注销一并完成。
+        self.assertTrue(reclaim_module._release_transfer_temp(self.state, record))
+        self.assertFalse(temp.exists())
+        after = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        self.assertNotIn(resource_id, after['resources'])
+
     # --- bounds: budget, cursor, mutex ----------------------------------------
 
     def test_maintenance_respects_the_item_budget_and_resumes_from_the_cursor(self):
@@ -435,6 +528,41 @@ class RemoteReclaimTest(unittest.TestCase):
         edited = self.call('file_edit', {'path': 'fresh.txt', 'readToken': read['readToken'],
                                          'edits': [{'oldText': 'fresh', 'newText': 'cooled'}]})
         self.assertTrue(edited['ok'], edited)
+
+    def test_non_dict_read_records_are_skipped_without_aborting_the_round(self):
+        # A reads/ entry that is valid JSON but not an object (a list, a
+        # number, ...) is corrupt, not fatal: like the jobs/transfers
+        # sections, the round must skip it and still reclaim the genuinely
+        # expired credential sorted right behind it.
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        bad, good = '0' * 32, 'a' * 32  # sorted: the corrupt entry comes first
+        now = time.time()
+        (reads / (bad + '.json')).write_text('[1, 2]')
+        (reads / (good + '.json')).write_text(json.dumps(
+            {'session': 'session-one', 'path': str(self.work / 'x'), 'version': 1,
+             'ranges': [[0, 1]], 'size': 1, 'lastSuccessAt': now,
+             'expiresAt': now - 1}))
+        result = self.maintenance(clock=now)
+        self.assertTrue(result['ok'], result)  # the round itself must survive
+        self.assertEqual(result['result']['removedReadTokens'], [good], result)
+        self.assertFalse((reads / (good + '.json')).exists())
+        self.assertTrue((reads / (bad + '.json')).is_file())  # corrupt: skipped, kept
+
+    def test_read_index_with_a_non_hex_token_key_is_skipped(self):
+        # The index's readToken feeds a path join, so anything that is not a
+        # 32-hex key (here a traversal attempt) is corrupt and skipped: the
+        # index is never used for access and never deleted by that branch.
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        index_name = 'index-' + 'c' * 64 + '.json'
+        (reads / index_name).write_text(json.dumps({'readToken': '../../evil'}))
+        result = self.maintenance(clock=time.time())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['result']['removedReadIndexes'], [], result)
+        self.assertTrue((reads / index_name).is_file())
+        # Nothing outside reads/ was touched through the forged key.
+        self.assertFalse((self.root / 'evil.json').exists())
 
     # --- issue #17: stale helper images ----------------------------------------
 

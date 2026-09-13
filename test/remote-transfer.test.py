@@ -739,6 +739,35 @@ class RemoteTransferTest(unittest.TestCase):
         fresh = self.register(b'fresh', target='fresh.bin')
         self.assertTrue(fresh['ok'], fresh)
 
+    def test_cancel_unlink_failure_keeps_the_ledger_registration_for_retry(self):
+        # R7：释放顺序先删文件后注销账本。unlink 失败（此处目录拒绝写入）
+        # 时账本登记必须保留，重试可再次释放——不得留下已注销却删不掉的
+        # 无主孤儿临时文件（通用资源回收按账本驱动，永远不会再碰它）。
+        data = b'u' * 32
+        transfer_id = self.register(data)['result']['transferId']
+        self.assertTrue(self.start(transfer_id)['ok'])
+        temp = self.temp_path(transfer_id)
+        self.assertTrue(temp.exists())
+        os.chmod(str(self.work), 0o500)  # unlink now fails with EACCES
+        try:
+            denied = self.call('transfer_cancel', {'transferId': transfer_id})
+            self.assertFalse(denied['ok'], denied)
+            self.assertEqual(denied['error']['code'], 'HELPER_ERROR', denied)
+        finally:
+            os.chmod(str(self.work), 0o700)
+        self.assertTrue(temp.exists())  # nothing was deleted
+        # 失败留下的必须是可以重试的登记，而不是孤儿：账本条目仍在。
+        ledger = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        record = self.record(transfer_id)
+        self.assertIn(record['resourceId'], ledger['resources'])
+        # 障碍解除后重试同一取消：文件与登记一并释放，状态落定。
+        cancelled = self.call('transfer_cancel', {'transferId': transfer_id})
+        self.assertTrue(cancelled['ok'], cancelled)
+        self.assertEqual(cancelled['result']['state'], 'cancelled', cancelled)
+        self.assertFalse(temp.exists())
+        after = json.loads((self.state / 'ledger' / 'ledger.json').read_text())
+        self.assertEqual(after['resources'], {})
+
     def test_cancel_is_idempotent_and_never_rolls_back_committed_targets(self):
         data = b'already committed'
         transfer_id, committed = self.deliver(data, target='committed.bin')
