@@ -58,7 +58,7 @@ it('a real workspace executes a registered task once and rejects legacy direct s
     assert.equal(second.jobId, first.jobId);
     await waitTerminal(registration.jobId);
     const output = await runtime.remote.call('output', { jobId: registration.jobId });
-    assert.equal(Buffer.from(output.stdout.data, 'base64').toString(), 'ONCE\n');
+    assert.equal(Buffer.from(output.stdout.data, 'base64').toString(), 'ONCE');
     // Unknown identifiers never take a creation branch on the real remote either.
     await assert.rejects(() => runtime.remote.call('task_start', { protocol: 2, jobId: 'unknown-' + randomUUID() }),
       error => { assert.equal(error.code, 'REQUEST_EXPIRED_OR_UNKNOWN'); return true; });

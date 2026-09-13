@@ -13,10 +13,12 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from common import AgentError, atomic_json, read_json
 
 
 PROTOCOL = 'SSH_MCP_V1 '
+PROTOCOL_VERSION = 2
 TERMINAL = frozenset(('exited', 'cancelled', 'interrupted'))
 
 
@@ -42,6 +44,13 @@ def job_path(root, job_id):
 def describe(root, job_id):
     path = job_path(root, job_id)
     if not (path / 'state.json').is_file():
+        # A durable registration without a startup record is an observable,
+        # not-yet-executed task. It must not be reported as missing.
+        if (path / 'registration.json').is_file():
+            registration = read_json(path / 'registration.json')
+            return {'schemaVersion': 1, 'jobId': job_id, 'state': 'prepared',
+                    'registeredAt': registration.get('registeredAt'),
+                    'cancelRequested': (path / 'cancel.json').exists()}
         raise AgentError('JOB_NOT_FOUND', 'Task record not found')
     state = read_json(path / 'state.json')
     if state['state'] == 'starting' and time.time() - state['createdAt'] > 30:
@@ -52,9 +61,12 @@ def describe(root, job_id):
     return state
 
 
-def start(root, request):
-    job_id = request.get('jobId')
-    path = job_path(root, job_id)
+def request_digest(normalized):
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode('utf8')).hexdigest()
+
+
+def validate_task_request(request):
+    """Validate the common task parameters; return the normalized request body."""
     command = request.get('command')
     cwd = request.get('cwd')
     environment = request.get('env', {})
@@ -72,9 +84,144 @@ def start(root, request):
     output_limit = request.get('maxOutputBytes', 256 * 1024 * 1024)
     if not isinstance(output_limit, int) or isinstance(output_limit, bool) or not 1 <= output_limit <= 9007199254740991:
         raise AgentError('INVALID_LIMIT', 'maxOutputBytes must be a positive safe integer')
-    normalized = {'jobId': job_id, 'command': command, 'cwd': cwd, 'env': environment,
-                  'executionTimeoutMs': timeout_ms, 'maxOutputBytes': output_limit}
-    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode('utf8')).hexdigest()
+    return {'command': command, 'cwd': cwd, 'env': environment,
+            'executionTimeoutMs': timeout_ms, 'maxOutputBytes': output_limit}
+
+
+def require_protocol(request):
+    if request.get('protocol') != PROTOCOL_VERSION:
+        raise AgentError('INVALID_PROTOCOL', 'This action requires protocol version 2')
+
+
+def read_protocol_state(root):
+    """Return the persisted activation record, or None before activation.
+
+    An unreadable activation record must never re-open the legacy creation
+    entry, so corruption is raised instead of ignored."""
+    path = root / 'protocol.json'
+    if not path.is_file():
+        return None
+    try:
+        state = read_json(path)
+    except ValueError:
+        raise AgentError('PROTOCOL_STATE_UNKNOWN', 'Protocol activation record is unreadable; resolve it before starting new tasks')
+    if not isinstance(state, dict) or state.get('protocol') != PROTOCOL_VERSION:
+        raise AgentError('PROTOCOL_STATE_UNKNOWN', 'Protocol activation record is invalid; resolve it before starting new tasks')
+    return state
+
+
+def legacy_pending_jobs(root):
+    """Legacy (v1) task directories that have not reached a terminal state."""
+    jobs = root / 'jobs'
+    pending = []
+    if not jobs.exists():
+        return pending
+    for candidate in sorted(jobs.iterdir()):
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        path = job_path(root, candidate.name)
+        if (path / 'registration.json').is_file():
+            continue
+        try:
+            state = read_json(path / 'state.json')
+            finished = isinstance(state, dict) and state.get('state') in TERMINAL
+        except (OSError, ValueError):
+            finished = False
+        if not finished:
+            pending.append(candidate.name)
+    return pending
+
+
+def ensure_protocol_active(root):
+    """Idempotently activate the v2 register-then-execute protocol.
+
+    Activation is refused while legacy tasks are still running: never kill
+    them silently, and never let both protocols accept new writes at once."""
+    state = read_protocol_state(root)
+    if state is not None:
+        return state
+    locks = root / 'locks'
+    locks.mkdir(mode=0o700, exist_ok=True)
+    with (locks / 'protocol').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_protocol_state(root)
+        if state is not None:
+            return state
+        pending = legacy_pending_jobs(root)
+        if pending:
+            raise AgentError('LEGACY_TASKS_PENDING',
+                             'Legacy tasks are still running: {}'.format(', '.join(pending[:5])))
+        state = {'schemaVersion': 1, 'protocol': PROTOCOL_VERSION, 'activatedAt': time.time()}
+        atomic_json(root / 'protocol.json', state)
+        return state
+
+
+def handshake(root, request):
+    require_protocol(request)
+    state = ensure_protocol_active(root)
+    return {'protocol': state['protocol'], 'status': 'active', 'activatedAt': state['activatedAt']}
+
+
+def task_register(root, request):
+    require_protocol(request)
+    normalized = validate_task_request(request)
+    ensure_protocol_active(root)
+    job_id = str(uuid.uuid4())
+    path = job_path(root, job_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        raise AgentError('REQUEST_CONFLICT', 'Task identifier was already assigned')
+    registration = dict(normalized, schemaVersion=1, requestHash=request_digest(normalized),
+                        registeredAt=time.time())
+    atomic_json(path / 'registration.json', registration)
+    return {'jobId': job_id, 'state': 'prepared', 'registeredAt': registration['registeredAt']}
+
+
+def task_start(root, request):
+    require_protocol(request)
+    job_id = request.get('jobId')
+    path = job_path(root, job_id)
+    locks = root / 'locks'
+    locks.mkdir(mode=0o700, exist_ok=True)
+    with (locks / job_id).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (path / 'registration.json').is_file():
+            # Unknown or removed identifiers never fall back to creation.
+            raise AgentError('REQUEST_EXPIRED_OR_UNKNOWN',
+                             'No registration for this task identifier; register it explicitly first')
+        if (path / 'request.json').is_file():
+            # At most one execution per registration, including lost responses.
+            return describe(root, job_id)
+        if (path / 'state.json').is_file():
+            raise AgentError('START_STATE_UNKNOWN', 'Existing task has an incomplete startup record; do not rerun')
+        registration = read_json(path / 'registration.json')
+        if not os.path.isdir(registration['cwd']):
+            raise AgentError('INVALID_CWD', 'Working directory must exist when starting a new task')
+        normalized = {'jobId': job_id, 'command': registration['command'], 'cwd': registration['cwd'],
+                      'env': registration['env'], 'executionTimeoutMs': registration['executionTimeoutMs'],
+                      'maxOutputBytes': registration['maxOutputBytes']}
+        atomic_json(path / 'request.json', normalized)
+        state = {'schemaVersion': 1, 'jobId': job_id, 'state': 'starting', 'createdAt': time.time(),
+                 'requestHash': registration['requestHash']}
+        atomic_json(path / 'state.json', state)
+        with (path / 'launcher.log').open('ab') as log:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), '--root', str(root), '_worker', '--job-id', job_id],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+        return describe(root, job_id)
+
+
+def start(root, request):
+    """Legacy entry: replay observations for existing tasks only.
+
+    Before the v2 protocol is activated this can still create tasks (upgrade
+    window); afterwards creation is refused so no client can bypass
+    registration."""
+    job_id = request.get('jobId')
+    path = job_path(root, job_id)
+    normalized = dict(validate_task_request(request), jobId=job_id)
+    digest = request_digest(normalized)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     locks = root / 'locks'
     locks.mkdir(mode=0o700, exist_ok=True)
@@ -86,15 +233,22 @@ def start(root, request):
             if read_json(path / 'request.json') != normalized:
                 raise AgentError('REQUEST_CONFLICT', 'Task identifier was already used with different parameters')
             return describe(root, job_id)
-        if not os.path.isdir(cwd):
-            raise AgentError('INVALID_CWD', 'Working directory must exist when starting a new task')
-        path.mkdir(mode=0o700)
-        atomic_json(path / 'request.json', normalized)
-        state = {'schemaVersion': 1, 'jobId': job_id, 'state': 'starting', 'createdAt': time.time(), 'requestHash': digest}
-        atomic_json(path / 'state.json', state)
-        with (path / 'launcher.log').open('ab') as log:
-            subprocess.Popen([sys.executable, os.path.abspath(__file__), '--root', str(root), '_worker', '--job-id', job_id],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+        # Serialize the creation check with activation so both protocols can
+        # never accept new writes at once. Lock order: job lock, then protocol lock.
+        with (locks / 'protocol').open('a') as protocol_lock:
+            fcntl.flock(protocol_lock, fcntl.LOCK_EX)
+            if read_protocol_state(root) is not None:
+                raise AgentError('PROTOCOL_UPGRADE_REQUIRED',
+                                 'The register-then-execute protocol is active; create tasks through task_register')
+            if not os.path.isdir(normalized['cwd']):
+                raise AgentError('INVALID_CWD', 'Working directory must exist when starting a new task')
+            path.mkdir(mode=0o700)
+            atomic_json(path / 'request.json', normalized)
+            state = {'schemaVersion': 1, 'jobId': job_id, 'state': 'starting', 'createdAt': time.time(), 'requestHash': digest}
+            atomic_json(path / 'state.json', state)
+            with (path / 'launcher.log').open('ab') as log:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), '--root', str(root), '_worker', '--job-id', job_id],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
         return describe(root, job_id)
 
 
@@ -287,7 +441,13 @@ def main():
     request = json.loads(sys.stdin.buffer.read().decode('utf8'))
     if not isinstance(request, dict):
         raise AgentError('INVALID_REQUEST', 'Request must be an object')
-    if args.action == 'start':
+    if args.action == 'handshake':
+        result = handshake(root, request)
+    elif args.action == 'task_register':
+        result = task_register(root, request)
+    elif args.action == 'task_start':
+        result = task_start(root, request)
+    elif args.action == 'start':
         result = start(root, request)
     elif args.action == 'status':
         result = describe(root, request.get('jobId'))

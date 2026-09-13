@@ -76,7 +76,7 @@ it('registration precedes execution and the local record carries the remote-assi
     const stored = JSON.parse(recordAtStart);
     assert.equal(stored.jobId, assigned);
     assert.equal(stored.protocol, 2);
-    const [registerRequest] = remote.calls.find(([action]) => action === 'task_register');
+    const [, registerRequest] = remote.calls.find(([action]) => action === 'task_register');
     assert.equal(registerRequest.protocol, 2);
     assert.ok(!registerRequest.jobId, 'registration must not accept a caller-chosen id');
     const [startAction, startRequest] = remote.calls.find(([action]) => action === 'task_start');

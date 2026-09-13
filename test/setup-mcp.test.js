@@ -37,7 +37,7 @@ it('named bindings coexist with legacy profiles and recover only their own tasks
       const config = await loadWorkspaceConfig(result.profilePath);
       let assigned = 0;
       const tasks = new TaskService({ call: async (action, r) => {
-        if (action === 'task_register') return { jobId: r.workspaceId + '-job-' + (++assigned), state: 'prepared' };
+        if (action === 'task_register') return { jobId: config.workspaceId + '-job-' + (++assigned), state: 'prepared' };
         return { jobId: r.jobId, state: 'running' };
       } }, config.localStateDir, config.identity);
       jobs.push((await tasks.start({ sessionId: 'owner', cwd: config.remoteRoot, command: 'build-' + jobs.length })).jobId);
