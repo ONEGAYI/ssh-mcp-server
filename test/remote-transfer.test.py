@@ -127,7 +127,13 @@ class RemoteTransferTest(unittest.TestCase):
         return run.stdout
 
     def parse_fetch(self, stdout):
-        """Split the framed response: control line, exact bytes, envelope."""
+        """Split the framed response: control line, exact bytes, envelope.
+
+        Error paths carry no frame: the whole stdout is the envelope alone.
+        """
+        if stdout.startswith(b'SSH_MCP_V1 '):
+            envelope = json.loads(base64.b64decode(stdout.split(b' ', 1)[1].strip()))
+            return None, None, envelope
         self.assertTrue(stdout.startswith(b'{'), stdout[:80])
         head, remainder = stdout.split(b'\n', 1)
         control = json.loads(head.decode('utf8'))
@@ -571,7 +577,7 @@ class RemoteTransferTest(unittest.TestCase):
             ({'sourceIdentity': {'size': 7, 'mtimeMs': 1.0}}, 'INVALID_REQUEST'),
             ({'sourcePath': 'missing.bin'}, 'PATH_NOT_FOUND'),
             ({'sourcePath': '../outside'}, 'PATH_NOT_ALLOWED'),
-            ({'sourcePath': None}, 'INVALID_REQUEST'),
+            ({'sourcePath': None}, 'INVALID_PATH'),
             ({'targetPath': None}, 'INVALID_REQUEST'),
             ({'overwrite': True}, 'INVALID_REQUEST'),
             ({'expectedVersion': 'l1-any'}, 'INVALID_REQUEST'),
@@ -596,6 +602,7 @@ class RemoteTransferTest(unittest.TestCase):
         sys.path.insert(0, str(HELPER.parent))
         import transfer as transfer_module
         from common import AgentError
+        self.state.mkdir(mode=0o700, parents=True, exist_ok=True)  # main() prepares the state root
         request = {'protocol': 2, 'direction': 'download', 'sourcePath': 'source.bin',
                    'chunkSize': CHUNK, 'overwrite': False, 'create': False,
                    'targetPath': 'C:/local/destination.bin',

@@ -753,7 +753,7 @@ it('download enforces the local target overwrite contract', async () => {
 it('a local target appearing mid-download refuses the commit without clobbering', async () => {
   const { fake, transfers } = await buildHarness();
   try {
-    const data = Buffer.alloc(CHUNK * 2, 0x99);
+    const data = Buffer.alloc(CHUNK * 4, 0x99); // four fetches outrun a 1 s budget at 400 ms each
     const name = 'appear-dl-' + randomUUID() + '.bin';
     await writeSource(fake.workspace, name, data);
     fake.fetchDelayMs = 400;
