@@ -1,4 +1,4 @@
-"""Behavior tests for issue #11: multi-backend content search with resumable pagination.
+"""Behavior tests for issues #11/#12: multi-backend search and filename find.
 
 Runs the real helper CLI (remote/agent.py) like remote-files.test.py. Fake
 ripgrep/grep executables are generated at runtime into tmpdir directories and
@@ -20,9 +20,12 @@ NEEDLE = 'NEEDLE-7f3a-中文'
 
 # A drop-in stand-in for ripgrep/grep supporting exactly the flags the helper
 # uses: literal fixed-string, case-sensitive, binary-as-text, line numbers on
-# stdin, output "N:line" per matching line. Honors two test env vars:
-# SSH_MCP_FAKE_BACKEND_LOG (append argv per invocation) and
-# SSH_MCP_FAKE_BACKEND_CRASH (exit 3 before doing any work).
+# stdin, output "N:line" per matching line. For issue #12 the fake rg also
+# implements "--files" enumeration (every non-directory entry under the root
+# argument, NUL-separated, mirroring rg --files --hidden --no-ignore which has
+# all implicit filtering disabled; the helper's common filter does the rest).
+# Honors two test env vars: SSH_MCP_FAKE_BACKEND_LOG (append argv per
+# invocation) and SSH_MCP_FAKE_BACKEND_CRASH (exit 3 before doing any work).
 FAKE_BACKEND = """#!/usr/bin/env python3
 import os
 import sys
@@ -39,6 +42,19 @@ if '--' in args:
     rest = args[args.index('--') + 1:]
 else:
     rest = args
+if '--files' in args:
+    def walk(directory):
+        with os.scandir(directory) as scanner:
+            entries = sorted(scanner, key=lambda entry: entry.name)
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                walk(entry.path)
+            else:
+                sys.stdout.buffer.write(os.path.abspath(entry.path).encode(
+                    'utf8', 'surrogateescape') + b'\\0')
+    for root in (rest or ['.']):
+        walk(root)
+    sys.exit(0)
 pattern = rest[0].encode('utf8', 'surrogateescape') if rest else b''
 data = sys.stdin.buffer.read()
 lines = data.split(b'\\n')
@@ -436,6 +452,244 @@ class RemoteDiscoveryTest(unittest.TestCase):
             if not cursor:
                 break
         self.assertEqual(collected, [('netlist.log', 1), ('netlist.log', lines // 2), ('netlist.log', lines)])
+
+
+    # --- filename find: backend alignment and filters (issue #12) -------------
+
+    def build_find_matrix(self):
+        """Shared fixture: hidden entries, layered .gitignore, empty dir, .git, symlink."""
+        self.write('a.txt', 'alpha\n')
+        self.write('b.txt', 'beta\n')
+        self.write('visible.log', 'log\n')
+        self.write('.hidden.txt', 'hidden\n')
+        self.write('.dotdir/inner.txt', 'dot\n')
+        self.write('logs/keep.log', 'keep\n')
+        self.write('logs/skip.log', 'skip\n')
+        self.write('build/artifact.txt', 'build\n')
+        self.write('nested/keep.txt', 'keep\n')
+        self.write('nested/inner.txt', 'inner\n')
+        self.write('nested/deep/kept.txt', 'deep\n')
+        self.write('excluded/kept-child.txt', 'child\n')
+        self.write('.gitignore', 'logs/skip.log\nbuild/\nnested/inner.txt\nexcluded/\n!excluded/kept-child.txt\n')
+        # A deeper .gitignore negates the shallower rule for inner.txt.
+        self.write('nested/.gitignore', '!inner.txt\n')
+        self.write('.git/config', 'git internals\n')
+        (self.work / 'empty-dir').mkdir(parents=True, exist_ok=True)
+        (self.work / 'link').symlink_to(self.work / 'a.txt')
+
+    FIND_ALL_DEFAULT = [
+        '.dotdir', '.dotdir/inner.txt', '.gitignore', '.hidden.txt', 'a.txt', 'b.txt',
+        'build', 'build/artifact.txt', 'empty-dir', 'excluded', 'excluded/kept-child.txt',
+        'link', 'logs', 'logs/keep.log', 'logs/skip.log', 'nested', 'nested/.gitignore',
+        'nested/deep', 'nested/deep/kept.txt', 'nested/inner.txt', 'nested/keep.txt', 'visible.log']
+    FIND_ALL_GITIGNORE = [
+        '.dotdir', '.dotdir/inner.txt', '.gitignore', 'a.txt', 'b.txt', 'empty-dir',
+        'link', 'logs', 'logs/keep.log', 'nested', 'nested/.gitignore', 'nested/deep',
+        'nested/deep/kept.txt', 'nested/inner.txt', 'nested/keep.txt', 'visible.log']
+    FIND_ALL_HIDDEN_OFF = [
+        'a.txt', 'b.txt', 'build', 'build/artifact.txt', 'empty-dir', 'excluded',
+        'excluded/kept-child.txt', 'link', 'logs', 'logs/keep.log', 'logs/skip.log',
+        'nested', 'nested/deep', 'nested/deep/kept.txt', 'nested/inner.txt',
+        'nested/keep.txt', 'visible.log']
+    FIND_DIRECTORIES = frozenset(
+        ['.dotdir', 'build', 'empty-dir', 'excluded', 'logs', 'nested', 'nested/deep'])
+
+    def find_entries(self, request, backends='system'):
+        return self.call('file_find', request, backends=backends)['result']['entries']
+
+    def test_find_backends_agree_across_glob_hidden_and_ignore_matrices(self):
+        self.build_find_matrix()
+        matrices = [({}, self.FIND_ALL_DEFAULT),
+                    ({'respectGitignore': True}, self.FIND_ALL_GITIGNORE),
+                    ({'includeHidden': False}, self.FIND_ALL_HIDDEN_OFF)]
+        for extra, expected in matrices:
+            request = dict({'path': '.', 'pattern': '*', 'limit': 1000}, **extra)
+            results = {}
+            for backends in ('rg+grep', 'grep', 'none'):
+                entries = self.find_entries(request, backends=backends)
+                self.assertEqual([entry['path'] for entry in entries], expected,
+                                 (backends, extra, [entry['path'] for entry in entries]))
+                types = {entry['path']: entry['type'] for entry in entries}
+                for path in self.FIND_DIRECTORIES.intersection(expected):
+                    self.assertEqual(types[path], 'directory', (path, extra))
+                self.assertEqual(types['link'], 'symlink')
+                # Full entries (path, type, size) must be identical across the
+                # rg and Python enumeration backends, not just the path set.
+                results[backends] = entries
+            self.assertEqual(results['rg+grep'], results['grep'])
+            self.assertEqual(results['rg+grep'], results['none'])
+        # Glob patterns keep matching against the basename or the relative path.
+        for pattern, expected in [
+                ('*.txt', ['.dotdir/inner.txt', '.hidden.txt', 'a.txt', 'b.txt',
+                           'build/artifact.txt', 'excluded/kept-child.txt',
+                           'nested/deep/kept.txt', 'nested/inner.txt', 'nested/keep.txt']),
+                ('nested/*', ['nested/.gitignore', 'nested/deep', 'nested/deep/kept.txt',
+                              'nested/inner.txt', 'nested/keep.txt']),
+                ('keep.txt', ['nested/keep.txt'])]:
+            request = {'path': '.', 'pattern': pattern, 'limit': 1000}
+            baseline = [entry['path'] for entry in self.find_entries(request, backends='none')]
+            self.assertEqual(baseline, expected, pattern)
+            self.assertEqual(self.find_entries(request, backends='rg+grep'),
+                             self.find_entries(request, backends='none'), pattern)
+
+    def test_find_always_excludes_git_and_rejects_explicit_git_root(self):
+        self.build_find_matrix()
+        for extra in ({}, {'respectGitignore': True}, {'includeHidden': False}):
+            request = dict({'path': '.', 'pattern': '*', 'limit': 1000}, **extra)
+            for backends in ('rg+grep', 'none'):
+                paths = [entry['path'] for entry in self.find_entries(request, backends=backends)]
+                self.assertFalse(any(path == '.git' or path.startswith('.git/') for path in paths),
+                                 (backends, extra))
+        for target in ('.git', '.git/config'):
+            blocked = self.call('file_find', {'path': target, 'pattern': '*'})
+            self.assertEqual(blocked['error']['code'], 'PATH_NOT_ALLOWED', target)
+
+    def test_find_reports_engine_invokes_rg_and_never_grep_for_enumeration(self):
+        self.build_find_matrix()
+        with_rg = self.call('file_find', {'path': '.', 'pattern': '*.txt'}, backends='rg+grep')['result']
+        self.assertEqual(with_rg['engine'], 'ripgrep-files')
+        log = self.root / 'find-backend-calls.log'
+        env = dict(os.environ)
+        env['PATH'] = str(self.bin_rg_and_grep)
+        env['SSH_MCP_FAKE_BACKEND_LOG'] = str(log)
+        self.call_env('file_find', {'path': '.', 'pattern': '*.txt'}, env)
+        content = log.read_text()
+        # rg does the enumeration with implicit filtering disabled; the root is
+        # one argv element, never shell text.
+        self.assertTrue(content.startswith('rg --files'), content)
+        self.assertIn('--no-ignore', content)
+        self.assertIn('--hidden', content)
+        self.assertIn(str(self.work), content)
+        self.assertNotIn('\ngrep ', content)
+        # grep provides no file enumeration: a grep-only host stays on the
+        # Python walk and grep is never spawned for filename lookups.
+        log_grep = self.root / 'find-grep-calls.log'
+        env_grep = dict(os.environ)
+        env_grep['PATH'] = str(self.bin_grep_only)
+        env_grep['SSH_MCP_FAKE_BACKEND_LOG'] = str(log_grep)
+        grep_only = self.call_env('file_find', {'path': '.', 'pattern': '*.txt'}, env_grep)['result']
+        self.assertEqual(grep_only['engine'], 'python-walk')
+        if log_grep.exists():
+            self.assertEqual(log_grep.read_text(), '')
+        self.assertEqual(self.call('file_find', {'path': '.', 'pattern': '*.txt'},
+                                   backends='none')['result']['engine'], 'python-walk')
+        for backends, engine, backends_list in [
+                ('rg+grep', 'ripgrep-files', ['ripgrep-files', 'python-walk']),
+                ('grep', 'python-walk', ['python-walk']),
+                ('none', 'python-walk', ['python-walk'])]:
+            capabilities = self.call('file_workspace', {}, backends=backends)['result']['capabilities']
+            self.assertEqual(capabilities['findEngine'], engine, backends)
+            self.assertEqual(capabilities['findBackends'], backends_list, backends)
+
+    def test_find_backend_crash_falls_back_to_python_walk(self):
+        self.build_find_matrix()
+        env = dict(os.environ)
+        env['PATH'] = str(self.bin_rg_and_grep)
+        env['SSH_MCP_FAKE_BACKEND_CRASH'] = '1'
+        crashed = self.call_env('file_find', {'path': '.', 'pattern': '*', 'limit': 1000}, env)['result']
+        baseline = self.call('file_find', {'path': '.', 'pattern': '*', 'limit': 1000},
+                             backends='none')['result']
+        self.assertEqual(crashed['engine'], 'python-walk')
+        self.assertEqual(crashed['entries'], baseline['entries'])
+
+    def test_find_byte_budget_stops_enumeration_with_resumable_lossless_cursor(self):
+        for index in range(1700):
+            self.write('f{:04}.txt'.format(index), 'x')
+        first = self.call('file_find', {'path': '.', 'pattern': 'f*.txt',
+                                         'scanBudgetBytes': 64 * 1024})['result']
+        self.assertTrue(first['truncated'])
+        self.assertEqual(first['reason'], 'SCAN_BYTE_LIMIT')
+        self.assertIsNotNone(first['nextCursor'])
+        self.assertIsNone(first['totalEntries'])
+        collected = [entry['path'] for entry in first['entries']]
+        cursor, pages = first['nextCursor'], 1
+        while cursor:
+            result = self.call('file_find', {'path': '.', 'pattern': 'f*.txt',
+                                              'scanBudgetBytes': 64 * 1024,
+                                              'cursor': cursor})['result']
+            collected.extend(entry['path'] for entry in result['entries'])
+            pages += 1
+            self.assertLessEqual(pages, 5)
+            cursor = result.get('nextCursor')
+            if cursor is None:
+                self.assertFalse(result['truncated'])
+                self.assertEqual(result['totalEntries'], 1700)
+        self.assertEqual(len(collected), 1700)
+        self.assertEqual(len(set(collected)), 1700)
+
+    def test_find_time_budget_is_reported_as_partial(self):
+        # In-process test: inject a time source that expires immediately.
+        sys.path.insert(0, str(HELPER.parent))
+        import discovery
+        from files import FileService
+        self.build_find_matrix()
+        (self.root / 'state').mkdir(parents=True, exist_ok=True)
+        service = FileService(self.root / 'state', str(self.work), 'session-one')
+        original = discovery.time.monotonic
+        ticks = [0]
+
+        def fast_clock():
+            ticks[0] += 5.0
+            return ticks[0]
+        try:
+            discovery.time.monotonic = fast_clock
+            result = discovery.discover(service, 'file_find', {'path': '.', 'pattern': '*'})
+        finally:
+            discovery.time.monotonic = original
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['reason'], 'SCAN_TIME_LIMIT')
+        self.assertIsNotNone(result['nextCursor'])
+
+    def test_find_cursor_rejects_changed_query(self):
+        self.write('a.txt', 'a\n')
+        self.write('b.txt', 'b\n')
+        first = self.call('file_find', {'path': '.', 'pattern': '*', 'limit': 1})['result']
+        self.assertTrue(first['truncated'])
+        other = self.call('file_find', {'path': '.', 'pattern': '*.txt', 'limit': 1,
+                                         'cursor': first['nextCursor']})
+        self.assertEqual(other['error']['code'], 'STALE_CURSOR')
+        tighter = self.call('file_find', {'path': '.', 'pattern': '*', 'limit': 1,
+                                           'scanBudgetBytes': 128 * 1024,
+                                           'cursor': first['nextCursor']})
+        self.assertEqual(tighter['error']['code'], 'STALE_CURSOR')
+
+    def test_find_glob_contract_and_pagination_preserved(self):
+        self.build_find_matrix()
+        whole = self.call('file_find', {'path': '.', 'pattern': '*'})['result']
+        self.assertFalse(whole['truncated'])
+        self.assertIsNone(whole['nextCursor'])
+        self.assertEqual(whole['totalEntries'], len(self.FIND_ALL_DEFAULT))
+        self.assertEqual(len(whole['entries']), len(self.FIND_ALL_DEFAULT))
+        for entry in whole['entries']:
+            self.assertEqual(sorted(entry.keys()), ['path', 'size', 'type'])
+            self.assertIn(entry['type'], ('file', 'directory', 'symlink', 'other'))
+        # Page through with small limits; the union must reproduce the whole list.
+        collected, cursor = [], None
+        while True:
+            request = {'path': '.', 'pattern': '*', 'limit': 5}
+            if cursor:
+                request['cursor'] = cursor
+            result = self.call('file_find', request)['result']
+            collected.extend(entry['path'] for entry in result['entries'])
+            cursor = result.get('nextCursor')
+            if cursor is None:
+                self.assertFalse(result['truncated'])
+                break
+            self.assertTrue(result['truncated'])
+        self.assertEqual(collected, self.FIND_ALL_DEFAULT)
+        # file_list keeps its legacy contract: immediate entries, hidden by
+        # default included, .git pruned, digest-cursor pagination, no engine.
+        listing = self.call('file_list', {'path': '.', 'limit': 1000})['result']
+        names = [entry['path'] for entry in listing['entries']]
+        self.assertEqual(names, sorted(['.gitignore', '.hidden.txt', '.dotdir', 'a.txt', 'b.txt',
+                                        'visible.log', 'empty-dir', 'logs', 'build', 'nested',
+                                        'excluded', 'link']))
+        self.assertNotIn('engine', listing)
+        first_page = self.call('file_list', {'path': '.', 'limit': 3})['result']
+        second_page = self.call('file_list', {'path': '.', 'limit': 1000,
+                                               'cursor': first_page['nextCursor']})['result']
+        self.assertEqual([entry['path'] for entry in first_page['entries'] + second_page['entries']],
+                         names)
 
 
 if __name__ == '__main__':
