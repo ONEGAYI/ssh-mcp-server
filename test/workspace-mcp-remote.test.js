@@ -60,6 +60,9 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
     const transfer = await call('remote_download', { path, localPath: downloaded });
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));
+    assert.equal(transfer.data.state, 'completed', JSON.stringify(transfer.data));
+    assert.equal(transfer.data.bytesWritten, 'hello\nworld\n'.length, JSON.stringify(transfer.data));
+    assert.equal('readToken' in transfer.data, false); // downloads never grant read coverage
     assert.equal(await readFile(downloaded, 'utf8'), 'hello\nworld\n');
     const hiddenRead = await call('remote_write', { path, text: 'lost', readToken: partial.data.readToken });
     // The write schema strips the legacy readToken; the create-only default
@@ -260,6 +263,121 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
   } finally {
     await client.close().catch(() => undefined);
     await rm(localPath, { force: true });
+    await runTask(`rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
+    runtime.close();
+  }
+});
+
+it('real workspace downloads 200 MiB resumably with matching digests and no half files (issue #14)', { skip: !profile, timeout: 300000 }, async () => {
+  const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
+  const sessionId = 'mcp-' + randomUUID();
+  const remoteName = 'big-download-' + sessionId + '.bin';
+  const localPath = join((await loadWorkspaceConfig(profile)).localRoot, remoteName);
+  const runtime = await createWorkspaceRuntime(profile);
+  const client = new Client({ name: 'remote-contract', version: '1' });
+  const call = async (name, args = {}) => {
+    const result = await client.callTool({ name, arguments: { sessionId, ...args } });
+    return { error: result.isError, data: JSON.parse(result.content[0].text) };
+  };
+  const runTask = async command => {
+    const registration = await runtime.remote.call('task_register', { protocol: 2,
+      cwd: runtime.config.remoteRoot, command });
+    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+    const deadline = Date.now() + 120000;
+    for (;;) {
+      const state = await runtime.remote.call('status', { jobId: registration.jobId });
+      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
+        assert.equal(state.state, 'exited', JSON.stringify(state));
+        assert.equal(state.exitCode, 0, JSON.stringify(state));
+        return state;
+      }
+      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  };
+  const startedAt = Date.now();
+  let partial = null; // visible to the finally for temp cleanup
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
+    const size = 200 * 1024 * 1024;
+    // Generate the fixture remotely (1 MiB tile repeated) and hash it there:
+    // the remote digest is the sender's register-time truth to match against.
+    await runTask(`python3 -c "import os; t = os.urandom(1024 * 1024); ` +
+      `f = open('${remoteName}', 'wb'); [f.write(t) for _ in range(200)]; f.close()"`);
+    await runTask(`sha256sum '${remoteName}' > '${remoteName}.sha256'`);
+    const digestRead = await call('remote_read', { path: remoteName + '.sha256' });
+    assert.equal(digestRead.error, undefined, JSON.stringify(digestRead));
+    const remoteDigest = digestRead.data.text.trim().split(' ')[0];
+    // First drive stops on a small budget: durable progress, no completion,
+    // and the tool returns the persistent identifier plus bounded state.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const step = attempt === 0
+        ? await call('remote_download', { path: remoteName, localPath, budgetMs: 1000 })
+        : await call('remote_download', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
+      assert.equal(step.error, undefined, JSON.stringify(step));
+      partial = step;
+      if (partial.data.state !== 'transferring' || partial.data.budgetExhausted !== true) break;
+      if (partial.data.confirmedOffset > 0 && partial.data.confirmedOffset < size) break;
+    }
+    assert.equal(partial.data.state, 'transferring', JSON.stringify(partial.data));
+    assert.equal(partial.data.budgetExhausted, true, JSON.stringify(partial.data));
+    const confirmedBefore = partial.data.confirmedOffset;
+    assert.ok(confirmedBefore > 0 && confirmedBefore < size, 'expected a mid-transfer stop, got ' + JSON.stringify(partial.data));
+    assert.equal('readToken' in partial.data, false);
+    // Queries observe without side effects and without renewing anything.
+    const observed = await call('remote_download', { action: 'status', transferId: partial.data.transferId });
+    assert.equal(observed.data.state, 'transferring');
+    assert.equal(observed.data.confirmedOffset, confirmedBefore);
+    assert.equal(observed.data.totalBytes, size);
+    // Resume finishes the download in bounded steps, each call staying under
+    // the MCP client's 60 s request timeout; only the unconfirmed tail is
+    // ever refetched, so the summed block count pins the precision.
+    let done, refetched = 0;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const step = await call('remote_download', { action: 'resume', transferId: partial.data.transferId, budgetMs: 50000 });
+      assert.equal(step.error, undefined, JSON.stringify(step));
+      done = step;
+      refetched += done.data.blocksFetched ?? 0;
+      if (done.data.state === 'completed') break;
+      assert.equal(done.data.state, 'transferring', JSON.stringify(done.data));
+      assert.equal(done.data.budgetExhausted, true, JSON.stringify(done.data));
+    }
+    assert.equal(done.data.state, 'completed', JSON.stringify(done.data));
+    assert.equal(done.data.bytesWritten, size);
+    assert.equal(done.data.sha256, remoteDigest);
+    assert.equal('readToken' in done.data, false);
+    const expectedBlocks = Math.ceil((size - confirmedBefore) / (1024 * 1024));
+    assert.equal(refetched, expectedBlocks,
+      'resume must fetch only the unconfirmed blocks');
+    // Independent local digest over the committed target, streamed.
+    const localHash = createHash('sha256');
+    const local = await open(localPath, 'r');
+    try {
+      const buffer = Buffer.alloc(1024 * 1024);
+      for (let offset = 0; offset < size;) {
+        const read = await local.read(buffer, 0, buffer.length, offset);
+        if (!read.bytesRead) throw new Error('local download ended early');
+        localHash.update(buffer.subarray(0, read.bytesRead));
+        offset += read.bytesRead;
+      }
+    } finally { await local.close(); }
+    assert.equal(localHash.digest('hex'), remoteDigest);
+    // No formal half file: this transfer's receive temp is gone after commit.
+    // Temps of OTHER interrupted transfers are intentionally retained for
+    // their 3-day resume window, so the check is scoped to this transfer.
+    const { readdir } = await import('node:fs/promises');
+    const { dirname } = await import('node:path');
+    assert.equal((await readdir(dirname(localPath)))
+      .includes('.ssh-mcp-download-' + partial.data.transferId), false,
+      'download temp files must not remain after commit');
+    const stoppedAtMs = Date.now() - startedAt;
+    console.log('[issue #14] 200 MiB download: stopped at %d bytes, resumed %d blocks, total wall time %d ms',
+      confirmedBefore, refetched, stoppedAtMs);
+  } finally {
+    await client.close().catch(() => undefined);
+    await rm(localPath, { force: true });
+    await rm(join((await import('node:path')).dirname(localPath), '.ssh-mcp-download-' + (partial ? partial.data.transferId : '')), { force: true });
     await runTask(`rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
     runtime.close();
   }
