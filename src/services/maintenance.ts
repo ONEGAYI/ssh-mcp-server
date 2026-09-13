@@ -241,16 +241,6 @@ export class MaintenanceService {
     return true;
   }
 
-  /** Reclaim crash-leftover local ledger resources (spec 7.2, issue #17).
-   *
-   * Occupancy evidence mirrors the remote end: the holder pid decides
-   * liveness (Windows offers no boot-anchored identity; that limitation is
-   * documented on SpaceLedger), and the recorded dev:ino identity decides
-   * whether the object at the registered path is still ours. A live holder
-   * keeps everything; a dead holder releases the registration, deleting the
-   * file only when the identity matches. A never-anchored identity stays
-   * behind as management fields only; files without any registration are
-   * never this pass's business. Age never flips a verdict. */
   /** Resource ids that living transfer records still manage themselves.
    *
    * A transfer's receiver temp and its ledger entry live across many short
@@ -261,7 +251,7 @@ export class MaintenanceService {
     const managed = new Set<string>();
     let entries;
     try { entries = await readdir(this.transfersDirectory, { withFileTypes: true }); }
-    catch (error) { if (isMissing(error)) return managed; throw error; }
+    catch (error) { if (!isMissing(error)) throw error; return managed; }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       try {
@@ -272,6 +262,16 @@ export class MaintenanceService {
     return managed;
   }
 
+  /** Reclaim crash-leftover local ledger resources (spec 7.2, issue #17).
+   *
+   * Occupancy evidence mirrors the remote end: the holder pid decides
+   * liveness (Windows offers no boot-anchored identity; that limitation is
+   * documented on SpaceLedger), and the recorded dev:ino identity decides
+   * whether the object at the registered path is still ours. A live holder
+   * keeps everything; a dead holder releases the registration, deleting the
+   * file only when the identity matches. A never-anchored identity stays
+   * behind as management fields only; files without any registration are
+   * never this pass's business. Age never flips a verdict. */
   private async reclaimLedgerResources(ledger: SpaceLedger,
     policy: Awaited<ReturnType<typeof loadPolicy>>, summary: LocalSummary, deadline: number): Promise<void> {
     let resources: Record<string, Record<string, unknown>> = {};

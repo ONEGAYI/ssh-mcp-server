@@ -39,7 +39,9 @@ const MiB = 1024 * 1024;
 // Shared fixtures
 // ---------------------------------------------------------------------------
 
-/** Run one registered shell command on the remote to a checked exit 0. */
+/** Run one registered shell command on the remote to a checked exit 0.
+ * Returns the registered jobId so callers can acknowledge (and thereby
+ * make reclaimable) the task record the run leaves behind (review R10). */
 async function runTask(runtime, command, timeoutMs = 120000) {
   const registration = await runtime.remote.call('task_register', { protocol: 2,
     cwd: runtime.config.remoteRoot, command });
@@ -56,10 +58,30 @@ async function runTask(runtime, command, timeoutMs = 120000) {
         } catch { /* logs may be absent */ }
         throw new Error('remote task failed: ' + JSON.stringify(state) + '\n' + stderr);
       }
-      return state;
+      return registration.jobId;
     }
     if (Date.now() > deadline) throw new Error('remote task did not finish: ' + JSON.stringify(state));
     await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+/** Best-effort acknowledgement of every task record a case registered
+ * (review R10): acknowledged records become reclaimable by the maintenance
+ * round instead of piling up as unconfirmed terminal results. Swallows all
+ * errors -- cleanup must never mask the assertions above. */
+async function ackJobs(runtime, jobIds) {
+  for (const jobId of jobIds) {
+    await runtime.remote.call('ack', { jobId }).catch(() => undefined);
+  }
+}
+
+/** Best-effort acknowledgement of remote transfer registrations that were
+ * driven outside TransferService (the MEASURER talks to the helper
+ * directly): the helper's transfer_ack needs the registering sessionId. */
+async function ackRemoteTransfers(runtime, config, sessionId, transferIds) {
+  for (const transferId of transferIds) {
+    await runtime.remote.call('transfer_ack', { protocol: 2, transferId, sessionId,
+      workspaceRoot: config.remoteRoot }).catch(() => undefined);
   }
 }
 
@@ -112,8 +134,14 @@ it('window read, line read, search and streamed edit of a 200 MiB file move wind
   const counting = new CountingTransport(runtime.ssh);
   const countingRemote = new RemoteAgentClient(counting, config);
   const base = { workspaceRoot: config.remoteRoot, sessionId, path: remoteName };
+  const jobIds = []; // every registered task, acknowledged in finally (review R10)
+  const task = async (command, timeoutMs) => {
+    const jobId = await runTask(runtime, command, timeoutMs);
+    jobIds.push(jobId);
+    return jobId;
+  };
   try {
-    await runTask(runtime,
+    await task(
       `python3 -c "f = open('${remoteName}', 'wb'); ` +
       `[f.write(('L%d ' % i).encode('ascii') + b'x' * (64 - len('L%d ' % i) - 1) + b'\\n') for i in range(1, ${lineCount + 1})]; ` +
       `f.close()"`, 180000);
@@ -176,7 +204,10 @@ it('window read, line read, search and streamed edit of a 200 MiB file move wind
     // 200 MiB file: window-scale traffic, not whole-file traffic.
     console.log('[issue #21] all local-operation exchanges stayed under 4 MiB on a 200 MiB file');
   } finally {
-    await runTask(runtime, `rm -f '${remoteName}'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${remoteName}'`).then(jobId => jobIds.push(jobId)).catch(() => undefined);
+    // Cleanup last, all errors swallowed (review R10): the registered task
+    // records must not outlive the case as unconfirmed terminal results.
+    await ackJobs(runtime, jobIds);
     runtime.close();
   }
 });
@@ -264,6 +295,7 @@ elif kind == 'upload':
     committed = call('transfer_commit', {'protocol': 2, 'transferId': registered['transferId']})
     info['bytesWritten'] = committed.get('bytesWritten')
     info['blocks'] = index
+    info['transferId'] = registered['transferId']
 elif kind == 'download':
     registered = call('transfer_register', {'protocol': 2, 'direction': 'download',
         'targetPath': 'receiver-side (not this host)', 'chunkSize': CHUNK,
@@ -297,6 +329,7 @@ elif kind == 'download':
     call('transfer_commit', {'protocol': 2, 'transferId': registered['transferId']})
     info['received'] = received
     info['blocks'] = index
+    info['transferId'] = registered['transferId']
 else:
     raise RuntimeError('unknown plan kind ' + kind)
 
@@ -351,6 +384,12 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
   const localDownloads = { 20: join(config.localRoot, `mem21-${sessionId}-20-dl.bin`),
     200: join(config.localRoot, `mem21-${sessionId}-200-dl.bin`) };
   const markerOf = { 20: null, 200: null };
+  // Bookkeeping for the finally cleanup (review R10): every task record and
+  // transfer registration this case creates is acknowledged afterwards so
+  // the shared VM workspace is not polluted across runs.
+  const jobIds = [];
+  const drivenTransferIds = []; // transfers driven through the real TransferService
+  const measuredTransferIds = []; // transfers the MEASURER registered directly
 
   /** Execute one remote measurement plan through the registered-task path. */
   const measureRemotely = async plan => {
@@ -359,6 +398,7 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
       `'${config.remoteStateDir}' '${config.remoteRoot}' '${sessionId}' ${planB64}`;
     const registration = await runtime.remote.call('task_register', { protocol: 2,
       cwd: runtime.config.remoteRoot, command });
+    jobIds.push(registration.jobId);
     await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
     const deadline = Date.now() + 300000;
     for (;;) {
@@ -371,7 +411,9 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
         }
         const output = await runtime.remote.call('output', { jobId: registration.jobId });
         const stdout = Buffer.from(output.stdout.data, 'base64').toString('utf8');
-        return JSON.parse(stdout.trim().split('\n').pop());
+        const measured = JSON.parse(stdout.trim().split('\n').pop());
+        if (measured.transferId) measuredTransferIds.push(measured.transferId);
+        return measured;
       }
       if (Date.now() > deadline) throw new Error('measurer task did not finish: ' + JSON.stringify(state));
       await new Promise(resolve => setTimeout(resolve, 250));
@@ -400,11 +442,11 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
       const patchAt = Math.floor(totalLines / 2);
       const marker = ('M' + patchAt + ' UNIQUE-MARKER FOR EDIT MEASUREMENT').slice(0, 60);
       markerOf[mib] = marker;
-      await runTask(runtime,
+      jobIds.push(await runTask(runtime,
         `python3 -c "f = open('${names[mib]}', 'wb'); ` +
         `[f.write((('${marker}' + 'x' * (63 - len('${marker}')) + chr(10)).encode('ascii')) if i == ${patchAt} else ` +
         `(('L%d ' % i).encode('ascii') + b'x' * (64 - len('L%d ' % i) - 1) + b'\\n')) for i in range(1, ${totalLines + 1})]; ` +
-        `f.close()"`, 240000);
+        `f.close()"`, 240000));
       const meta = await runtime.remote.call('file_read', { workspaceRoot: config.remoteRoot,
         sessionId, path: names[mib], metadataOnly: true });
       assert.equal(meta.size, mib * MiB, names[mib]);
@@ -465,12 +507,14 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
         { localPath: localUploads[mib], path: uploaded[mib] + '.local.bin', budgetMs: 400000 }));
       assert.equal(up.result.state, 'completed', JSON.stringify(up.result));
       assert.equal(up.result.sha256, digestOf(size));
+      drivenTransferIds.push(up.result.transferId);
       local['upload' + mib] = up;
       const down = await withMemorySampling(() => transfers.download(sessionId,
         { path: uploaded[mib] + '.local.bin', localPath: localDownloads[mib], budgetMs: 400000 }));
       assert.equal(down.result.state, 'completed', JSON.stringify(down.result));
       assert.equal(down.result.sha256, digestOf(size));
       assert.equal(await hashFile(localDownloads[mib]), digestOf(size));
+      drivenTransferIds.push(down.result.transferId);
       local['download' + mib] = down;
     }
     for (const op of ['upload', 'download']) {
@@ -482,10 +526,21 @@ it('20 vs 200 MiB operations keep incremental peak memory bounded on both ends (
       'sampled every 50 ms while the real TransferService drove the transfer, baseline subtracted.');
   } finally {
     await runTask(runtime, `rm -f '${names[20]}' '${names[200]}' '${uploaded[20]}' '${uploaded[200]}' ` +
-      `'${uploaded[20]}.local.bin' '${uploaded[200]}.local.bin'`).catch(() => undefined);
+      `'${uploaded[20]}.local.bin' '${uploaded[200]}.local.bin'`)
+      .then(jobId => jobIds.push(jobId)).catch(() => undefined);
     for (const target of [...Object.values(localUploads), ...Object.values(localDownloads)]) {
       await rm(target, { force: true }).catch(() => undefined);
     }
+    // Cleanup last, all errors swallowed (review R10): acknowledge the
+    // transfer registrations (local mirrors + remote records, including the
+    // MEASURER's direct helper registrations) and every task record, so the
+    // shared VM workspace does not accumulate reclaim-blocking residue like
+    // the 125-task/35-transfer pollution seen in the wt21 workspace.
+    for (const transferId of drivenTransferIds) {
+      await transfers.acknowledge(sessionId, transferId).catch(() => undefined);
+    }
+    await ackRemoteTransfers(runtime, config, sessionId, measuredTransferIds);
+    await ackJobs(runtime, jobIds);
     runtime.close();
   }
 });
@@ -546,11 +601,28 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
   const localPath = join(config.localRoot, `rec21-${sessionId}-dl.bin`);
   const uploadLocal = join(config.localRoot, `rec21-${sessionId}-up.bin`);
   const uploadRemote = `rec21-${sessionId}-up.bin`;
+  // Cleanup bookkeeping (review R10): surfaced so the finally block can
+  // acknowledge the transfers even when the drill fails midway, plus every
+  // task record the case registers.
+  let downloadId = null;
+  let uploadId = null;
+  const jobIds = [];
+  const task = async (command, timeoutMs) => {
+    const jobId = await runTask(runtime, command, timeoutMs);
+    jobIds.push(jobId);
+    return jobId;
+  };
+  const ackTransferQuiet = id => {
+    if (!id) return;
+    // A quiet CLI ack: cleanup must never fail the case (review R10).
+    spawnSync(process.execPath, [jobJsPath(), 'transfer', 'ack', '--transfer-id', id,
+      '--workspace', profile, '--session', sessionId], { encoding: 'utf8', timeout: 60000 });
+  };
 
   try {
     // ================= download direction =================================
     const blocks = Math.floor(size / chunk);
-    await runTask(runtime, `python3 -c "t = bytes(range(256)) * 4096; ` +
+    await task(`python3 -c "t = bytes(range(256)) * 4096; ` +
       `f = open('${remoteName}', 'wb'); [f.write(t) for _ in range(${blocks})]; f.close()"`, 240000);
     const expected = tileDigest(size);
 
@@ -559,6 +631,7 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
     const start = invokeSync('transfer', 'start', '--direction', 'download', '--remote', remoteName,
       '--local', localPath, '--budget', '3000');
     const transferId = start.transferId;
+    downloadId = transferId;
     assert.ok(['transfer-started', 'transfer-result'].includes(start.kind), start.kind);
     const firstOffset = start.confirmedOffset;
     assert.ok(firstOffset > 0 && firstOffset < size, 'expected a partway stop, got ' + JSON.stringify(start));
@@ -611,20 +684,20 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
     const uploadStart = invokeSync('transfer', 'start', '--direction', 'upload', '--remote', uploadRemote,
       '--local', uploadLocal, '--budget', '3000');
     assert.ok(['transfer-started', 'transfer-result'].includes(uploadStart.kind), uploadStart.kind);
-    const uploadId = uploadStart.transferId;
+    uploadId = uploadStart.transferId;
     const uploadFirst = uploadStart.confirmedOffset;
     assert.ok(uploadFirst > 0 && uploadFirst < size, 'expected a partway upload stop: ' + JSON.stringify(uploadStart));
 
     // Torn half-block on the remote end: corrupt 16 bytes inside the last
     // confirmed block AND leave unconfirmed trailing bytes in the temp. The
     // heal must rewind to the last trusted boundary and retransfer from there.
-    await runTask(runtime,
+    await task(
       `python3 -c "p = '${config.remoteRoot}/.ssh-mcp-upload-${uploadId}'; ` +
       `f = open(p, 'r+b'); f.seek(${uploadFirst} - 512); d = f.read(16); ` +
       `f.seek(${uploadFirst} - 512); f.write(bytes(b ^ 0xff for b in d)); ` +
       `f.seek(${uploadFirst}); f.write(b'z' * 300000); f.close()"`);
     // No formal target exists while the upload is interrupted.
-    await runTask(runtime, `test ! -e '${uploadRemote}'`);
+    await task(`test ! -e '${uploadRemote}'`);
 
     // Kill a resuming driver mid-flight, then let a fresh process finish.
     const killedUp = cliJob(['transfer', 'resume', '--transfer-id', uploadId, '--budget', '400000'], sessionId);
@@ -646,11 +719,11 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
     const uploadRemaining = Math.ceil((size - uploadResumedAt) / chunk);
     assert.ok(uploadDone.blocksSent <= uploadRemaining + 1,
       `upload resume sent ${uploadDone.blocksSent} blocks but only ${uploadRemaining} (+1) remained`);
-    await runTask(runtime, `sha256sum '${uploadRemote}' > '${uploadRemote}.sha256'`);
+    await task(`sha256sum '${uploadRemote}' > '${uploadRemote}.sha256'`);
     const digestRead = await runtime.remote.call('file_read', { workspaceRoot: config.remoteRoot,
       sessionId, path: uploadRemote + '.sha256' });
     assert.equal(digestRead.text.trim().split(' ')[0], expected, 'the remote committed target matches');
-    await runTask(runtime, `test ! -e '.ssh-mcp-upload-${uploadId}'`,
+    await task(`test ! -e '.ssh-mcp-upload-${uploadId}'`,
       'the upload temp is released after the commit');
     invokeSync('transfer', 'ack', '--transfer-id', uploadId);
     console.log('[issue #21] 128 MiB upload recovery: stopped at %d B, healed+resumed at %d B, resent %d blocks (bound %d)',
@@ -658,8 +731,21 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
   } finally {
     await rm(localPath, { force: true }).catch(() => undefined);
     await rm(uploadLocal, { force: true }).catch(() => undefined);
-    await runTask(runtime, `rm -f '${remoteName}' '${uploadRemote}' '${uploadRemote}.sha256'`)
-      .catch(() => undefined);
+    // Fault-injection leftovers the drill may not have settled: the receive
+    // temp of a download that never finished and the remote upload temp of a
+    // drive that died before the heal (review R10).
+    if (downloadId) {
+      await rm(join(config.localRoot, '.ssh-mcp-download-' + downloadId), { force: true }).catch(() => undefined);
+    }
+    await runTask(runtime, `rm -f '${remoteName}' '${uploadRemote}' '${uploadRemote}.sha256'` +
+      (uploadId ? ` '.ssh-mcp-upload-${uploadId}'` : ''))
+      .then(jobId => jobIds.push(jobId)).catch(() => undefined);
+    // Cleanup last, all errors swallowed (review R10): acknowledge both
+    // transfers (even on a midway failure) and every task record so the
+    // shared VM workspace is not polluted for later runs.
+    ackTransferQuiet(downloadId);
+    ackTransferQuiet(uploadId);
+    await ackJobs(runtime, jobIds);
     runtime.close();
   }
 });
