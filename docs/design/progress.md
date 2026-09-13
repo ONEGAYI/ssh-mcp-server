@@ -1,5 +1,23 @@
 # 实施进展与验证证据
 
+## 2026-09-13 后半票据审查轮 1：缺陷修复与验证
+
+对 ecc8bcc..e1c838d（票据 #15–#21 六票）三子代理独立审查 + 主代理逐项源码核实：确认 P2×3、P3×14（含测试健壮性），误报 1 项（numberOption 已拒 NaN），合并修复后全档验证。修复明细：
+
+**P2**
+- R1 上传本机传输记录无 expiresAt 永不回收 + 远端记录被 #16 回收后 resume/cancel 不收敛（僵尸 pending 误导恢复钩子）：upload 注册/resume 写 TTL，远端 REQUEST_EXPIRED_OR_UNKNOWN 时本机 failLocal 收敛为 terminal（可 ack 可按 30 天回收）
+- R2 下载 commit 双证据不足折叠为 failed 进入可确认集合（unknown 防线死代码）：改写 state=unknown，resume/cancel/acknowledge 拒绝分支激活，按非终态 TTL 回收
+- R3 空间汇总两端 maintenance.lastCompletedAt 单位差 1000 倍（本机毫秒/远端秒）且本机缺 lastRunAt：组装层秒→毫秒归一（<1e11 判秒），本机每轮持久化 lastRunAt，契约写明毫秒单位
+
+**P3（实现修复）**：R4a reads 段非 dict JSON 防护；R4b 维护游标段捕获 AgentError（单项失败不再中止整轮，LOCK_SWITCH_BLOCKED/STORAGE_FULL 等软卡死消除）；R7 远端释放顺序改先删文件后注销账本（失败留可重试登记而非无主孤儿）；R6 本机维护远端调用传 timeoutMs=max(60s, 预算+15s)（大预算配置不再被 SSH 30s 默认超时杀成失败循环）；R8 维护锁半写（ENOSPC）自愈；R9 损坏 ack.json 留 pending+INVALID_ACKNOWLEDGEMENT；R12 维护失败 5 分钟退避（离线时不再每工具调用叠加连接超时；连续失败窗口过后仍重试，离线补做语义保留）；R10 largefile-acceptance 三用例 finally 补任务/传输 ack 与注入 temp 清理；C-07 index token_key 32-hex 校验；F7 LAZY_ACTIONS 单一来源；F6 JSDoc 归位；F3 懒清理时序契约措辞对齐实现（查询结果计算完成后同步执行，至多一轮预算延迟——客户端经 exec 通道按进程交付，改时序零收益）
+
+**P3（测试健壮性）**：三个 VM 门控用例（#17 凭据、#16 传输到期、#16 日志/记录两层）单轮摘要断言在脏工作区暴露游标语义脆弱（懒清理/前一轮把游标推过目标名，最坏下一轮环绕后回收）——改为有界三轮收敛断言。过期凭据的失效由读取路径 expiresAt 即时判定，物理回收延迟一轮只是空间问题
+
+**不修记档**：本机锁偷取 TOCTOU 窗口（narrowing 后仍存，双持幂等无实害，与 space-ledger 同款平台局限）；Windows PID 复用可致维护 busy（无 boot 锚定可用，误判方向只是停回收）；维护轮每条目双重 fsync 与 helpers 段逐 digest /proc 扫描效率（正确性无影响）；远端 policy.json 维护参数 float 未按请求侧严格 int 校验（无现实调用方写 float）
+
+**验证（2026-09-13，f44ab35）**：npm 287 项（270 通过/0 失败/17 门控跳过）；WSL 七 Python 套件全 OK（reclaim 27 含新增 6 用例）；VM（wt21，脏工作区状态）三文件分开串行 workspace-mcp-remote 5/5、job-cli-remote 8/8、largefile-acceptance 4/4。修复均有先红后绿证据（见各 fix 提交）。
+
+
 ## 2026-09-13 #21 合并注记：终验工作区状态重置与分段预算特征
 
 合并 #21 时 VM job-cli-remote 首跑失败（TRANSFER_LIMIT_REACHED，工作区已有 2 个活动传输；维护轮 itemsConsidered=100 不止）。核实为终验代理开发迭代在 wt21 工作区累积的 125 条任务记录与 35 条传输记录（测试时钟下未到期、故障注入用例留下的中断传输占满并发槽），非代码缺陷；删除该工作区 jobs/transfers/reads/ledger/maintenance.json（保留 helper 与 protocol.json）后三文件串行 5/5、8/8、4/4 全绿，且 largefile→job-cli 顺序复验 8/8 无交叉污染。两点启示：一是探针工作区多轮大文件调试后需重置状态目录再验收（VM 测试不重置远端状态）；二是维护轮五段共享同一预算，jobs 段大量积压时会推迟 transfers/reads 等段回收多轮（游标逐轮推进，设计内行为），现场运维若见回收滞后可连续多轮 maintain 或清理积压任务。
