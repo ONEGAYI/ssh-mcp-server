@@ -140,12 +140,25 @@ export class SpaceLedger {
 
   /** Steal the lock only from a holder proven dead; never on timeout alone. */
   private async reclaimDeadHolder(): Promise<void> {
+    let holderPid: unknown;
     try {
-      const holder = JSON.parse(await readFile(this.lockPath(), "utf8"));
-      if (typeof holder.pid === "number" && processAlive(holder.pid)) return;
-    } catch (error) {
-      if (isMissing(error)) return; // released between the check and the read
-      return; // unreadable holder: treat as held and keep waiting
+      holderPid = JSON.parse(await readFile(this.lockPath(), "utf8"))?.pid;
+    } catch {
+      return; // released between the check and the read, or unreadable: keep waiting
+    }
+    if (typeof holderPid === "number" && processAlive(holderPid)) return;
+    // TOCTOU narrowing: between the death verdict above and the unlink below,
+    // another process may have reclaimed the lock already and written its own
+    // pid; unlinking then would delete the new holder's lock file and let two
+    // processes hold the ledger at once. Re-read and unlink only while the
+    // file still names the pid we just judged dead. A millisecond-scale
+    // window remains (this read and the unlink are separate steps); the
+    // complete fix is a unique lock name per attempt plus an atomic rename,
+    // deliberately deferred.
+    try {
+      if (JSON.parse(await readFile(this.lockPath(), "utf8"))?.pid !== holderPid) return;
+    } catch {
+      return; // released or unreadable meanwhile: keep waiting
     }
     await unlink(this.lockPath()).catch(error => { if (!isMissing(error)) throw error; });
   }
@@ -266,19 +279,29 @@ export class SpaceLedger {
     if (reservationId !== undefined) requireId(reservationId, "reservationId");
     const resourceId = randomUUID().replaceAll("-", "");
     return this.withLedger(async state => {
+      // A cited reservation must exist before any quota arithmetic: a stale
+      // id is RESOURCE_NOT_FOUND regardless of the remaining quota headroom.
+      const reservation = reservationId !== undefined
+        ? state.reservations[reservationId] ?? null
+        : null;
+      if (reservationId !== undefined && reservation === null) {
+        throw new RemoteAgentError("RESOURCE_NOT_FOUND", "Reservation is not registered or was fully consumed");
+      }
       const summary = await this.summary(state);
-      this.requireQuota(summary, bytes);
-      if (reservationId !== undefined) {
-        const reservation = state.reservations[reservationId];
-        if (!reservation) {
-          throw new RemoteAgentError("RESOURCE_NOT_FOUND", "Reservation is not registered or was fully consumed");
-        }
+      // The reservation's bytes are already inside summary.usedBytes, so
+      // charging the full amount again would double count. Only the growth
+      // beyond the cited reservation may consume quota: redeeming a
+      // reservation that exactly fits is net zero even at the limit. This
+      // mirrors the remote helper's net-delta check (remote/ledger.py).
+      const net = reservation === null ? bytes : Math.max(0, bytes - reservation.bytes);
+      this.requireQuota(summary, net);
+      if (reservation !== null && reservationId !== undefined) {
         reservation.bytes -= bytes;
         if (reservation.bytes <= 0) delete state.reservations[reservationId];
       }
       state.resources[resourceId] = { kind: "temp-file", path, bytes, identity: null,
         holderPid: process.pid, origin, reservationId: reservationId ?? null, createdAt: Date.now() };
-      return { resourceId, usedBytes: summary.usedBytes + bytes, limitBytes: this.limitBytes };
+      return { resourceId, usedBytes: summary.usedBytes + net, limitBytes: this.limitBytes };
     });
   }
 

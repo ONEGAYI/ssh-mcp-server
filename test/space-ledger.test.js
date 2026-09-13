@@ -91,6 +91,28 @@ it('registering a resource consumes the reservation it cites without double coun
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+it('redeeming a reservation that exactly fills the quota is a net-zero change', async () => {
+  assert.ok(SpaceLedger);
+  const root = await fixture();
+  try {
+    const ledger = new SpaceLedger(join(root, 'ledger'), 4096);
+    const { reservationId } = await ledger.reserve(4096, 'exact fit');
+    // The reservation already holds the entire quota; redeeming it for the
+    // same byte count must not charge the amount a second time on top of the
+    // reservation still being counted inside usedBytes.
+    const result = await ledger.register(join(root, 'exact.part'), 4096, 'local-transfer', reservationId);
+    assert.equal(result.usedBytes, 4096); // exactly at the limit, neither 8192 nor rejected
+    const usage = await ledger.usage();
+    assert.equal(usage.tempBytes, 4096);
+    assert.equal(usage.reservedBytes, 0);
+    assert.equal(usage.usedBytes, 4096);
+    // A cited reservation that never existed stays RESOURCE_NOT_FOUND even
+    // when the ledger is at its limit and the quota check would fire first.
+    await assert.rejects(ledger.register(join(root, 'ghost.part'), 10, 'local-transfer', 'a'.repeat(32)),
+      error => error.code === 'RESOURCE_NOT_FOUND');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it('rejects invalid ledger input with explicit codes', async () => {
   assert.ok(SpaceLedger);
   const root = await fixture();
@@ -118,6 +140,21 @@ it('a stale lock left by a dead holder is reclaimed, never while the holder live
     const ledger = new SpaceLedger(directory, 1 << 20);
     const reservation = await ledger.reserve(512, 'after stale lock');
     assert.match(reservation.reservationId, /^[0-9a-f]{32}$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('a lock held by a live process times out to LEDGER_BUSY without being stolen', async () => {
+  assert.ok(SpaceLedger);
+  const root = await fixture();
+  const directory = join(root, 'ledger');
+  try {
+    await mkdir(directory, { recursive: true });
+    // This test process is alive: its lock must be respected, never stolen.
+    await writeFile(join(directory, 'ledger.lock'), JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+    const ledger = new SpaceLedger(directory, 1 << 20);
+    await assert.rejects(ledger.reserve(512, 'locked out'), error => error.code === 'LEDGER_BUSY');
+    const holder = JSON.parse(await readFile(join(directory, 'ledger.lock'), 'utf8'));
+    assert.equal(holder.pid, process.pid); // untouched, not deleted by the waiter
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
