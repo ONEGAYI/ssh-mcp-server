@@ -273,6 +273,17 @@ export class TransferService {
       offset = confirmed.confirmedOffset;
       blocksSent += 1;
     }
+    // All blocks are confirmed now, but verify and commit each spend up to a
+    // full exchange timeout (60 s apiece); running them past the deadline
+    // would let one call overshoot budgetMs by up to two exchanges. With the
+    // budget already spent, return bounded progress instead -- resume skips
+    // the (empty) block loop and goes straight to verify/commit.
+    if (Date.now() >= deadline) {
+      return { transferId: record.transferId, direction: "upload", state: "transferring",
+        path: record.remotePath, localPath: record.localPath, totalBytes, confirmedOffset: offset,
+        blocksSent, budgetExhausted: true,
+        message: "Upload budget exhausted after the last confirmed block; call remote_upload with action=resume and this transferId to run the final verify and commit" };
+    }
     // Both ends now hold the same full content; verify streams the digest
     // remotely, commit publishes through the issue #10 skeleton.
     await this.raw("transfer_verify", sessionId, { protocol: 2, transferId: record.transferId });

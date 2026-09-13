@@ -345,6 +345,38 @@ it('budget exhaustion returns bounded progress and resume finishes without re-se
   } finally { await fake.cleanup(); }
 });
 
+it('budget exhaustion right after the last block defers verify and commit to resume', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const data = Buffer.alloc(CHUNK * 3, 0x66);
+    const source = await writeSource(fake.workspace, 'tail-' + randomUUID() + '.bin', data);
+    fake.blockDelayMs = 400;
+    // Three 400 ms blocks cross the 1000 ms budget only after the last block
+    // confirms (the third pre-block checkpoint sits at ~800 ms), so the block
+    // loop completes and only the verify/commit tail is left unaffordable.
+    const partial = await transfers.upload('session-a', {
+      localPath: source.target, path: 'tail-dest.bin', chunkSize: CHUNK, budgetMs: 1000,
+    });
+    assert.equal(partial.state, 'transferring');
+    assert.equal(partial.budgetExhausted, true);
+    assert.equal(partial.confirmedOffset, data.length); // every block already confirmed
+    assert.equal(partial.blocksSent, 3);
+    const uploadExchanges = fake.exchanges.slice(); // snapshot before resume
+    const uploadActions = uploadExchanges.map(exchange => exchange.action);
+    assert.ok(!uploadActions.includes('transfer_verify'), 'verify must stay inside the budget');
+    assert.ok(!uploadActions.includes('transfer_commit'), 'commit must stay inside the budget');
+    fake.blockDelayMs = 0;
+    const done = await transfers.resume('session-a', partial.transferId);
+    assert.equal(done.state, 'completed');
+    assert.equal(done.blocksSent, 0); // nothing left to send; resume only verifies and commits
+    assert.equal(done.sha256, createHash('sha256').update(data).digest('hex'));
+    const resumedActions = fake.exchanges.slice(uploadExchanges.length).map(exchange => exchange.action);
+    assert.deepEqual(resumedActions, ['transfer_resume', 'transfer_verify', 'transfer_commit']);
+    const committed = await readFile(join(fake.workspace, 'tail-dest.bin'));
+    assert.ok(committed.equals(data));
+  } finally { await fake.cleanup(); }
+});
+
 it('a changed local source refuses to resume the original transfer', async () => {
   const { fake, transfers } = await buildHarness();
   try {
