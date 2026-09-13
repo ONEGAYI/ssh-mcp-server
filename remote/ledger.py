@@ -244,13 +244,21 @@ def register(root, request):
     resource_id = uuid.uuid4().hex
     with ledger_lock(root):
         ledger = load(root)
-        limit = space_limit(root)
-        summary = _sums(root, ledger)
-        _require_quota(summary, limit, requested)
+        reservation = None
         if reservation_id is not None:
+            # Existence first: a dangling reservation id must surface as
+            # RESOURCE_NOT_FOUND, never leak into a quota verdict.
             reservation = ledger['reservations'].get(reservation_id)
             if reservation is None:
                 raise AgentError('RESOURCE_NOT_FOUND', 'Reservation is not registered or was fully consumed')
+        # The summary already counts the cited reservation inside reservedBytes,
+        # so both the quota gate and the reported usage move by the net increase
+        # only -- the full amount on top of the reservation would double count.
+        net = requested if reservation is None else max(0, requested - reservation['bytes'])
+        limit = space_limit(root)
+        summary = _sums(root, ledger)
+        _require_quota(summary, limit, net)
+        if reservation is not None:
             reservation['bytes'] -= requested
             if reservation['bytes'] <= 0:
                 del ledger['reservations'][reservation_id]
@@ -260,7 +268,7 @@ def register(root, request):
                                             'session': session, 'origin': origin,
                                             'reservationId': reservation_id, 'createdAt': time.time()}
         save(root, ledger)
-    return {'resourceId': resource_id, 'usedBytes': summary['usedBytes'] + requested, 'limitBytes': limit}
+    return {'resourceId': resource_id, 'usedBytes': summary['usedBytes'] + net, 'limitBytes': limit}
 
 
 def register_temp(root, path, byte_count, session, origin):
