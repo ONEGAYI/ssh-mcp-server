@@ -24,8 +24,9 @@ TERMINAL = frozenset(('exited', 'cancelled', 'interrupted'))
 # the worker re-checks the workspace quota (spec 7.2) before saving more.
 LOG_QUOTA_CHECK_BYTES = 1024 * 1024
 # Query actions that also trigger a throttled lazy reclamation round (#16).
-LAZY_ACTIONS = frozenset(('status', 'output', 'transfer_status',
-                          'file_read', 'file_list', 'file_find', 'file_search'))
+# Single definition lives in reclaim.py; importing keeps the copies from
+# drifting apart when an action is added or renamed.
+from reclaim import LAZY_ACTIONS
 
 
 def process_identity(pid):
@@ -558,8 +559,12 @@ def main():
     else:
         raise AgentError('UNSUPPORTED_ACTION', 'Unknown helper action')
     if args.action in LAZY_ACTIONS:
-        # Opportunistic bounded reclamation after the query's own result is
-        # settled (spec 7.2): cleanup must never fail or delay the answer.
+        # Opportunistic bounded reclamation: the query's own result is already
+        # computed and this runs synchronously before the response is emitted
+        # (spec 7.2). Cleanup failure never fails the query itself; the SSH
+        # exec channel delivers output by process exit, so a query inside the
+        # first 60-second throttle window carries this bounded delay (at most
+        # one round's maintenance budget, 2 seconds by default).
         from reclaim import lazy_attempt
         lazy_attempt(root)
     emit({'ok': True, 'result': result})

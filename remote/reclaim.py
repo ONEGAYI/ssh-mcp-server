@@ -341,20 +341,28 @@ def _process_transfer(root, name, periods, now, summary):
 
 
 def _release_transfer_temp(root, record):
-    """Release the stopped transfer's temp and ledger entry; False on doubt."""
+    """Delete the stopped transfer's temp, then release its ledger entry.
+
+    File first, ledger second (same order as transfer.py's _release_temp and
+    the local end's resetLocalTemp): an unlink failure or a crash between the
+    two steps keeps the registration alive, so the retry re-releases
+    idempotently instead of leaving an ownerless temp the ledger-driven
+    generic resource pass would never revisit. False-on-doubt is preserved:
+    after a successful unlink with a failed release the caller keeps the
+    record and the next round retries the idempotent release."""
     import ledger
-    resource_id = record.get('resourceId')
-    if resource_id:
-        try:
-            ledger.release(root, resource_id)
-        except AgentError:
-            return False
     temp = record.get('tempPath')
     if temp:
         try:
             os.unlink(temp)
         except FileNotFoundError:
             pass
+    resource_id = record.get('resourceId')
+    if resource_id:
+        try:
+            ledger.release(root, resource_id)
+        except AgentError:
+            return False
     return True
 
 
@@ -376,16 +384,26 @@ def _process_read_entry(root, name, now, summary):
     path = reads / name
     if name.startswith('index-'):
         try:
-            token_key = read_json(path).get('readToken')
+            index = read_json(path)
         except (OSError, ValueError):
             return
-        if not isinstance(token_key, str):
+        if not isinstance(index, dict):
+            # Valid JSON but not an object is corrupt (jobs/transfers rule):
+            # skipped, never fatal for the round.
+            return
+        token_key = index.get('readToken')
+        if not isinstance(token_key, str) or not re.fullmatch(r'[a-f0-9]{32}', token_key):
+            # The key feeds a path join: only a real 32-hex token key ever
+            # materializes into a path (same guard as transferId); anything
+            # else -- including traversal attempts -- is corrupt and skipped.
             return
         token_path = reads / (token_key + '.json')
         if token_path.is_file():
             try:
                 record = read_json(token_path)
             except (OSError, ValueError):
+                return
+            if not isinstance(record, dict):
                 return
             if now <= record.get('expiresAt', 0):
                 return  # live credential: its index stays
@@ -398,6 +416,10 @@ def _process_read_entry(root, name, now, summary):
     try:
         record = read_json(path)
     except (OSError, ValueError):
+        return
+    if not isinstance(record, dict):
+        # Valid JSON but not an object is corrupt (jobs/transfers rule):
+        # skipped, never fatal for the round.
         return
     if now > record.get('expiresAt', 0):
         try:
@@ -563,8 +585,13 @@ def _run_cursor_section(root, state, cursor_key, names, process,
             return items, True
         try:
             process(name)
-        except OSError:
-            pass  # one unreadable entry never aborts the round
+        except (OSError, AgentError):
+            # One unreadable or refused entry (e.g. LOCK_SWITCH_BLOCKED from
+            # ensure_slot_protocol, INVALID_REQUEST/STORAGE_FULL from the
+            # ledger) never aborts the round: the cursor advances past it so
+            # a permanently broken entry is skipped instead of stalling the
+            # remaining entries and every later section, round after round.
+            pass
         items += 1
         state[cursor_key] = name
         _save_maintenance_state(root, state)
