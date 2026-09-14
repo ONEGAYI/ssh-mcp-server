@@ -12,7 +12,7 @@
 - 保留边界：用户已人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
-- **分发纪律**：对外分发一律使用 `scripts/package-offline.mjs` 生成的离线目录包（含 Node 运行时与全部依赖）；不提供轻量分发包（package-dist 已于 2026-09-14 移除）。
+- **分发纪律**：对外分发一律使用 `scripts/package-offline.mjs` 生成的离线目录包（含 Node 运行时与全部依赖）；不提供轻量分发包（package-dist 已于 2026-09-14 移除）。每次版本发布（`gh release create`）必须附带对应版本的离线包资产：先 `npm run build`，再打包输出到 `ssh-mcp-<版本>-offline` 目录并压缩为同名 zip 上传 Release（先例：v2.0.1、v2.1.0）；只发 CHANGELOG 不附包不算发布完成。
 - 功能实施遵守测试先行。用户已授权创建个人 fork 并推送，变更通过 fork 内的 PR 审阅；未授权直接合并或向上游提交 PR。
 - `AGENTS.md` 为通用规则入口；`CLAUDE.md` 仅导入并附加专属规则。
 
