@@ -117,8 +117,8 @@ Agent 会先调用工具获取缺项，再向你询问：
 
 - 生成本机工作区的 `.ssh-mcp-workspace.json`；提供 `bindingName` 时生成独立的 `.ssh-mcp-workspace.<名称>.json`。
 - 合并项目 MCP 和恢复钩子到 `.zcode/config.json`，保留已有服务与规则；每个绑定一个 `ssh-workspace-*` MCP 服务和一个恢复钩子。
-- 准备已随包附带的后台命令入口及 Agent 操作指引。
-- 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`（命名绑定为 `.ssh-mcp-connection.<名称>.json`）；只记录连接参数，不复制私钥。
+- 合并生成项目级 ZCode MCP 与恢复钩子接入配置（Agent 操作指引由工作区 MCP 的 remote_help 按需提供，不再写任何 markdown）。
+- 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`（命名绑定为 `.ssh-mcp-connection.<名称>.json`）；只记录连接参数，不复制私钥。建议把 `.ssh-mcp-*.json` 加入本项目 `.gitignore`——它们含主机与认证参数，不宜入库（setup 不代改 .gitignore）。旧版本曾生成的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md，若内容仍与已知生成文本一致，会在重新 configure 时自动回收并在返回中报告；用户改过的文件保留不动。
 
 不需要手工运行 setup 脚本。成功返回中的 `sshVerified=false` 表示**配置已准备好，但还没有验证远端连接**。
 
