@@ -15,17 +15,21 @@ it('setup merges project MCP/hooks idempotently and preserves existing rules', a
     await mkdir(join(root, '.zcode'));
     await writeFile(join(root, '.zcode', 'config.json'), JSON.stringify({ mcp: { servers: { existing: { command: 'keep' } } }, hooks: { events: { Stop: [] } } }));
     await writeFile(join(root, 'AGENTS.md'), 'keep rules');
+    let last;
     for (let i = 0; i < 2; i++) {
       const run = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/setup-workspace.mjs', import.meta.url)), '--workspace', profile, '--apply'], { encoding: 'utf8', timeout: 10000 });
       assert.equal(run.status, 0, run.stderr);
+      last = run.stdout;
     }
-    const config = JSON.parse(await readFile(join(root, '.zcode', 'config.json'), 'utf8'));
+    const config = JSON.parse(await readFile(join(root, '.zcode/config.json'), 'utf8'));
     assert.equal(config.mcp.servers.existing.command, 'keep');
     assert.ok(config.mcp.servers['ssh-workspace-test']);
     assert.equal(config.hooks.events.UserPromptSubmit.length, 1);
     assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), 'keep rules');
     // Issue #31: CLAUDE.md is no longer generated; user files stay untouched.
     await assert.rejects(readFile(join(root, 'CLAUDE.md')), { code: 'ENOENT' });
+    // The manual CLI path carries the same .ssh-mcp-*.json gitignore suggestion.
+    assert.match(JSON.parse(last).note, /gitignore/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

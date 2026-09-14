@@ -306,7 +306,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     directoryScope: input.directoryScope === "unrestricted" ? "unrestricted" : "restricted",
     hooksInstalled: true, sshVerified: false,
     ...(integration.legacyDocs ? { legacyDocs: integration.legacyDocs } : {}),
-    instructions: integration.note + " Suggest adding .ssh-mcp-*.json to this project's .gitignore — they carry host and authentication parameters; setup does not edit .gitignore itself. Guidance lives in the workspace MCP's remote_help tool; legacy markdown files configure used to write are reclaimed and reported in legacyDocs when they still match known generated text. After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook. Call remote_setup again with a new bindingName whenever the user wants another remote target in this project." };
+    instructions: integration.note + " Guidance lives in the workspace MCP's remote_help tool; legacy markdown files configure used to write are reclaimed and reported in legacyDocs when they still match known generated text. After tools load, call remote_workspace to verify SSH/runtime and read remote rules. Use the real session ID from the recovery hook. Call remote_setup again with a new bindingName whenever the user wants another remote target in this project." };
 }
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {

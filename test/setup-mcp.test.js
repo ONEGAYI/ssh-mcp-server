@@ -487,7 +487,7 @@ it('configure writes no markdown and reclaims legacy generated docs across three
     // Fresh project: configure writes none of the three markdown files.
     const fresh = await configureFromTool(common);
     for (const name of ['AGENTS.md', 'SSH-WORKSPACE-GUIDE.md', 'CLAUDE.md']) await absent(name);
-    assert.match(JSON.stringify(fresh), /gitignore/, 'configure return suggests gitignoring .ssh-mcp-*.json');
+    assert.match(fresh.instructions, /gitignore/, 'configure return suggests gitignoring .ssh-mcp-*.json');
 
     // v3 stock plus the CLAUDE.md import: both reclaimed, both reported.
     await writeFile(join(root, 'AGENTS.md'), legacyV3);
@@ -526,5 +526,13 @@ it('configure writes no markdown and reclaims legacy generated docs across three
     assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), 'my own rules');
     assert.ok(!result.legacyDocs.removed.some(e => e.path.endsWith('AGENTS.md')));
     assert.ok(result.legacyDocs.removed.some(e => e.path.endsWith('SSH-WORKSPACE-GUIDE.md')));
+
+    // A CLAUDE.md that is not the generated import outlives its AGENTS.md and is reported.
+    await writeFile(join(root, 'AGENTS.md'), legacyV3);
+    await writeFile(join(root, 'CLAUDE.md'), '# my own claude rules\n');
+    result = await configureFromTool(common);
+    await absent('AGENTS.md');
+    assert.equal(await readFile(join(root, 'CLAUDE.md'), 'utf8'), '# my own claude rules\n');
+    assert.ok(result.legacyDocs.kept.some(e => e.path.endsWith('CLAUDE.md')), 'non-generated CLAUDE.md is reported as kept');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

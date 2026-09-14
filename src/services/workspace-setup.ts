@@ -76,9 +76,6 @@ export async function setupWorkspaceIntegration(profile: IntegrationProfile, app
     mcp: { ...config.mcp, servers: { ...config.mcp?.servers, [serverName]: { ...mcpServer, enable: true } } },
     hooks: { ...config.hooks, enabled: true, events: { ...events, UserPromptSubmit: hooks } },
   };
-  // Transition note (issues #29/#31): this on-disk rules text is retired once
-  // #31 lands; until then keep its behavioural rules in sync with
-  // WORKSPACE_GUIDE in src/core/workspace-server.ts.
   // Issue #31: configure no longer writes project markdown — remote_help is
   // the single guidance source. The one-time migration below reclaims files
   // whose content still matches a known generated generation.
@@ -89,7 +86,7 @@ export async function setupWorkspaceIntegration(profile: IntegrationProfile, app
   }
   return { applied: apply, configPath, config: updated, serverName, mcpServer,
     ...(legacyDocs ? { legacyDocs } : {}),
-    note: "Project integration is prepared. Reopen this local project if its tools are not loaded yet, and confirm ZCode's first-time workspace-hook trust. No global config was changed." };
+    note: "Project integration is prepared. Reopen this local project if its tools are not loaded yet, and confirm ZCode's first-time workspace-hook trust. No global config was changed. Suggest adding .ssh-mcp-*.json to this project's .gitignore — they carry host and authentication parameters; setup does not edit .gitignore itself." };
 }
 
 /** Frozen history of every markdown generation configure ever wrote. Never extend
@@ -100,7 +97,9 @@ const V2_TEXT = "# SSH 远端开发工作区\n\n本目录可配置一个或多�
 const V3_TEXT = "# SSH 远端开发工作区\n\n本目录可配置一个或多个 SSH 远端绑定：每个绑定连接一台服务器的某个目录，对应一个 `ssh-workspace-*` MCP 服务和一个恢复钩子。绑定清单见 `.zcode/config.json` 的 `mcp.servers`；各绑定当前的远端目录与待恢复任务由恢复钩子注入的上下文说明。\n\n- 开始工作先按目标绑定调用 remote_workspace，再用 remote_read 读取远端适用的 AGENTS.md / CLAUDE.md。\n- 文件读写优先使用 remote_* 工具。凭据冲突时重新读取，不用 Shell 绕过工具报出的冲突。\n- 远端命令（构建、测试、目录管理等）通过恢复钩子提供的 job CLI run 入口运行，必须使用 ZCode 原生后台 Shell 的 run_in_background: true。\n- sessionId 使用恢复钩子提供的真实对话标识，不猜测、不借用其他对话的任务。\n- 继续对话时用 wait 挂接原任务，不再 run 原命令。\n- 后台通知后检查 task-result 和日志，按 eventId 去重，处理后使用 remote_ack 或 CLI ack。\n- 本机等待退出不是远端取消；显式 cancel 后核实状态，unknown 不自动重跑。\n";
 const CLAUDE_IMPORT = "@AGENTS.md\n";
 
-function matchGeneration(text: string): string | undefined {
+type Generation = "v1" | "v2" | "v3";
+
+function matchGeneration(text: string): Generation | undefined {
   if (text === V3_TEXT) return "v3";
   if (text === V2_TEXT) return "v2";
   // v1 interpolated a single-line remoteRoot; anything multi-line is not ours.
@@ -112,7 +111,7 @@ function matchGeneration(text: string): string | undefined {
 }
 
 export interface LegacyDocCleanup {
-  removed: Array<{ path: string; generation: string }>;
+  removed: Array<{ path: string; generation: Generation }>;
   kept: Array<{ path: string; reason: string }>;
 }
 
@@ -127,28 +126,33 @@ export async function cleanupLegacyGeneratedDocs(localRoot: string): Promise<Leg
     const text = await readOptional(path);
     return text === undefined ? undefined : { path, text };
   };
+  // ENOENT still counts as reclaimed: a concurrent configure (and later the
+  // remove action reusing this cleanup) may have already taken the file, and
+  // the reached end state — file gone — is what the report records.
+  const reclaim = async (path: string, generation: Generation) => {
+    try { await unlink(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    removed.push({ path, generation });
+  };
   const agents = await readAt("AGENTS.md");
   if (agents) {
     const generation = matchGeneration(agents.text);
     if (generation) {
-      await unlink(agents.path);
-      removed.push({ path: agents.path, generation });
+      await reclaim(agents.path, generation);
       // The generated one-line import dies with the file it imported; a user
       // import of a surviving AGENTS.md keeps working and stays.
       const claude = await readAt("CLAUDE.md");
-      if (claude && claude.text === CLAUDE_IMPORT) {
-        await unlink(claude.path);
-        removed.push({ path: claude.path, generation });
+      if (claude) {
+        if (claude.text === CLAUDE_IMPORT) await reclaim(claude.path, generation);
+        else kept.push({ path: claude.path, reason: "AGENTS.md was reclaimed but this CLAUDE.md is not the generated one-line import; kept for manual review" });
       }
     } else kept.push({ path: agents.path, reason: "content differs from every known generated generation; kept for manual review" });
   }
   const guide = await readAt("SSH-WORKSPACE-GUIDE.md");
   if (guide) {
     const generation = matchGeneration(guide.text);
-    if (generation) {
-      await unlink(guide.path);
-      removed.push({ path: guide.path, generation });
-    } else kept.push({ path: guide.path, reason: "content differs from every known generated generation; kept for manual review" });
+    if (generation) await reclaim(guide.path, generation);
+    else kept.push({ path: guide.path, reason: "content differs from every known generated generation; kept for manual review" });
   }
   return { removed, kept };
 }
