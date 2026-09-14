@@ -107,7 +107,8 @@ it('workspace MCP serves the full usage guide through remote_help with zero remo
     for (const keyword of ['remote_workspace', 'remote_read', 'sessionId', '后台', 'wait', 'remote_ack']) {
       assert.ok(data.guide.includes(keyword), `guide covers ${keyword}`);
     }
-    assert.ok(!data.guide.includes('本目录可配置'), 'the guide addresses the agent directly, not the directory');
+    assert.ok(data.guide.includes('你正在通过 SSH 远端绑定'), 'the guide addresses the agent directly');
+    assert.ok(!data.guide.includes('本目录可配置'), 'the guide does not speak about the directory in document voice');
     assert.ok(!JSON.stringify(data).includes('must-not-leak'));
     assert.ok(!('storage' in data) && !('status' in data), 'the guide carries no remote-end state');
     // A real maintenance round writes maintenance.json before anything can fail

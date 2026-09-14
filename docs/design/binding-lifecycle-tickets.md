@@ -1,6 +1,6 @@
 # 绑定生命周期实施票据（按需指引 + 绑定移除）
 
-状态：2026-09-14 拆票完成，#30–#33 共 4 张票据待实施。实施顺序为线性链：#30 → #31 → #32 → #33。
+状态：2026-09-14 拆票完成，#30–#33 共 4 张票据。#30 已实施（PR #34）；#31–#33 待实施。实施顺序为线性链：#30 → #31 → #32 → #33。
 
 规格：[按需指引 #29](https://github.com/ONEGAYI/ssh-mcp-server/issues/29) / [绑定移除 #28](https://github.com/ONEGAYI/ssh-mcp-server/issues/28)（决策记档见两 issue 评论）。需求访谈与领域术语见 [CONTEXT.md](CONTEXT.md)「绑定移除与按需指引访谈（2026-09-14）」一节。
 
@@ -19,7 +19,7 @@
 
 ### #30 feat: remote_help 按需指引工具与 instructions 引导
 
-规格：#29。expand 阶段，不改现有行为。
+规格：#29。expand 阶段，不改现有行为。已实施（PR #34）。
 
 - 工作区 MCP 新增 `remote_help`：零参数、不连 SSH、返回静态完整指引；文本改为指引视角。
 - server instructions 末尾加引导句。
