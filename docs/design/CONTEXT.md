@@ -58,7 +58,7 @@
 - 已确认（落盘文档退役）：configure 不再写 `AGENTS.md` / `SSH-WORKSPACE-GUIDE.md` / `CLAUDE.md`；新增 `remote_help` 工具按需返回完整指引，零参数、不连 SSH、文本改为指引视角，server instructions 加引导句；一次性迁移清理在 configure 与 remove 复用同一逻辑，匹配 v1/v2 两代已知生成文本才删并报告，匹配不上不删、报告路径请用户手工处理。
 - 已确认（#28 移除动作）：入口仅以 revision 防并发覆写（与 update 一致）并标注 destructiveHint；存在未确认任务或传输时硬拒绝、不设 force；远端收尾保持零 SSH 连接，仅报告远端状态目录路径与手工清理指引；本地 `<identity[:24]>` 状态目录在校验通过后整体删除；共享文档仅最后一个绑定时尝试删（存量兼容）；`.zcode/config.json` 只摘条目、空节点保留；提供与 MCP 共用实现的 CLI 入口。
 - 已确认（边界约定）：setup 与 remove 均为纯本地文件操作，不执行任何 git 命令；返回文本提示用户将 `.ssh-mcp-*.json` 加入 `.gitignore`。恢复钩子常驻注入的五条核心纪律与工作区 MCP instructions 不依赖落盘文档，指引按需化不降低安全底线。
-- 上述均尚未实施。
+- 实施时点（2026-09-14 复核更新）：remote_help 按需指引工具已实施（PR #34）；落盘文档退役与迁移清理（#31）、remove 动作（#32）、CLI 入口（#33）尚未实施。
 
 ## 领域术语
 
