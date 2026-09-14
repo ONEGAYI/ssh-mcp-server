@@ -128,10 +128,19 @@ export async function cleanupLegacyGeneratedDocs(localRoot: string): Promise<Leg
   };
   // ENOENT still counts as reclaimed: a concurrent configure (and later the
   // remove action reusing this cleanup) may have already taken the file, and
-  // the reached end state — file gone — is what the report records.
+  // the reached end state — file gone — is what the report records. Any other
+  // failure (EPERM/EBUSY under an editor lock, EACCES) also stays inside the
+  // report: integration is already complete at this point, so a locked file
+  // must fail the reclaim, not the configure — the path stays visible in kept.
   const reclaim = async (path: string, generation: Generation) => {
-    try { await unlink(path); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try {
+      await unlink(path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") { removed.push({ path, generation }); return; }
+      kept.push({ path, reason: `reclaim failed (${code ?? "unknown"}); file left in place for manual removal` });
+      return;
+    }
     removed.push({ path, generation });
   };
   const agents = await readAt("AGENTS.md");

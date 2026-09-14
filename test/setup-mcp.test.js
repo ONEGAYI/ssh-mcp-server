@@ -509,6 +509,13 @@ it('configure writes no markdown and reclaims legacy generated docs across three
     await absent('AGENTS.md');
     assert.ok(result.legacyDocs.removed.some(e => e.generation === 'v1'));
 
+    // A multi-line payload between the v1 prefix and suffix is not ours: kept.
+    await writeFile(join(root, 'AGENTS.md'), legacyV1('/first\n/second'));
+    result = await configureFromTool(common);
+    assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), legacyV1('/first\n/second'));
+    assert.ok(!result.legacyDocs.removed.some(e => e.path.endsWith('AGENTS.md')), 'multi-line v1 payload must not be reclaimed');
+    await rm(join(root, 'AGENTS.md'), { force: true });
+
     // User-edited docs stay and are reported; the import stays valid while AGENTS.md lives.
     const edited = legacyV3 + '\n- 我的项目额外规则\n';
     await writeFile(join(root, 'AGENTS.md'), edited);
