@@ -223,7 +223,7 @@ node <安装目录>/build/cli/job.js transfer wait --transfer-id <传输编号> 
 - 内置搜索是 Python 字面量匹配，不模拟 rg 的正则与 .gitignore；远端 rg 需要目标机自行具备。
 - 普通 Shell 一直不做工作区目录沙箱；文件工具的目录边界默认开启，只有用户显式选择才解除，解除后其余文件保护仍然生效。
 - 多绑定共享同一对话上下文，但任务登记与恢复按绑定隔离。
-- 已有本机 ZCode + CentOS 7 VM 的人工验收，以及新 setup、连续编辑的自动验证；最终内网离线现场尚未验收。
+- 已有本机 ZCode + CentOS 7 VM 的人工验收，以及新 setup、连续编辑的自动验证；用户已于 2026-09-14 人工验收通过 v2.0.0 全部功能。
 
 进一步说明：[详细使用指南](docs/design/usage.md) · [接口契约](docs/design/contracts.md) · [验证进度](docs/design/progress.md)。
 

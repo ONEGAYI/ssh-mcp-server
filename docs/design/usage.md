@@ -292,13 +292,3 @@ node scripts/package-offline.mjs --output D:/Packages/ssh-mcp-windows-preview
 输出目录包含当前 Windows Node 运行时、已安装依赖、构建代码、Python 辅助文件、接入脚本和文档。为避免迁移时遗漏间接依赖，预览包包含当前 node_modules 的开发依赖；没有复制 SSH 配置、凭据、工作区 profile 或测试产物。MANIFEST.json 提供每个文件的 SHA-256。
 
 将目录复制到相同架构的内网 Windows 后，用 `runtime/node.exe scripts/setup-workspace.mjs ... --apply` 重新生成路径。打包目录不要求 npm install。Linux 端依然需要已有 Python 3.6+；当前未提供自带 Python 的发行物。
-
-## 人工验收
-
-1. 在专用本机工作区开始 ZCode 对话，确认能列出 remote_* 工具，钩子提供真实对话标识。
-2. 要求 Agent 在远端创建小文件、读取并编辑；随后用外部 SSH 改动，再验证旧凭据被拒绝。
-3. 要求执行 `sleep 20; printf 'build done\n'`，检查主对话先返回、任务结束后自动继续。
-4. 运行约一分钟的任务，中途关闭 ZCode；重新进入原对话输入“继续”，检查同一任务被接回且没有重跑。
-5. 查看处理完成后的待处理列表，确认仅在 Agent ack 后消失。
-
-用户已于 2026-09-11 报告上述本机 ZCode / VMware VM 人工验收通过。自动化证据、人工报告及尚待完成的真实内网离线现场验收范围见 [progress.md](progress.md)。交互式 stdin/PTY 延期评估见 [interactive-assessment.md](interactive-assessment.md)。

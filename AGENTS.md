@@ -8,7 +8,7 @@
 
 - 为只能通过 SSH 使用的 CentOS 7 服务器提供接近远程原生 Agent 的操作体验。
 - 全部演进已合入 main 并发布 v2.0.0（2026-09-13）：首版工作区（PR #1，用户人工验收通过）、三项扩展（PR #2）、大文件扩展总规格 16 张票据（PR #22，三轮代码审查 44 项修复收口）、轻量打包脚本（PR #27）。
-- 保留边界：最终内网离线现场人工验收仍未完成（VM 自动测试不替代）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
+- 保留边界：用户已人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
 - 功能实施遵守测试先行。用户已授权创建个人 fork 并推送，变更通过 fork 内的 PR 审阅；未授权直接合并或向上游提交 PR。
@@ -20,7 +20,7 @@
 - `docs/design/contracts.md`：文件读取/写入、任务状态、日志和完成恢复契约。
 - `docs/design/implementation-plan.md`：分阶段实施、关键验证门槛及测试验收安排。
 - `docs/design/progress.md`：当前实现进度、真实环境证据与未完成工作。
-- `docs/design/usage.md`：工作区配置、Agent 使用、恢复边界、离线交付与人工验收。
+- `docs/design/usage.md`：工作区配置、Agent 使用、恢复边界与离线交付。
 - `docs/design/CONTEXT.md`：用户已提供的背景、需求目标和领域术语。
 - `docs/design/large-file-spec.md`：大文件读写、远端搜索、续传、状态清理与二次配置的扩展规格（票据 #6–#20 已实施，终验收尾见 #21）。
 - `docs/design/large-file-tickets.md`：扩展实施票据、GitHub 链接、依赖和验收条件。

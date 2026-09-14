@@ -1,6 +1,6 @@
 # SSH 远程开发首版规格
 
-状态：首版已实现并通过 2026-09-11 用户人工验收（本机 ZCode + CentOS 7 VM）；最终内网离线现场验收未完成，无 root 与旧 glibc 约束不变。2026-09-12 批准的三项扩展（setup 预存 SSH 连接库、同一项目多命名绑定、可选解除文件目录边界）已实现并自动验证，见 [progress.md](progress.md) 与 [contracts.md](contracts.md) 的扩展契约；扩展部分尚未人工验收。
+状态：首版已实现并通过 2026-09-11 用户人工验收（本机 ZCode + CentOS 7 VM）；全部功能已于 2026-09-14 随 v2.0.0 通过用户人工验收，无 root 与旧 glibc 约束不变。2026-09-12 批准的三项扩展（setup 预存 SSH 连接库、同一项目多命名绑定、可选解除文件目录边界）已实现并自动验证，见 [progress.md](progress.md) 与 [contracts.md](contracts.md) 的扩展契约；扩展部分已随 v2.0.0 于 2026-09-14 通过用户人工验收。
 
 ## 目标
 
