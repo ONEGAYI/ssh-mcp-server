@@ -2,6 +2,12 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [未发布]
+
+### 其他改进
+
+- 确立分发纪律：对外分发一律使用离线目录包（`scripts/package-offline.mjs`，含 Node 运行时与全部依赖），移除轻量分发脚本 `package-dist`（PR #27 引入后按用户决策撤回）。
+
 ## [2.0.0] - 2026-09-13
 
 首个 fork 版本，覆盖上游 v1.9.2 之后合入 main 的全部演进（PR [#1](https://github.com/ONEGAYI/ssh-mcp-server/pull/1)、[#2](https://github.com/ONEGAYI/ssh-mcp-server/pull/2)、[#22](https://github.com/ONEGAYI/ssh-mcp-server/pull/22)、[#27](https://github.com/ONEGAYI/ssh-mcp-server/pull/27)）：从单一同步式 MCP 工具服务器演化为面向 CentOS 7 / Python 3.6 标准库 / 无 root / 离线内网的「远程原生 Agent 工作区」——远端只需 SSH 与 Python 3.6，本机 Agent 即可获得持久任务、断线恢复、流式大文件操作与有界状态管理的完整能力。
