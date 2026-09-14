@@ -2,11 +2,14 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
-## [未发布]
+## [2.0.1] - 2026-09-14
+
+分发与验收口径修正版：确立「一律离线包」的分发纪律，并确认用户人工验收通过。
 
 ### 其他改进
 
-- 确立分发纪律：对外分发一律使用离线目录包（`scripts/package-offline.mjs`，含 Node 运行时与全部依赖），移除轻量分发脚本 `package-dist`（PR #27 引入后按用户决策撤回）。
+- 确立分发纪律：对外分发一律使用离线目录包（`scripts/package-offline.mjs`，含 Node 运行时与全部依赖），移除轻量分发脚本 `package-dist`（PR #27 引入后按用户决策撤回）；v2.0.0 附带的轻量 tar.gz 资产已从 Release 移除。
+- 用户人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；相关文档口径同步更新。
 
 ## [2.0.0] - 2026-09-13
 
@@ -41,4 +44,5 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.0.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/ONEGAYI/ssh-mcp-server/commits/v2.0.0
