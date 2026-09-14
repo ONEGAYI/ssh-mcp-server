@@ -2,6 +2,21 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.1.0] - 2026-09-14
+
+按需指引起航版：工作区使用指引从落盘 markdown 迁移到 `remote_help` 工具，configure 不再向项目写任何文档文件，存量生成文档自动回收。
+
+### 新功能
+
+- **remote_help 按需指引**（PR [#34](https://github.com/ONEGAYI/ssh-mcp-server/pull/34)）：每个绑定的工作区 MCP 新增 `remote_help` 工具——零参数、纯本地静态文本、不连 SSH，返回完整使用指引（工作流顺序、后台任务、恢复与确认规则、SSH 不可达处置）；server instructions 附引导句。SSH 断连时指引依然可得。
+- **configure 停止落盘文档**（PR [#35](https://github.com/ONEGAYI/ssh-mcp-server/pull/35)）：不再生成 `AGENTS.md` / `SSH-WORKSPACE-GUIDE.md` / `CLAUDE.md`，`remote_help` 成为唯一指引来源；项目 git 工作区不再被 setup 写入的文件污染。
+
+### 其他改进
+
+- **存量文档一次性迁移清理**（PR [#35](https://github.com/ONEGAYI/ssh-mcp-server/pull/35)）：重入 configure 时自动回收内容仍与已知生成文本（v1/v2/v3 三代）逐字一致的旧文档并在返回的 `legacyDocs` 中报告路径；用户修改过的文件保留不动、仅报告；`CLAUDE.md` 的一行导入仅随被回收的 `AGENTS.md` 联动删除；回收失败（如文件被编辑器锁定）不阻塞 configure，路径与原因进报告。清理逻辑独立导出，后续绑定移除动作复用。
+- **gitignore 建议**（PR [#35](https://github.com/ONEGAYI/ssh-mcp-server/pull/35)）：configure 返回提示将 `.ssh-mcp-*.json` 加入项目 `.gitignore`（含主机与认证参数，不宜入库）；setup 不代改 `.gitignore`。
+- 两项 PR 均经多轮独立代码审查修复收口（PR #34 三轮、PR #35 两轮 + 双轴审查），全部修复由未参与修复的审查者复核关闭。
+
 ## [2.0.1] - 2026-09-14
 
 分发与验收口径修正版：确立「一律离线包」的分发纪律，并确认用户人工验收通过。
@@ -44,5 +59,6 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.1.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/ONEGAYI/ssh-mcp-server/commits/v2.0.0
