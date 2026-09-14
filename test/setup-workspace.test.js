@@ -24,7 +24,8 @@ it('setup merges project MCP/hooks idempotently and preserves existing rules', a
     assert.ok(config.mcp.servers['ssh-workspace-test']);
     assert.equal(config.hooks.events.UserPromptSubmit.length, 1);
     assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), 'keep rules');
-    assert.equal(await readFile(join(root, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
+    // Issue #31: CLAUDE.md is no longer generated; user files stay untouched.
+    await assert.rejects(readFile(join(root, 'CLAUDE.md')), { code: 'ENOENT' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

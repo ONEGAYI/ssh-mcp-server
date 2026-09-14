@@ -117,7 +117,7 @@ node scripts/setup-workspace.mjs --workspace D:/RemoteWork/example/.ssh-mcp-work
 node scripts/setup-workspace.mjs --workspace D:/RemoteWork/example/.ssh-mcp-workspace.json --apply
 ```
 
-第一条展示具体变更；第二条合并写入项目 `.zcode/config.json`，保留已有 MCP 与其他钩子。项目缺少规则文件时生成 AGENTS.md / CLAUDE.md；已有 AGENTS.md 时另写 SSH-WORKSPACE-GUIDE.md，恢复钩子也会注入操作指引。
+第一条展示具体变更；第二条合并写入项目 `.zcode/config.json`，保留已有 MCP 与其他钩子。setup 不写任何 markdown（#31 起），操作指引由工作区 MCP 的 `remote_help` 与恢复钩子注入提供；旧版本生成的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md 若内容仍与已知生成文本一致会被自动回收并在返回中报告，用户改过的文件保留不动。
 
 用 ZCode 打开该本机目录。恢复钩子属于项目级进程钩子，首次可能需要在 ZCode 中信任；这是 ZCode 的工作区钩子接入步骤。全局配置不被修改。官方文件路径说明见 [MCP 配置](https://zcode.z.ai/en/docs/mcp-services)，钩子输入与来源见 [Hooks](https://zcode.z.ai/en/docs/hooks)。
 

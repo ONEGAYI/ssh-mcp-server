@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawnSync } from 'node:child_process';
+import { legacyV1, legacyV2, legacyV3 } from './legacy-doc-generations.mjs';
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
 import { TaskService } from '../build/services/task-service.js';
 // Namespace import keeps the whole suite runnable while inspect/update land (ticket #18).
@@ -56,9 +57,10 @@ it('named bindings coexist with legacy profiles and recover only their own tasks
       assert.doesNotMatch(context, /private-other-session/);
       assert.ok(context.includes(results[i].serverName), 'Recovery identifies the corresponding MCP server');
     }
-    const guide = await readFile(join(root, 'AGENTS.md'), 'utf8');
-    assert.match(guide, /绑定/);
-    assert.ok(!guide.includes('/legacy'), 'Shared guidance must not pin future bindings to the first target');
+    // Issue #31: configure writes no markdown; guidance lives in remote_help.
+    for (const name of ['AGENTS.md', 'SSH-WORKSPACE-GUIDE.md', 'CLAUDE.md']) {
+      await assert.rejects(readFile(join(root, name)), { code: 'ENOENT' }, name + ' must not be written');
+    }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -472,4 +474,57 @@ it('setup MCP exposes inspect and update through the protocol surface', async ()
     assert.equal(updated.isError, undefined, JSON.stringify(updated));
     assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).policy.search.timeBudgetMs, 20000);
   } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it('configure writes no markdown and reclaims legacy generated docs across three generations (issue #31)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-docs-'));
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'test' } }));
+    const common = { localRoot: root, sshConfigFile: auth, connectionName: 'eda', remoteRoot: '/work', remoteStateDir: '/state', localStateDir: join(root, 'state') };
+    const absent = async name => assert.rejects(readFile(join(root, name)), { code: 'ENOENT' }, name + ' must not exist');
+
+    // Fresh project: configure writes none of the three markdown files.
+    const fresh = await configureFromTool(common);
+    for (const name of ['AGENTS.md', 'SSH-WORKSPACE-GUIDE.md', 'CLAUDE.md']) await absent(name);
+    assert.match(JSON.stringify(fresh), /gitignore/, 'configure return suggests gitignoring .ssh-mcp-*.json');
+
+    // v3 stock plus the CLAUDE.md import: both reclaimed, both reported.
+    await writeFile(join(root, 'AGENTS.md'), legacyV3);
+    await writeFile(join(root, 'CLAUDE.md'), '@AGENTS.md\n');
+    let result = await configureFromTool(common);
+    await absent('AGENTS.md'); await absent('CLAUDE.md');
+    assert.ok(result.legacyDocs.removed.some(e => e.path.endsWith('AGENTS.md') && e.generation === 'v3'));
+    assert.ok(result.legacyDocs.removed.some(e => e.path.endsWith('CLAUDE.md')), 'the generated import follows its AGENTS.md');
+
+    // v2 stock: reclaimed.
+    await writeFile(join(root, 'AGENTS.md'), legacyV2);
+    result = await configureFromTool(common);
+    await absent('AGENTS.md');
+    assert.ok(result.legacyDocs.removed.some(e => e.generation === 'v2'));
+
+    // v1 stock matches any historical remoteRoot, not just the current one.
+    await writeFile(join(root, 'AGENTS.md'), legacyV1('/a/different/root'));
+    result = await configureFromTool(common);
+    await absent('AGENTS.md');
+    assert.ok(result.legacyDocs.removed.some(e => e.generation === 'v1'));
+
+    // User-edited docs stay and are reported; the import stays valid while AGENTS.md lives.
+    const edited = legacyV3 + '\n- 我的项目额外规则\n';
+    await writeFile(join(root, 'AGENTS.md'), edited);
+    await writeFile(join(root, 'CLAUDE.md'), '@AGENTS.md\n');
+    result = await configureFromTool(common);
+    assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), edited);
+    assert.equal(await readFile(join(root, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
+    assert.ok(result.legacyDocs.kept.some(e => e.path.endsWith('AGENTS.md')), 'edited AGENTS.md is reported as kept');
+
+    // The side-guide scenario: user's own AGENTS.md stays, the generated guide goes.
+    await writeFile(join(root, 'AGENTS.md'), 'my own rules');
+    await writeFile(join(root, 'SSH-WORKSPACE-GUIDE.md'), legacyV3);
+    result = await configureFromTool(common);
+    await absent('SSH-WORKSPACE-GUIDE.md');
+    assert.equal(await readFile(join(root, 'AGENTS.md'), 'utf8'), 'my own rules');
+    assert.ok(!result.legacyDocs.removed.some(e => e.path.endsWith('AGENTS.md')));
+    assert.ok(result.legacyDocs.removed.some(e => e.path.endsWith('SSH-WORKSPACE-GUIDE.md')));
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
