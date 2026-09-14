@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -76,6 +76,49 @@ it('workspace MCP storage report keeps the local end and marks an unreachable re
     }
     assert.ok(!JSON.stringify(data).includes('must-not-leak'));
     assert.ok(Buffer.byteLength(JSON.stringify(data), 'utf8') <= 4096, 'the report stays within the 4 KiB budget');
+  } finally {
+    await client.close();
+    const child = relative(tmpdir(), directory);
+    assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('workspace MCP serves the full usage guide through remote_help with zero remote interaction (issue #30)', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-help-'));
+  const client = new Client({ name: 'contract-test', version: '1' });
+  try {
+    // port 1 on loopback: connection refused; the guide must still be served.
+    await writeFile(join(directory, 'ssh.json'), JSON.stringify({ offline: { host: '127.0.0.1', port: 1, username: 'test', password: 'must-not-leak' } }));
+    await writeFile(join(directory, 'workspace.json'), JSON.stringify({ workspaceId: 'help-contract', connectionName: 'offline', sshConfigFile: './ssh.json', remoteRoot: '/work', remoteStateDir: '/state', localStateDir: './state' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', join(directory, 'workspace.json')], stderr: 'pipe' }));
+    assert.match(client.getInstructions(), /remote_help/, 'server instructions point agents to remote_help');
+    const tools = await client.listTools();
+    const help = tools.tools.find(tool => tool.name === 'remote_help');
+    assert.ok(help, 'remote_help is advertised');
+    assert.deepEqual(Object.keys(help.inputSchema.properties ?? {}), [], 'remote_help takes no parameters');
+    assert.deepEqual(help.inputSchema.required ?? [], [], 'remote_help requires nothing');
+    const result = await client.callTool({ name: 'remote_help', arguments: {} });
+    assert.equal(result.isError, undefined, result.content?.[0]?.text);
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(typeof data.guide, 'string');
+    assert.ok(data.guide.length > 200, 'the full guide is served, not a stub');
+    for (const keyword of ['remote_workspace', 'remote_read', 'sessionId', '后台', 'wait', 'remote_ack']) {
+      assert.ok(data.guide.includes(keyword), `guide covers ${keyword}`);
+    }
+    assert.ok(!data.guide.includes('本目录可配置'), 'the guide addresses the agent directly, not the directory');
+    assert.ok(!JSON.stringify(data).includes('must-not-leak'));
+    assert.ok(!('storage' in data) && !('status' in data), 'the guide carries no remote-end state');
+    // A real maintenance round writes maintenance.json before anything can fail
+    // (review R3), so its absence proves remote_help triggered no round.
+    const stateRoot = join(directory, 'state');
+    const identities = await readdir(stateRoot, { withFileTypes: true }).catch(() => []);
+    for (const entry of identities) {
+      if (!entry.isDirectory()) continue;
+      const stamped = await access(join(stateRoot, entry.name, 'maintenance.json')).then(() => true, () => false);
+      assert.equal(stamped, false, 'remote_help must not trigger a maintenance round');
+    }
   } finally {
     await client.close();
     const child = relative(tmpdir(), directory);

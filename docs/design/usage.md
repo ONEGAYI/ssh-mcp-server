@@ -216,7 +216,7 @@ node <安装目录>/build/cli/job.js transfer pending --workspace <配置文件>
 ### 后台任务
 
 
-继续任意对话时，UserPromptSubmit 钩子给出真实 `sessionId`、工作区根和待处理任务。Agent 应先通过 `remote_workspace` / `remote_read` 读取远端规则，再使用 `remote_*` 文件工具。
+继续任意对话时，UserPromptSubmit 钩子给出真实 `sessionId`、工作区根和待处理任务。Agent 应先通过 `remote_workspace` / `remote_read` 读取远端规则，再使用 `remote_*` 文件工具；工作流规则不明确时调用工作区 MCP 的 `remote_help`（零参数、纯本地静态指引，不连 SSH，连接异常时也可用，#30）。
 
 命令通过本机入口运行，**必须由 ZCode 原生 Shell 设置 `run_in_background: true`**。仅在命令末尾加 `&` 不提供相同的原对话完成跟进。
 
