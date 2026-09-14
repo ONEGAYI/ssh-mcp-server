@@ -11,7 +11,9 @@ import { SERVER_CONFIG } from "../config/server.js";
 
 /** On-demand usage guide (issue #30); agent-facing voice — addresses "you", never the directory.
  * Behavioural rules mirror the on-disk rules text in services/workspace-setup.ts until #31
- * retires that copy; keep both in sync across any wording change. */
+ * retires that copy; keep both in sync across any wording change. One deliberate exemption:
+ * the last entry (SSH unreachable) is remote_help-specific guidance — the on-disk file is
+ * trivially local, so only the tool needs that reminder. */
 const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 
 你正在通过 SSH 远端绑定操作 Linux 工程。存在多个绑定时，本指引对每个 \`ssh-workspace-*\` 服务各适用一次：先选定目标绑定再工作，本机路径与远端路径不混用，各绑定的任务互不借用。
