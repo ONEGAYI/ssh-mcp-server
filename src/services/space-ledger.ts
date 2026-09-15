@@ -23,9 +23,10 @@
  * (the remote end uses /proc identity for a strict verdict). Age never flips
  * a verdict here either.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
+import { identityStateDirectory } from "../config/workspace.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
 
 export const DEFAULT_SPACE_LIMIT_BYTES = 10 * 1024 ** 3;
@@ -61,7 +62,7 @@ export interface OccupancyEvidence {
 
 /** The ledger directory shared by every local service of one workspace. */
 export function workspaceLedgerDirectory(localStateDir: string, identity: string): string {
-  return join(localStateDir, createHash("sha256").update(identity).digest("hex").slice(0, 24), "ledger");
+  return join(identityStateDirectory(localStateDir, identity), "ledger");
 }
 
 function emptyLedger(): LedgerState {

@@ -1,17 +1,53 @@
 # 测试文档
 
-本项目使用 Node.js 内置的测试框架进行单元测试和集成测试。
+本项目使用 Node.js 内置的测试框架进行单元测试和集成测试；远端 helper 另有 Python 测试（`*.test.py`，需真实 Linux 环境的用例在无环境时自动跳过）。
 
 ## 测试结构
 
-```
+```text
 test/
-├── ssh-config-parser.test.js      # SSH 配置解析器测试
-├── command-line-parser.test.js    # 命令行参数解析器测试
-├── ssh-connection-manager.test.js # SSH 连接管理器测试
-├── integration.test.js            # 集成测试
-└── fixtures/                      # 测试数据（自动生成）
+├── command-line-parser.test.js    # 命令行参数与 --config-file 解析
+├── ssh-config-parser.test.js      # OpenSSH config 解析（Host 别名/Include/展开）
+├── ssh-connection-manager.test.js # 连接管理、白名单/黑名单校验
+├── ssh-input-command.test.js      # 输入命令白名单校验
+├── explicit-ssh-args.test.js      # 显式 host/密钥参数模式
+├── list-servers.test.js           # --list-servers 输出
+├── cli-info-flags.test.js         # CLI 信息类旗标
+├── integration.test.js            # 上游集成测试
+├── lazy-dependencies.test.js      # 惰性依赖加载纪律
+├── lifecycle.test.js              # 工作区 MCP 生命周期
+├── workspace-config.test.js       # profile 加载、identity 派生与校验
+├── workspace-mcp.test.js          # 工作区 MCP 契约（含 remote_help）
+├── workspace-mcp-remote.test.js   # 工作区 MCP 与远端交互契约
+├── workspace-write-schema.test.js # 写工具入参 schema
+├── directory-scope.test.js        # restricted/unrestricted 目录边界
+├── setup-mcp.test.js              # remote_setup configure/inspect/update 契约与 #31 迁移
+├── setup-workspace.test.js        # 手工 CLI setup 入口
+├── remove-binding.test.js         # 绑定移除契约（#28/#32/#33）
+├── legacy-doc-generations.mjs     # 三代落盘文档契约快照（非测试，供引用）
+├── recovery-hook.test.js          # 恢复钩子注入与离线纪律
+├── job-cli.test.js                # job CLI 本地行为
+├── job-cli-remote.test.js         # job CLI 与远端协议
+├── task-service.test.js           # 本地任务登记/确认/pendingAcross
+├── transfer-service.test.js       # 传输事务：断点续传、预算、恢复、pendingAcross
+├── remote-agent-client.test.js    # SSH_MCP_V1 信封与传输客户端
+├── space-ledger.test.js           # 本机空间额度账本
+├── storage-report.test.js         # 空间用量报告
+├── status-collector.test.js       # 状态汇总
+├── maintenance-service.test.js    # 维护轮节流与互斥
+├── largefile-acceptance.test.js   # 大文件扩展端到端验收（#6–#21）
+├── test-runner.test.js            # 测试运行器自身
+├── remote-agent.test.py           # 远端 helper：任务生命周期
+├── remote-files.test.py           # 远端 helper：受保护文件操作
+├── remote-transfer.test.py        # 远端 helper：传输事务
+├── remote-ledger.test.py          # 远端 helper：远端空间账本
+├── remote-lifecycle-probe.test.py # 远端 helper：持久任务生命周期探针
+├── remote-reclaim.test.py         # 远端 helper：到期回收
+├── remote-space-report.test.py    # 远端 helper：空间报告
+└── remote-discovery.test.py       # 远端 helper：环境发现
 ```
+
+以下「测试覆盖范围」各节描述的是上游继承测试（命令行/SSH 解析/连接管理/集成）的覆盖点；工作区、任务、传输、维护与 setup 等本 fork 新增能力的覆盖见上表对应文件与各设计文档。
 
 ## 运行测试
 

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { identityStateDirectory } from "../config/workspace.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
 
 interface RemoteCaller {
@@ -83,7 +84,7 @@ export class TaskService {
 
   constructor(private readonly remote: RemoteCaller, stateDirectory: string, private readonly workspaceId: string) {
     if (!isAbsolute(stateDirectory)) throw new RemoteAgentError("INVALID_CONFIG", "Local state directory must be absolute");
-    this.directory = join(stateDirectory, createHash("sha256").update(workspaceId).digest("hex").slice(0, 24), "tasks");
+    this.directory = join(identityStateDirectory(stateDirectory, workspaceId), "tasks");
   }
 
   private taskPath(jobId: string): string {
@@ -181,6 +182,16 @@ export class TaskService {
   }
 
   async pending(sessionId: string): Promise<TaskRecord[]> {
+    return this.unacknowledged(record => record.sessionId === sessionId);
+  }
+
+  /** Binding-level (every session) unacknowledged registrations. The remove
+   * action uses this so another conversation's unfinished work blocks removal. */
+  async pendingAcross(): Promise<TaskRecord[]> {
+    return this.unacknowledged(undefined);
+  }
+
+  private async unacknowledged(match: ((record: TaskRecord) => boolean) | undefined): Promise<TaskRecord[]> {
     this.registryIssues.length = 0;
     let entries;
     try { entries = await readdir(this.directory, { withFileTypes: true }); }
@@ -195,7 +206,7 @@ export class TaskService {
         this.registryIssues.push({ jobId: entry.name, code: (error as RemoteAgentError).code ?? "REGISTRY_CORRUPT" });
         continue;
       }
-      if (record.sessionId !== sessionId) continue;
+      if (match && !match(record)) continue;
       try {
         const ack = JSON.parse(await readFile(join(this.taskPath(entry.name), "ack.json"), "utf8"));
         if (ack.jobId !== entry.name || typeof ack.acknowledgedAt !== "string") throw new RemoteAgentError("REGISTRY_CORRUPT", "Invalid result acknowledgement");

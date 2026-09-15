@@ -6,15 +6,15 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, posix, resolve } from "node:path";
 import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
-import { setupWorkspaceIntegration, writeAtomic } from "../services/workspace-setup.js";
+import { setupWorkspaceIntegration, removeWorkspaceBinding, revisionOf, writeAtomic } from "../services/workspace-setup.js";
 import { bindingNamePattern, profileSchema } from "../config/workspace.js";
 import { policySectionSchema, resolvePolicy, StoredPolicy } from "../config/policy.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
 const inputSchema = {
-  action: z.enum(["configure", "inspect", "update"]).optional().describe("Operation on a workspace binding. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision"),
-  revision: z.string().min(1).optional().describe("Revision token from a previous inspect; required for action='update' so concurrent changes are rejected instead of overwritten"),
+  action: z.enum(["configure", "inspect", "update", "remove"]).optional().describe("Operation on a workspace binding. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision. 'remove' decommissions one binding from this project and requires that revision: it refuses while any task or transfer of the binding is unacknowledged, then unhooks the MCP entry and recovery hook, deletes the profile, the generated connection file and the local state — all without any SSH connection. Run it only on the user's explicit request"),
+  revision: z.string().min(1).optional().describe("Revision token from a previous inspect; required for action='update' and action='remove' so concurrent changes are rejected instead of overwritten"),
   policy: policySectionSchema.optional().describe("Workspace policy: per-end space limits, retention periods, search filters and budgets, maintenance cadence. Provide only the fields to set; unspecified fields keep defaults or stored values. Saved values apply from the next operation or maintenance cycle and never recalculate existing records' expiry"),
   bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for this project's original unnamed binding"),
   localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
@@ -54,10 +54,6 @@ const IDENTITY_LOCKED: Record<string, string> = {
   workspaceId: "the workspace id is part of the binding identity",
 };
 
-function revisionOf(content: string): string {
-  return createHash("sha256").update(content).digest("hex");
-}
-
 function firstIssue(error: z.ZodError): string {
   const issue = error.issues[0];
   return issue ? `${issue.path.join(".")}: ${issue.message}` : "invalid value";
@@ -76,12 +72,17 @@ const askLocalRoot = {
   instructions: "Ask the user for the local project directory, then call remote_setup again with the same action and that directory. Nothing was read or written.",
 };
 
-/** Locates and validates the existing profile an inspect/update call addresses. */
-async function loadProfileForAction(input: SetupInput): Promise<{ profilePath: string; content: string; raw: Record<string, unknown> }> {
+/** Resolves the profile file an inspect/update/remove call addresses. */
+async function resolveProfilePath(input: SetupInput): Promise<string> {
   if (!isAbsolute(input.localRoot!)) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
   const localRoot = await realpath(input.localRoot!);
   if (!await stat(localRoot).then(info => info.isDirectory())) throw new RemoteAgentError("SETUP_INVALID_PATH", "localRoot must be an existing directory");
-  const profilePath = join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
+  return join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
+}
+
+/** Locates and validates the existing profile an inspect/update call addresses. */
+async function loadProfileForAction(input: SetupInput): Promise<{ profilePath: string; content: string; raw: Record<string, unknown> }> {
+  const profilePath = await resolveProfilePath(input);
   let content: string;
   try { content = await readFile(profilePath, "utf8"); }
   catch (error) {
@@ -206,11 +207,21 @@ async function updateFromTool(input: SetupInput) {
   };
 }
 
+/** Decommissions one binding (issue #28). The core owns validation; this
+ * wrapper only resolves the addressed profile and enforces the revision. */
+async function removeFromTool(input: SetupInput) {
+  checkBindingName(input);
+  if (!input.localRoot) return askLocalRoot;
+  if (!input.revision) throw new RemoteAgentError("SETUP_REVISION_REQUIRED", "Remove requires the revision returned by a previous inspect of this binding; inspect first, then retry with that revision");
+  return removeWorkspaceBinding(await resolveProfilePath(input), input.revision);
+}
+
 /** Single entry the MCP tool calls; dispatches on the optional action field. */
 export async function setupFromTool(input: SetupInput, defaultSshConfigFile?: string) {
   const action = input.action ?? "configure";
   if (action === "inspect") return inspectFromTool(input);
   if (action === "update") return updateFromTool(input);
+  if (action === "remove") return removeFromTool(input);
   return configureFromTool(input, defaultSshConfigFile);
 }
 
@@ -311,10 +322,10 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
+    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. action='remove' decommissions a binding after inspect — run it only on the user's explicit request; it is local-only (no SSH connection) and refuses while the binding still has unacknowledged tasks or transfers. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
   });
-  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. No manual setup command needed; no SSH connection during setup.",
-    inputSchema, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }, async input => {
+  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. action='remove': requires that revision and the user's explicit request; decommissions exactly this binding — unacknowledged tasks or transfers (any session) are a hard refusal with no force, then the MCP entry, recovery hook, profile, generated connection file and local state are removed; external SSH configs and the remote state directory are never touched. No manual setup command needed; no SSH connection during setup or removal.",
+    inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async input => {
     try { return { content: [{ type: "text" as const, text: JSON.stringify(await setupFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {
       const known = error instanceof RemoteAgentError;
