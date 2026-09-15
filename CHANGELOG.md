@@ -2,6 +2,21 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [未发布]
+
+绑定生命周期收口：remote_setup 新增移除绑定动作（remove），手工 CLI 提供对等入口，绑定从此具备完整的接入—调整—退役闭环。
+
+### 新功能
+
+- **remote_setup 移除绑定（remove）**（#28 决策，票据 #32）：`action: "remove"` 按 revision 防并发（与 update 一致）、标注 `destructiveHint`；绑定存在任何未确认任务或传输时硬拒绝（SETUP_PENDING_OPERATIONS，按绑定全量统计、不限当前对话，无 force 参数）；通过后按"先摘钩子与 MCP 条目、再删 profile"的顺序摘除 `.zcode/config.json` 中本绑定的接入（空节点原样保留，外部 MCP/钩子不动），删除 profile、setup 生成的连接文件与本机 identity 状态目录；外部引用的 sshConfigFile 永不删除。仅当移除最后一个绑定时，复用 #31 的匹配逻辑回收仍与已知生成文本一致的存量文档并报告。全程零 SSH 连接，远端状态目录仅报告路径与手工清理指引。
+- **手工 CLI 移除入口**（票据 #33）：`node scripts/setup-workspace.mjs --workspace <profile> --remove [--revision <token>]` 与 MCP 共用同一实现；不带 revision 先返回包含当前 revision 与待确认工作清单的预览，带 revision 执行；拒绝路径与 MCP 一致，错误以 JSON 输出到 stderr 并以非零码退出。
+
+### 其他改进
+
+- **绑定级待确认判定**：任务与传输服务新增 `pendingAcross()`（全对话、离线读本地登记），供移除校验复用；恢复钩子的会话级 `pending` 语义不变。
+- **路径身份匹配**：摘除 MCP 条目与恢复钩子时按"执行器 + `--workspace` 指向同一 profile 文件"匹配（文本精确匹配或 realpath 同一文件），大小写拼写差异或链接引用也能正确摘除，且不会误删外部条目。
+- **文档收尾**（票据 #33）：README、usage 补移除流程；CONTEXT.md 大文件访谈节时点口径更正（#6–#21 已随 v2.0.0 实施）；test/README.md 测试结构树补齐至当前全量文件。
+
 ## [2.1.0] - 2026-09-14
 
 按需指引起航版：工作区使用指引从落盘 markdown 迁移到 `remote_help` 工具，configure 不再向项目写任何文档文件，存量生成文档自动回收。

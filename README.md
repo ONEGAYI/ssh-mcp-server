@@ -136,6 +136,8 @@ setup 服务负责首次接入；日常文件和任务操作使用它生成的�
 
 不提供 `bindingName` 的首次绑定保持原有文件名和行为，已有任务不受影响。
 
+**移除绑定**：某个绑定不再使用时，让 Agent 先 `inspect` 拿到 revision，再执行 `action: "remove"`（或用 `node scripts/setup-workspace.mjs --workspace <profile> --remove`，先预览再带 revision 执行）。移除是纯本地操作、不连 SSH：该绑定仍有未确认任务或传输时会被硬拒绝，需先逐个确认；通过后摘除 MCP 条目与恢复钩子、删除 profile、生成的连接文件和本机状态目录，其他绑定与自有配置不受影响，外部 SSH 配置永不删除。远端状态目录只报告路径供手工清理。
+
 **目录边界**默认开启：文件工具只能访问远端工程目录内的路径。如果明确希望让文件工具访问远端任意绝对路径（例如要同时改工程目录之外的配置文件），在 setup 时向 Agent 明确说明"不限制目录"，Agent 会以 `directoryScope: "unrestricted"` 记录该选择；无边界绑定的默认执行目录通常建议填远端 home（如 `/home/user`）。解除边界**不会**取消读取凭据、已读区间、外部变更检查等保护；SSH 配置中显式写明的 `allowedRemotePaths` 仍会继续生效。未说明时一律按默认受限处理，不会隐式放开。
 
 ## 6. 日常怎么用

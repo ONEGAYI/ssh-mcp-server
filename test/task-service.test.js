@@ -229,3 +229,21 @@ it('the drain gate rejection is surfaced without a local record', async () => {
     assert.deepEqual(await service.pending('owner'), []);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+it('pendingAcross lists unacknowledged work from every session for removal checks', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-tasks-across-'));
+  const remote = fakeRemote();
+  try {
+    const service = new TaskService(remote, directory, 'workspace-one');
+    const mine = await service.start({ sessionId: 'session-one', cwd: '/work', command: 'build' });
+    const theirs = await service.start({ sessionId: 'session-two', cwd: '/work', command: 'test' });
+    assert.deepEqual((await service.pending('session-two')).map(record => record.jobId), [theirs.jobId]);
+    const across = await service.pendingAcross();
+    assert.deepEqual(across.map(record => record.jobId).sort(), [mine.jobId, theirs.jobId].sort(),
+      'removal checks see every session, not just the current one');
+    await service.acknowledge(mine.jobId, 'session-one');
+    assert.deepEqual((await service.pendingAcross()).map(record => record.jobId), [theirs.jobId]);
+    await service.acknowledge(theirs.jobId, 'session-two');
+    assert.deepEqual(await service.pendingAcross(), []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

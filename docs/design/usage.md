@@ -90,6 +90,19 @@ policy 组与默认值（未写的字段按默认生效）：
 
 手工编辑 profile 中的 policy 节同样受 schema 校验：未知字段、非正整数或布尔类型错误会让配置加载失败并明确报出字段位置。
 
+### 移除绑定（remove）
+
+一个绑定不再使用时，对其做本地退役（decommission）。对 Agent 说明：
+
+> 请用 remote_setup 的 action=inspect 拿到这个绑定的 revision，然后执行 action=remove 移除它。
+
+- `action: "remove"`（提供 `localRoot` 与 `revision`，多绑定时加 `bindingName`）摘除该绑定的全部本地接入痕迹：MCP 条目与恢复钩子（先摘钩子再删 profile，避免恢复钩子带悬空参数运行）、profile 文件、setup 生成的 `.ssh-mcp-connection[.<绑定名>].json`，以及本机 identity 状态目录。整个过程零 SSH 连接。
+- **硬拒绝**：该绑定存在任何未确认任务或传输时返回 SETUP_PENDING_OPERATIONS（按绑定全量统计，不限当前对话），没有 force 参数；先逐个 ack/cancel 清完再移除。
+- **外科手术边界**：只摘自己的条目，其他绑定与用户自有的 MCP/钩子不受影响；`.zcode/config.json` 摘空后的空节点原样保留；外部引用的 `sshConfigFile` 永不删除。
+- **存量文档**：仅当移除的是最后一个绑定（config 中不再有 `ssh-workspace-*` 服务）时，才复用 #31 的匹配逻辑回收仍与已知生成文本一致的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md 并报告；用户改过的保留。
+- **远端收尾**：remove 不连 SSH，只在返回中报告远端状态目录绝对路径与手工清理指引；远端记录由维护轮按保留期自然回收。
+- 返回 `remoteStateDir` 与各步骤结果；若 profile 曾提交进 git，删除后由用户自行提交，remove 不执行任何 git 命令。
+
 ### 手工入口（保留兼容）
 
 在本机为一个远端项目建立专用目录，例如 `D:\RemoteWork\example`。该目录保存接入配置和本机输出，Linux 源码不会自动同步到这里。
@@ -118,6 +131,13 @@ node scripts/setup-workspace.mjs --workspace D:/RemoteWork/example/.ssh-mcp-work
 ```
 
 第一条展示具体变更；第二条合并写入项目 `.zcode/config.json`，保留已有 MCP 与其他钩子。setup 不写任何 markdown（#31 起），操作指引由工作区 MCP 的 `remote_help` 与恢复钩子注入提供；旧版本生成的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md 若内容仍与已知生成文本一致会被自动回收并在返回中报告，用户改过的文件保留不动。
+
+移除绑定走同一 CLI（两步：先预览拿 revision，再执行；与 MCP 行为一致，含拒绝路径）：
+
+```powershell
+node scripts/setup-workspace.mjs --workspace D:/RemoteWork/example/.ssh-mcp-workspace.json --remove
+node scripts/setup-workspace.mjs --workspace D:/RemoteWork/example/.ssh-mcp-workspace.json --remove --revision <预览返回的revision>
+```
 
 用 ZCode 打开该本机目录。恢复钩子属于项目级进程钩子，首次可能需要在 ZCode 中信任；这是 ZCode 的工作区钩子接入步骤。全局配置不被修改。官方文件路径说明见 [MCP 配置](https://zcode.z.ai/en/docs/mcp-services)，钩子输入与来源见 [Hooks](https://zcode.z.ai/en/docs/hooks)。
 

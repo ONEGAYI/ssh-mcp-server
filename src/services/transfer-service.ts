@@ -35,7 +35,7 @@ import { FileHandle, link, mkdir, open, readFile, readdir, rename, stat, unlink 
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join } from "node:path";
-import { WorkspaceConfig } from "../config/workspace.js";
+import { WorkspaceConfig, identityStateDirectory } from "../config/workspace.js";
 import { loadPolicy } from "../config/policy.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
 import { FileService } from "./file-service.js";
@@ -178,7 +178,7 @@ export class TransferService {
 
   constructor(private readonly remote: TransferRemote, private readonly config: WorkspaceConfig,
     private readonly files: Pick<FileService, "call" | "localPath">) {
-    const identityDirectory = join(config.localStateDir, createHash("sha256").update(config.identity).digest("hex").slice(0, 24));
+    const identityDirectory = identityStateDirectory(config.localStateDir, config.identity);
     this.directory = join(identityDirectory, "transfers");
     // Download temps are local resources; the ledger is the same per-workspace
     // instrument the file tools use (issue #8). Since #16 the limit is re-read
@@ -199,6 +199,12 @@ export class TransferService {
   }
 
   private async localRecord(transferId: string, sessionId: string): Promise<LocalTransferRecord> {
+    const record = await this.localRecordAny(transferId);
+    if (record.sessionId !== sessionId) throw new RemoteAgentError("TRANSFER_SCOPE_MISMATCH", "Transfer belongs to another conversation");
+    return record;
+  }
+
+  private async localRecordAny(transferId: string): Promise<LocalTransferRecord> {
     if (!/^[a-f0-9]{32}$/.test(transferId)) throw new RemoteAgentError("TRANSFER_NOT_FOUND", "No local registration for this transfer");
     let record: LocalTransferRecord;
     try { record = JSON.parse(await readFile(join(this.directory, transferId, "record.json"), "utf8")); }
@@ -209,7 +215,6 @@ export class TransferService {
     if (record.schemaVersion !== 1 || record.workspaceId !== this.config.workspaceId || record.transferId !== transferId) {
       throw new RemoteAgentError("TRANSFER_SCOPE_MISMATCH", "Transfer registration does not match this workspace");
     }
-    if (record.sessionId !== sessionId) throw new RemoteAgentError("TRANSFER_SCOPE_MISMATCH", "Transfer belongs to another conversation");
     return record;
   }
 
@@ -1126,6 +1131,50 @@ export class TransferService {
         // exclusion, not a defect; anything else is a registry issue.
         if (code === "TRANSFER_SCOPE_MISMATCH") continue;
         this.transferRegistryIssues.push({ transferId: entry.name, code: code ?? "REGISTRY_CORRUPT" });
+        continue;
+      }
+      try {
+        const ack = JSON.parse(await readFile(join(this.directory, entry.name, "ack.json"), "utf8"));
+        if (ack.transferId !== entry.name) throw new RemoteAgentError("REGISTRY_CORRUPT", "Invalid transfer acknowledgement");
+        continue; // already consumed
+      } catch (error) {
+        if (!isMissing(error)) {
+          // An unreadable (torn JSON) or mismatching acknowledgement is an
+          // INVALID one: the transfer stays pending with the defect reported,
+          // never silently treated as consumed (contracts: pending section).
+          if ((error as RemoteAgentError).code === "REGISTRY_CORRUPT" || error instanceof SyntaxError) {
+            this.transferRegistryIssues.push({ transferId: entry.name, code: "INVALID_ACKNOWLEDGEMENT" });
+          } else {
+            this.transferRegistryIssues.push({ transferId: entry.name, code: "REGISTRY_CORRUPT" });
+            continue;
+          }
+        }
+      }
+      pending.push({ transferId: entry.name, direction: record.direction,
+        path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
+        confirmedOffset: record.direction === "download" ? record.confirmedOffset : undefined,
+        state: record.direction === "download" ? record.state : undefined,
+        createdAt: record.createdAt });
+    }
+    return pending.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  /** Binding-level (every session) unacknowledged registrations. The remove
+   * action uses this so another conversation's unfinished work blocks removal;
+   * unlike pending(), no session is an ordinary exclusion here, so a workspace
+   * mismatch surfaces as a registry issue instead of being skipped. */
+  async pendingAcross(): Promise<PendingTransfer[]> {
+    this.transferRegistryIssues.length = 0;
+    let entries;
+    try { entries = await readdir(this.directory, { withFileTypes: true }); }
+    catch (error) { if (isMissing(error)) return []; throw error; }
+    const pending: PendingTransfer[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
+      let record: LocalTransferRecord;
+      try { record = await this.localRecordAny(entry.name); }
+      catch (error) {
+        this.transferRegistryIssues.push({ transferId: entry.name, code: (error as RemoteAgentError).code ?? "REGISTRY_CORRUPT" });
         continue;
       }
       try {

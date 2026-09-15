@@ -7,7 +7,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1408,4 +1408,29 @@ it('a corrupted ack.json keeps the transfer pending with an INVALID_ACKNOWLEDGEM
     assert.deepEqual(pending.map(entry => entry.transferId), [partial.transferId]);
     assert.equal(transfers.transferRegistryIssues[0].code, 'INVALID_ACKNOWLEDGEMENT');
   } finally { await fake.cleanup(); }
+});
+
+it('pendingAcross lists unacknowledged transfers from every session for removal checks', async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'ssh-mcp-transfers-across-'));
+  try {
+    const offline = { async call() { throw new Error('No remote calls'); }, async localPath() { throw new Error('No remote calls'); } };
+    const config = { workspaceId: 'ws-across', identity: 'identity-across', profilePath: join(stateRoot, 'profile.json'),
+      localStateDir: join(stateRoot, 'local') };
+    const transfers = new TransferService(offline, config, offline);
+    const identityDirectory = join(config.localStateDir, createHash('sha256').update(config.identity).digest('hex').slice(0, 24));
+    const record = transferId => ({ schemaVersion: 1, transferId, workspaceId: config.workspaceId,
+      sessionId: 'session-' + transferId[0], direction: 'upload', localPath: 'x', remotePath: '/x',
+      totalBytes: 1, totalSha256: '0'.repeat(64), chunkSize: 1, overwrite: false, create: true,
+      expectedVersion: null, createdAt: new Date().toISOString() });
+    for (const id of ['a'.repeat(32), 'b'.repeat(32)]) {
+      await mkdir(join(identityDirectory, 'transfers', id), { recursive: true });
+      await writeFile(join(identityDirectory, 'transfers', id, 'record.json'), JSON.stringify(record(id)));
+    }
+    assert.deepEqual((await transfers.pending('session-a')).map(entry => entry.transferId), ['a'.repeat(32)]);
+    assert.deepEqual((await transfers.pendingAcross()).map(entry => entry.transferId).sort(), ['a'.repeat(32), 'b'.repeat(32)],
+      'removal checks see every session, not just the current one');
+    await writeFile(join(identityDirectory, 'transfers', 'a'.repeat(32), 'ack.json'),
+      JSON.stringify({ transferId: 'a'.repeat(32), state: 'completed', acknowledgedAt: new Date().toISOString() }));
+    assert.deepEqual((await transfers.pendingAcross()).map(entry => entry.transferId), ['b'.repeat(32)]);
+  } finally { await rm(stateRoot, { recursive: true, force: true }); }
 });

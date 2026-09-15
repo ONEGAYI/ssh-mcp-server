@@ -34,6 +34,12 @@ export function serverNameForWorkspaceId(workspaceId: string): string {
   return "ssh-workspace-" + workspaceId.replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
+/** The per-binding local state directory both task and transfer registrations
+ * live under; setup's remove action deletes exactly this directory. */
+export function identityStateDirectory(localStateDir: string, identity: string): string {
+  return join(localStateDir, createHash("sha256").update(identity).digest("hex").slice(0, 24));
+}
+
 export interface WorkspaceConfig {
   workspaceId: string;
   bindingName?: string;
