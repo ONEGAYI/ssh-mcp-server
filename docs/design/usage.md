@@ -101,6 +101,7 @@ policy 组与默认值（未写的字段按默认生效）：
 - **外科手术边界**：只摘自己的条目，其他绑定与用户自有的 MCP/钩子不受影响；`.zcode/config.json` 摘空后的空节点原样保留；外部引用的 `sshConfigFile` 永不删除。
 - **存量文档**：仅当移除的是最后一个绑定（config 中不再有 `ssh-workspace-*` 服务）时，才复用 #31 的匹配逻辑回收仍与已知生成文本一致的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md 并报告；用户改过的保留。
 - **远端收尾**：remove 不连 SSH，只在返回中报告远端状态目录绝对路径与手工清理指引；远端记录由维护轮按保留期自然回收。
+- **移除前与中断后**：先关闭仍在使用该绑定的会话与 MCP 服务（重开本项目即可），避免移除期间新建的任务/传输登记被连带删除或成为孤儿。profile 删除后若清理步骤失败或进程中断，remove 无法重跑，按返回报告中的路径（connectionFile、localStateDir、legacyDocs）手工删除残留。
 - 返回 `remoteStateDir` 与各步骤结果；若 profile 曾提交进 git，删除后由用户自行提交，remove 不执行任何 git 命令。
 
 ### 手工入口（保留兼容）

@@ -14,6 +14,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { legacyV3 } from './legacy-doc-generations.mjs';
 import { loadWorkspaceConfig, identityStateDirectory } from '../build/config/workspace.js';
 import { TaskService } from '../build/services/task-service.js';
+import { removeWorkspaceBinding } from '../build/services/workspace-setup.js';
 import * as setupServer from '../build/core/setup-server.js';
 const { configureFromTool, setupFromTool } = setupServer;
 
@@ -245,7 +246,7 @@ it('the manual CLI previews a removal and executes it with the printed revision'
     await writeFile(join(root, 'ssh.json'), JSON.stringify({ offline: { host: 'localhost', port: 22, username: 'test', password: 'test-only' } }));
     const profile = join(root, 'profile.json');
     await writeFile(profile, JSON.stringify({ workspaceId: 'cli-remove', connectionName: 'offline', sshConfigFile: 'ssh.json',
-      remoteRoot: '/work', remoteStateDir: '/state' }));
+      remoteRoot: '/work', remoteStateDir: '/state', localStateDir: './state' }));
     await mkdir(join(root, '.zcode'));
     await writeFile(join(root, '.zcode', 'config.json'), JSON.stringify({ mcp: { servers: {} } }));
     const run = args => spawnSync(process.execPath, [cli, '--workspace', profile, ...args], { encoding: 'utf8', timeout: 10000 });
@@ -318,5 +319,71 @@ it('remove rejects invalid profiles without touching them', async () => {
     await assert.rejects(setupFromTool({ action: 'remove', localRoot: root, revision: 'any' }), { code: 'SETUP_INVALID_CONFIG' },
       'a structurally invalid profile is rejected before anything else');
     assert.equal(await readFile(profile, 'utf8'), JSON.stringify({ workspaceId: 'x' }), 'the profile content survives');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('removal treats a torn registration record as reported damage but a torn acknowledgement as pending work', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-remove-registry-'));
+  try {
+    const ssh = join(root, 'ssh.json');
+    await writeFile(ssh, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'x' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: ssh, connectionName: 'eda',
+      remoteRoot: '/work', remoteStateDir: '/state', localStateDir: join(root, 'state') });
+    const inspected = await setupFromTool({ action: 'inspect', localRoot: root });
+    const remove = () => setupFromTool({ action: 'remove', localRoot: root, revision: inspected.revision });
+    const config = await loadWorkspaceConfig(configured.profilePath);
+    const identityDirectory = identityStateDirectory(config.localStateDir, config.identity);
+
+    // A torn record.json cannot assert pendingness either way: it must surface
+    // as a registry issue, never silently block or silently vanish.
+    const torn = join(identityDirectory, 'tasks', 'torn-record-job');
+    await mkdir(torn, { recursive: true });
+    await writeFile(join(torn, 'record.json'), '{"schemaVersion":1,"sessionId":"se');
+    // A torn ack.json counts as unacknowledged and must block removal.
+    const tasks = new TaskService(fakeRemote(), config.localStateDir, config.identity);
+    const blocked = await tasks.start({ sessionId: 'owner', cwd: '/work', command: 'build' });
+    await writeFile(join(identityDirectory, 'tasks', blocked.jobId, 'ack.json'), '{"jobId":"' + blocked.jobId);
+
+    await assert.rejects(remove(), error => error.code === 'SETUP_PENDING_OPERATIONS' && error.message.includes(blocked.jobId),
+      'the torn acknowledgement keeps the task counted as pending');
+    assert.ok(await readFile(configured.profilePath, 'utf8'), 'the blocked removal changed nothing');
+
+    await tasks.acknowledge(blocked.jobId, 'owner');
+    const removed = await remove();
+    assert.equal(removed.status, 'removed', 'the torn record alone never blocks removal');
+    assert.ok(removed.registryIssues.some(issue => issue.source === 'tasks' && issue.id === 'torn-record-job'),
+      'the torn registration is reported as damage instead of being ignored');
+    await assert.rejects(readFile(configured.profilePath), { code: 'ENOENT' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('removal preview explains a squatted server entry instead of showing a bare false', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-remove-squat-'));
+  try {
+    await configureFromTool({ localRoot: root, host: '127.0.0.1', port: 1, username: 'test', sshAgent: 'pageant',
+      remoteRoot: '/work', remoteStateDir: '/state', localStateDir: join(root, 'state') });
+    const profilePath = join(root, '.ssh-mcp-workspace.json');
+    // Point the generated server entry at some other workspace: same name,
+    // not our binding.
+    const configPath = join(root, '.zcode', 'config.json');
+    const config = JSON.parse(await readFile(configPath, 'utf8'));
+    const serverName = Object.keys(config.mcp.servers).find(name => name.startsWith('ssh-workspace-'));
+    const at = config.mcp.servers[serverName].args.indexOf('--workspace');
+    config.mcp.servers[serverName].args[at + 1] = join(root, 'some-other-profile.json');
+    await writeFile(configPath, JSON.stringify(config, null, 2) + '\n');
+
+    const preview = await removeWorkspaceBinding(profilePath);
+    assert.equal(preview.status, 'removal_preview');
+    assert.equal(preview.wouldRemove.mcpServerEntry, false);
+    assert.match(preview.note, /left untouched/, 'the preview says why the entry stays');
+
+    const removed = await removeWorkspaceBinding(profilePath, preview.revision);
+    assert.equal(removed.status, 'removed');
+    assert.equal(removed.unhooked.mcpServerEntry, false);
+    assert.match(removed.unhooked.note, /left untouched/);
+    assert.deepEqual(removed.unhooked.recoveryHooks, 1, 'our own recovery hook still goes');
+    const after = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.ok(after.mcp.servers[serverName], 'the squatted entry survives the removal');
+    assert.deepEqual(after.hooks.events.UserPromptSubmit, []);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

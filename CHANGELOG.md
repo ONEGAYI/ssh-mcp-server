@@ -9,7 +9,7 @@
 ### 新功能
 
 - **remote_setup 移除绑定（remove）**（#28 决策，票据 #32）：`action: "remove"` 按 revision 防并发（与 update 一致）、标注 `destructiveHint`；绑定存在任何未确认任务或传输时硬拒绝（SETUP_PENDING_OPERATIONS，按绑定全量统计、不限当前对话，无 force 参数）；通过后按"先摘钩子与 MCP 条目、再删 profile"的顺序摘除 `.zcode/config.json` 中本绑定的接入（空节点原样保留，外部 MCP/钩子不动），删除 profile、setup 生成的连接文件与本机 identity 状态目录；外部引用的 sshConfigFile 永不删除。仅当移除最后一个绑定时，复用 #31 的匹配逻辑回收仍与已知生成文本一致的存量文档并报告。全程零 SSH 连接，远端状态目录仅报告路径与手工清理指引。
-- **手工 CLI 移除入口**（票据 #33）：`node scripts/setup-workspace.mjs --workspace <profile> --remove [--revision <token>]` 与 MCP 共用同一实现；不带 revision 先返回包含当前 revision 与待确认工作清单的预览，带 revision 执行；拒绝路径与 MCP 一致，错误以 JSON 输出到 stderr 并以非零码退出。
+- **手工 CLI 移除入口**（票据 #33）：`node scripts/setup-workspace.mjs --workspace <profile> --remove [--revision <token>]` 与 MCP 共用同一实现；不带 revision 先返回包含当前 revision 与待确认工作清单的预览，带 revision 执行；移除流程的拒绝与失败以 JSON 输出到 stderr 并以非零码退出（参数误用仍为 Node 直接抛错）。注解为工具级——含破坏性动作后 remote_setup 整体标注 destructiveHint: true、idempotentHint: false（MCP 注解无 action 粒度，保守方向）。
 
 ### 其他改进
 

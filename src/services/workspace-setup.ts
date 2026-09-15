@@ -284,6 +284,7 @@ export interface RemovalPreview {
   profilePath: string;
   bindingName?: string;
   serverName: string;
+  note?: string;
   blocked: boolean;
   pending: RemovalPending;
   wouldRemove: {
@@ -335,8 +336,8 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   let config: WorkspaceConfig;
   try { config = await loadWorkspaceConfig(absolute); }
   catch (error) {
-    if (error instanceof RemoteAgentError) throw error;
-    throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not derive the binding identity: the profile's referenced SSH config must stay readable until removal; it was left untouched");
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", `Could not derive the binding identity (${detail}); the profile's referenced SSH config must stay readable until removal, and the profile was left untouched`);
   }
   const pending = await removalPending(config);
   const generatedConnection = join(config.localRoot, config.bindingName
@@ -352,6 +353,7 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
       status: "removal_preview", revision: revisionOf(content), profilePath: absolute,
       ...(config.bindingName ? { bindingName: config.bindingName } : {}),
       serverName: plan.serverName,
+      ...(plan.note ? { note: plan.note } : {}),
       blocked: pending.tasks.length + pending.transfers.length > 0,
       pending,
       wouldRemove: {
@@ -359,7 +361,7 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
         connectionFile: { path: config.sshConfigFile, generated },
         localStateDir: statePath, lastBinding: plan.lastBinding,
       },
-      instructions: "Pass this revision back to execute the removal. Blocked until every pending task and transfer is acknowledged; registryIssues list local registration defects worth checking first. No SSH connection is ever made.",
+      instructions: "Pass this revision back to execute the removal. Blocked until every pending task and transfer is acknowledged; registryIssues list local registration defects worth checking first. Close other sessions and MCP servers still using this binding before removing — registrations they create during removal would be deleted or orphaned. No SSH connection is ever made.",
     };
   }
 
@@ -431,6 +433,6 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
     ...(legacyDocs ? { legacyDocs } : {}),
     ...(legacyCleanupError ? { legacyCleanupError } : {}),
     ...(pending.registryIssues.length ? { registryIssues: pending.registryIssues } : {}),
-    instructions: "No SSH connection was made. The remote state directory keeps its records until the workspace server's maintenance cycles reclaim them by retention; delete it manually over SSH if it must go now. Keep any remaining .ssh-mcp-*.json (other bindings, external SSH configs) in this project's .gitignore; if the deleted files were ever committed, commit the deletions yourself — remove never runs git commands.",
+    instructions: "No SSH connection was made. The remote state directory keeps its records until the workspace server's maintenance cycles reclaim them by retention; delete it manually over SSH if it must go now. Keep any remaining .ssh-mcp-*.json (other bindings, external SSH configs) in this project's .gitignore; if the deleted files were ever committed, commit the deletions yourself — remove never runs git commands. If a cleanup step failed or the process was interrupted after this point, finish by hand: delete the reported paths that still exist (a re-run cannot resume once the profile is gone).",
   };
 }

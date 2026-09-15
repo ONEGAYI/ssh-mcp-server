@@ -26,11 +26,10 @@
  * registration record, the remote register-then-execute protocol rejects
  * unknown identifiers with REQUEST_EXPIRED_OR_UNKNOWN.
  */
-import { createHash } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { loadPolicy } from "../config/policy.js";
-import { WorkspaceConfig } from "../config/workspace.js";
+import { WorkspaceConfig, identityStateDirectory } from "../config/workspace.js";
 import { SpaceLedger } from "./space-ledger.js";
 
 const TASK_ID = /^[A-Za-z0-9_-]{1,80}$/;
@@ -100,7 +99,7 @@ export class MaintenanceService {
 
   constructor(private readonly config: Pick<WorkspaceConfig, "localStateDir" | "identity" | "profilePath">,
     private readonly remote: MaintenanceRemote | null) {
-    this.identityDirectory = join(config.localStateDir, createHash("sha256").update(config.identity).digest("hex").slice(0, 24));
+    this.identityDirectory = identityStateDirectory(config.localStateDir, config.identity);
     this.tasksDirectory = join(this.identityDirectory, "tasks");
     this.transfersDirectory = join(this.identityDirectory, "transfers");
     this.statePath = join(this.identityDirectory, "maintenance.json");
