@@ -5,6 +5,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { Readable, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
+import { generateKeyPairSync } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -711,6 +712,46 @@ describe('SSH Connection Manager', () => {
       assert.strictEqual(manager.statusCache.get('dev').reachable, true);
     });
 
+    it('状态采集经真实内部通道执行预验证探针', async () => {
+      // The case above replaces runCommandInternal, so the real
+      // prevalidatedInternalCommand bypass has no coverage there: if that
+      // branch regressed (internal probes also passing the whitelist), the
+      // merged probe script — which never matches ^hostname$ on its own —
+      // would be rejected and status fields would silently stay empty.
+      // Drive the real channel end to end here.
+      const execCommands = [];
+      const client = new FakeClient({
+        onConnect: () => setImmediate(() => client.emit('ready')),
+        onExec: ({ command, callback }) => {
+          execCommands.push(command);
+          const stream = new FakeExecStream();
+          callback(undefined, stream);
+          setImmediate(() => {
+            const marker = command.match(/printf '\\n(__MCP_FIELD_\w+_)hostname/)?.[1];
+            stream.emit('data', Buffer.from(`\n${marker}hostname\nfake-host\n`));
+            stream.emit('exit', 0);
+            stream.emit('close', 0);
+          });
+        },
+      });
+
+      manager.createClient = () => client;
+      manager.scheduleStatusCollection = () => {};
+      manager.setConfig({
+        dev: createPasswordConfig({
+          name: 'dev',
+          commandWhitelist: ['^hostname$'],
+        }),
+      });
+
+      await manager.collectStatusForConnection('dev');
+      const info = manager.getAllServerInfos().find((server) => server.name === 'dev');
+      assert.strictEqual(info.status.hostname, 'fake-host');
+      assert.ok(execCommands.length >= 1);
+      assert.ok(execCommands.every((command) => command.includes('hostname')));
+      assert.ok(execCommands.every((command) => !command.includes('uname -s')));
+    });
+
     it('SOCKS 代理应传递认证信息并脱敏日志', async () => {
       const originalCreateConnection = SocksClient.createConnection;
       const originalLog = Logger.log;
@@ -1002,22 +1043,35 @@ describe('SSH Connection Manager', () => {
     });
 
     it('tryKeyboard authHandler 应在 publickey 仍可用时继续尝试 agent', async () => {
-      const sshConfig = await manager.buildClientConfig(
-        'mixed',
-        createPasswordConfig({
-          name: 'mixed',
-          password: undefined,
-          privateKey: path.join(process.cwd(), 'node_modules/ssh2/test/fixtures/id_rsa'),
-          agent: '/tmp/ssh-agent.sock',
-          tryKeyboard: true,
-        }),
-      );
+      // buildClientConfig reads privateKey from a file path, so generate a
+      // throwaway key instead of depending on ssh2's shipped test fixture
+      // (absent from production installs).
+      const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' } });
+      const keyDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-mcp-key-'));
+      try {
+        const keyPath = path.join(keyDirectory, 'id_rsa');
+        fs.writeFileSync(keyPath, privateKey);
+        const sshConfig = await manager.buildClientConfig(
+          'mixed',
+          createPasswordConfig({
+            name: 'mixed',
+            password: undefined,
+            privateKey: keyPath,
+            agent: '/tmp/ssh-agent.sock',
+            tryKeyboard: true,
+          }),
+        );
 
-      const attempts = [];
-      sshConfig.authHandler(null, null, (nextAuth) => attempts.push(nextAuth));
-      sshConfig.authHandler(['publickey', 'keyboard-interactive'], false, (nextAuth) => attempts.push(nextAuth));
+        const attempts = [];
+        sshConfig.authHandler(null, null, (nextAuth) => attempts.push(nextAuth));
+        sshConfig.authHandler(['publickey', 'keyboard-interactive'], false, (nextAuth) => attempts.push(nextAuth));
 
-      assert.deepStrictEqual(attempts, ['publickey', 'agent']);
+        assert.deepStrictEqual(attempts, ['publickey', 'agent']);
+      } finally {
+        fs.rmSync(keyDirectory, { recursive: true, force: true });
+      }
     });
 
     it('keyboard prompt 有验证码时应优先响应非密码提示', async () => {

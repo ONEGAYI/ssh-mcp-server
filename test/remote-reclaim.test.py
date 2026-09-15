@@ -504,7 +504,11 @@ class RemoteReclaimTest(unittest.TestCase):
         rejected = self.call('file_edit', {'path': 'credential.txt', 'readToken': token,
                                            'edits': [{'oldText': 'alpha', 'newText': 'beta'}]})
         self.assertFalse(rejected['ok'])
-        self.assertIn(rejected['error']['code'], ('READ_REQUIRED', 'READ_TOKEN_EXPIRED'))
+        # The record and its index are physically deleted above, so the edit
+        # can only hit the "record unavailable" branch; the expired branch
+        # requires the record to still exist (contracts.md read-credential
+        # reclaim: reclaimed tokens answer READ_REQUIRED).
+        self.assertEqual(rejected['error']['code'], 'READ_REQUIRED')
         # Recovery is one fresh read of just the needed fragment.
         second = self.call('file_read', {'path': 'credential.txt', 'offset': 0, 'maxBytes': 24})['result']
         edited = self.call('file_edit', {'path': 'credential.txt', 'readToken': second['readToken'],

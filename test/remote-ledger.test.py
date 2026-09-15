@@ -45,6 +45,7 @@ class RemoteLedgerTest(unittest.TestCase):
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=15)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     def set_limit(self, limit):
@@ -192,6 +193,7 @@ class RemoteLedgerTest(unittest.TestCase):
         output = process.stdout.read()
         process.wait(timeout=15)
         self.assertEqual(process.returncode, 0)
+        self.assertTrue(output.startswith('SSH_MCP_V1 '), output)
         self.assertTrue(json.loads(base64.b64decode(output.split(' ', 1)[1]))['ok'], output)
 
         # Part B: the moment a temp file becomes observable, its registration

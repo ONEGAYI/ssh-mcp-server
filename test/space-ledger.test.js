@@ -31,7 +31,8 @@ function spawnReserver(directory, limit, bytes) {
     }`;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--input-type=module', '-e', script],
-      { env: { ...process.env, LEDGER_DIR: directory, LEDGER_LIMIT: String(limit), LEDGER_BYTES: String(bytes) } });
+      { stdio: ['ignore', 'pipe', 'inherit'],
+        env: { ...process.env, LEDGER_DIR: directory, LEDGER_LIMIT: String(limit), LEDGER_BYTES: String(bytes) } });
     let output = '';
     child.stdout.on('data', chunk => { output += chunk; });
     child.on('error', reject);

@@ -433,11 +433,17 @@ class RemoteTransferTest(unittest.TestCase):
         # NOT proof of our commit: the outcome stays unknown.
         (self.state / 'transfers' / transfer_id / 'receipt.json').unlink()
         target = self.work / 'target.bin'
+        original_inode = os.stat(str(target)).st_ino
         target.unlink()
         # The freshly freed inode is consumed first, so the recreation below
-        # really is a different object.
+        # really is a different object. Inode allocation order is a filesystem
+        # implementation detail, not a POSIX guarantee: make the assumption
+        # explicit so an environment that hands the inode back skips instead
+        # of reporting a contract failure.
         (self.work / '.inode-cushion').write_bytes(b'cushion')
         target.write_bytes(data)  # same bytes, different inode
+        if os.stat(str(target)).st_ino == original_inode:
+            self.skipTest('filesystem reused the freed inode for the recreated target')
         self.assertEqual(self.call('transfer_commit', {'transferId': transfer_id})['error']['code'],
                          'TRANSFER_STATE_UNKNOWN')
         # The same inode rewritten with different content is not our commit either.
@@ -748,6 +754,11 @@ class RemoteTransferTest(unittest.TestCase):
         self.assertTrue(self.start(transfer_id)['ok'])
         temp = self.temp_path(transfer_id)
         self.assertTrue(temp.exists())
+        # The directory permission bits are the failure trigger; root ignores
+        # them, so the case can only run unprivileged (in-process monkey-
+        # patching os.unlink would not reach the helper subprocess).
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('root ignores the directory permission bits this case needs')
         os.chmod(str(self.work), 0o500)  # unlink now fails with EACCES
         try:
             denied = self.call('transfer_cancel', {'transferId': transfer_id})

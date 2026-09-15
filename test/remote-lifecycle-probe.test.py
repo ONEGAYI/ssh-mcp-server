@@ -21,6 +21,21 @@ def wait_for(path, seconds=5):
 
 
 class LifecycleProbeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # A Windows checkout (core.autocrlf) leaves CRLF in the working tree
+        # while the committed bytes stay LF, and bash rejects CRLF endings
+        # ("set: pipefail\r: invalid option name") before any probe logic
+        # runs. Execute an LF-normalized copy instead, the same defense
+        # remote-discovery.test.py applies to its FAKE_BACKEND source.
+        cls.runner_dir = tempfile.TemporaryDirectory(prefix='ssh-mcp probe runner ')
+        cls.runner = Path(cls.runner_dir.name) / RUNNER.name
+        cls.runner.write_bytes(RUNNER.read_bytes().replace(b'\r\n', b'\n'))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runner_dir.cleanup()
+
     def stop_own_worker(self, job):
         if not (job / 'worker-pid').exists():
             return
@@ -40,11 +55,11 @@ class LifecycleProbeTest(unittest.TestCase):
             command = "printf ready > ready; deadline=$((SECONDS+20)); while [ ! -f release ]; do [ $SECONDS -lt $deadline ] || exit 98; sleep 0.05; done; printf 'hello\\n'; printf 'warning\\n' >&2; exit 7"
             job = root / 'job-one'
             try:
-                launched = subprocess.run(['/usr/bin/bash', str(RUNNER), 'start', str(root), 'job-one', command],
+                launched = subprocess.run(['/usr/bin/bash', str(self.runner), 'start', str(root), 'job-one', command],
                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5)
                 self.assertEqual(launched.returncode, 0, launched.stderr)
                 wait_for(job / 'ready')
-                running = subprocess.check_output(['/usr/bin/bash', str(RUNNER), 'inspect', str(root), 'job-one'],
+                running = subprocess.check_output(['/usr/bin/bash', str(self.runner), 'inspect', str(root), 'job-one'],
                                                   universal_newlines=True, timeout=5)
                 self.assertIn('state=running', running)
             finally:
@@ -54,7 +69,7 @@ class LifecycleProbeTest(unittest.TestCase):
                         wait_for(job / 'exit-code')
                     finally:
                         self.stop_own_worker(job)
-            inspected = subprocess.check_output(['/usr/bin/bash', str(RUNNER), 'inspect', str(root), 'job-one'],
+            inspected = subprocess.check_output(['/usr/bin/bash', str(self.runner), 'inspect', str(root), 'job-one'],
                                                 universal_newlines=True, timeout=5)
             self.assertIn('state=exited', inspected)
             self.assertIn('exitCode=7', inspected)
@@ -66,13 +81,13 @@ class LifecycleProbeTest(unittest.TestCase):
             root = Path(tmp)
             job = root / 'job-dead'
             try:
-                subprocess.check_call(['/usr/bin/bash', str(RUNNER), 'start', str(root), 'job-dead', 'sleep 20'],
+                subprocess.check_call(['/usr/bin/bash', str(self.runner), 'start', str(root), 'job-dead', 'sleep 20'],
                                       stdout=subprocess.DEVNULL, timeout=5)
                 wait_for(job / 'running')
                 self.stop_own_worker(job)
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
-                    inspected = subprocess.check_output(['/usr/bin/bash', str(RUNNER), 'inspect', str(root), 'job-dead'],
+                    inspected = subprocess.check_output(['/usr/bin/bash', str(self.runner), 'inspect', str(root), 'job-dead'],
                                                         universal_newlines=True, timeout=5)
                     if 'state=unknown' in inspected:
                         break

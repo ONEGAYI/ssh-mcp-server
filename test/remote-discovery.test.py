@@ -108,6 +108,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=timeout, env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     def call_env(self, action, request, env, timeout=30):
@@ -116,6 +117,7 @@ class RemoteDiscoveryTest(unittest.TestCase):
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=timeout, env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     # --- helpers -------------------------------------------------------------
@@ -701,7 +703,8 @@ class RemoteDiscoveryTest(unittest.TestCase):
     def test_find_second_page_zero_advance_raises_instead_of_repeating_cursor(self):
         # 续页把整个时间预算耗在跳过已返回候选上时，返回同游标的
         # partial 会让每页重新全量枚举又同样超时，查询永久不可完成：
-        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。        sys.path.insert(0, str(HELPER.parent))
+        # 应报明确的 SCAN_TIME_LIMIT 错误。首页（after=None）语义不变。
+        sys.path.insert(0, str(HELPER.parent))
         import discovery
         from common import AgentError
         from files import FileService

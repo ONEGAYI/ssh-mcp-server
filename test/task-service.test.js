@@ -247,3 +247,27 @@ it('pendingAcross lists unacknowledged work from every session for removal check
     assert.deepEqual(await service.pendingAcross(), []);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+it('terminal status carries a stable eventId bound to the completion identity', async () => {
+  // contracts.md completion hand-off: results carry one stable event id and
+  // consumers deduplicate by it. Pin the generating factors (workspaceId /
+  // jobId / state / completedAt) and the terminal stability, so a unit or
+  // serialization-order change cannot turn one completion into two events.
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-event-'));
+  const remote = fakeRemote();
+  try {
+    const service = new TaskService(remote, directory, 'binding');
+    const created = await service.start({ sessionId: 'session-one', cwd: '/work', command: 'build' });
+    const first = await service.status(created.jobId);
+    const second = await service.status(created.jobId);
+    assert.equal(first.eventId, second.eventId, 'the same terminal task must yield one event id');
+    assert.match(first.eventId, /^[a-f0-9]{64}$/);
+    assert.equal(first.eventId, createHash('sha256')
+      .update(JSON.stringify(['binding', created.jobId, 'exited', 100])).digest('hex'));
+    await service.acknowledge(created.jobId, 'session-one');
+    const completion = JSON.parse(await readFile(
+      join(directory, createHash('sha256').update('binding').digest('hex').slice(0, 24),
+        'tasks', created.jobId, 'completion.json'), 'utf8'));
+    assert.equal(completion.eventId, first.eventId);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

@@ -216,7 +216,7 @@ describe('集成测试', () => {
         process.argv = ['node', 'test', '--config-file', incompleteConfig];
         assert.throws(() => {
           CommandLineParser.parseArgs();
-        });
+        }, /Port must be a valid number/);
       } finally {
         fs.unlinkSync(incompleteConfig);
       }

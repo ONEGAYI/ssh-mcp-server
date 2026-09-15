@@ -30,6 +30,7 @@ class RemoteFilesTest(unittest.TestCase):
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=10)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     def scoped_call(self, action, request, scope, allowed=None, session='session-one'):
@@ -42,6 +43,7 @@ class RemoteFilesTest(unittest.TestCase):
                              input=json.dumps(data), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, timeout=10)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     def test_file_management_actions_are_retired(self):
@@ -649,6 +651,7 @@ class RemoteFilesTest(unittest.TestCase):
                              universal_newlines=True, timeout=30,
                              env=dict(os.environ, SSH_MCP_TEST_CLOCK=str(float(clock))))
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith('SSH_MCP_V1 '), run.stdout)
         return json.loads(base64.b64decode(run.stdout.split(' ', 1)[1]))
 
     def write_fixed_lines(self, path, total_lines, line_bytes=64):

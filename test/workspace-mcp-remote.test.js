@@ -9,6 +9,28 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
 
 const profile = process.env.SSH_MCP_TEST_WORKSPACE;
+
+/** Register, start and wait for one shell task on the remote, asserting a
+ * clean exit. Issue #20 retired remote_delete/remote_move (ADR 0007), so the
+ * cases below clean up through this registered execute task — the shell
+ * replacement path. Single definition keeps the terminal-state checks from
+ * drifting between copies. */
+const runTask = async (runtime, command) => {
+  const registration = await runtime.remote.call('task_register', { protocol: 2,
+    cwd: runtime.config.remoteRoot, command });
+  await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
+  const deadline = Date.now() + 120000;
+  for (;;) {
+    const state = await runtime.remote.call('status', { jobId: registration.jobId });
+    if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
+      assert.equal(state.state, 'exited', JSON.stringify(state));
+      assert.equal(state.exitCode, 0, JSON.stringify(state));
+      return state;
+    }
+    if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+};
 it('real workspace MCP protects uploads and transfers binary data without granting hidden read coverage', { skip: !profile, timeout: 90000 }, async () => {
   const { createWorkspaceRuntime } = await import('../build/services/workspace-runtime.js');
   const config = await loadWorkspaceConfig(profile);
@@ -21,24 +43,6 @@ it('real workspace MCP protects uploads and transfers binary data without granti
   const call = async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
-  };
-  // Issue #20: remote_delete/remote_move are retired (ADR 0007); the test
-  // cleans up through a registered execute task, the shell replacement path.
-  const runTask = async command => {
-    const registration = await runtime.remote.call('task_register', { protocol: 2,
-      cwd: runtime.config.remoteRoot, command });
-    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
-    const deadline = Date.now() + 120000;
-    for (;;) {
-      const state = await runtime.remote.call('status', { jobId: registration.jobId });
-      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
-        assert.equal(state.state, 'exited', JSON.stringify(state));
-        assert.equal(state.exitCode, 0, JSON.stringify(state));
-        return state;
-      }
-      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
   };
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath,
@@ -91,7 +95,7 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.deepEqual(page2.data.matches.map(match => match.line), [4]);
     assert.equal(page2.data.truncated, false);
     assert.equal('readToken' in page1.data, false);
-    await runTask(`rm -f '${searchPath}'`);
+    await runTask(runtime, `rm -f '${searchPath}'`);
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
     const transfer = await call('remote_download', { path, localPath: downloaded });
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));
@@ -137,10 +141,10 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal(overwritten.error, undefined, JSON.stringify(overwritten));
     const staleCursor = await call('remote_read', { path, offset: beforeWrite.data.nextOffset, expectedVersion: beforeWrite.data.version });
     assert.equal(staleCursor.data.code, 'FILE_CONFLICT');
-    await runTask(`rm -f '${path}'`);
+    await runTask(runtime, `rm -f '${path}'`);
   } finally {
     await client.close();
-    await runTask(`rm -f '${path}'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${path}'`).catch(() => undefined);
     runtime.close();
     for (const target of [localPath, downloaded]) await unlink(target).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
@@ -159,28 +163,12 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
   };
-  const runTask = async command => {
-    const registration = await runtime.remote.call('task_register', { protocol: 2,
-      cwd: runtime.config.remoteRoot, command });
-    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
-    const deadline = Date.now() + 120000;
-    for (;;) {
-      const state = await runtime.remote.call('status', { jobId: registration.jobId });
-      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
-        assert.equal(state.state, 'exited', JSON.stringify(state));
-        assert.equal(state.exitCode, 0, JSON.stringify(state));
-        return state;
-      }
-      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-  };
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
     // Generate the 200 MiB fixture on the remote side itself: fixed 64-byte
     // lines ('L<n> ' head + x padding + newline), matching lineOf exactly.
-    await runTask(`python3 -c "f = open('${remoteName}', 'wb'); ` +
+    await runTask(runtime, `python3 -c "f = open('${remoteName}', 'wb'); ` +
       `[f.write(('L%d ' % i).encode('ascii') + b'x' * (64 - len('L%d ' % i) - 1) + b'\\n') for i in range(1, ${lineCount + 1})]; ` +
       `f.close()"`);
     const meta = await call('remote_read', { path: remoteName, metadataOnly: true });
@@ -217,7 +205,7 @@ it('real workspace edits a 200 MiB file through the streamed replacement path', 
     assert.equal(finalMeta.data.size, 200 * 1024 * 1024 + delta);
   } finally {
     await client.close().catch(() => undefined);
-    await runTask(`rm -f '${remoteName}'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${remoteName}'`).catch(() => undefined);
     runtime.close();
   }
 });
@@ -232,22 +220,6 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
   const call = async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
-  };
-  const runTask = async command => {
-    const registration = await runtime.remote.call('task_register', { protocol: 2,
-      cwd: runtime.config.remoteRoot, command });
-    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
-    const deadline = Date.now() + 120000;
-    for (;;) {
-      const state = await runtime.remote.call('status', { jobId: registration.jobId });
-      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
-        assert.equal(state.state, 'exited', JSON.stringify(state));
-        assert.equal(state.exitCode, 0, JSON.stringify(state));
-        return state;
-      }
-      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
   };
   const startedAt = Date.now();
   try {
@@ -296,7 +268,7 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
     assert.equal(done.data.blocksSent, expectedBlocks,
       'resume must send only the unconfirmed blocks');
     // Independent remote-side digest over the committed target.
-    await runTask(`sha256sum '${remoteName}' > '${remoteName}.sha256'`);
+    await runTask(runtime, `sha256sum '${remoteName}' > '${remoteName}.sha256'`);
     const remoteDigest = await call('remote_read', { path: remoteName + '.sha256' });
     assert.equal(remoteDigest.error, undefined, JSON.stringify(remoteDigest));
     assert.equal(remoteDigest.data.text.trim().split(' ')[0], totalSha256);
@@ -307,7 +279,7 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
   } finally {
     await client.close().catch(() => undefined);
     await rm(localPath, { force: true });
-    await runTask(`rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
     runtime.close();
   }
 });
@@ -323,22 +295,6 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
   };
-  const runTask = async command => {
-    const registration = await runtime.remote.call('task_register', { protocol: 2,
-      cwd: runtime.config.remoteRoot, command });
-    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
-    const deadline = Date.now() + 120000;
-    for (;;) {
-      const state = await runtime.remote.call('status', { jobId: registration.jobId });
-      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
-        assert.equal(state.state, 'exited', JSON.stringify(state));
-        assert.equal(state.exitCode, 0, JSON.stringify(state));
-        return state;
-      }
-      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-  };
   const startedAt = Date.now();
   let partial = null; // visible to the finally for temp cleanup
   try {
@@ -347,9 +303,9 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     const size = 200 * 1024 * 1024;
     // Generate the fixture remotely (1 MiB tile repeated) and hash it there:
     // the remote digest is the sender's register-time truth to match against.
-    await runTask(`python3 -c "import os; t = os.urandom(1024 * 1024); ` +
+    await runTask(runtime, `python3 -c "import os; t = os.urandom(1024 * 1024); ` +
       `f = open('${remoteName}', 'wb'); [f.write(t) for _ in range(200)]; f.close()"`);
-    await runTask(`sha256sum '${remoteName}' > '${remoteName}.sha256'`);
+    await runTask(runtime, `sha256sum '${remoteName}' > '${remoteName}.sha256'`);
     const digestRead = await call('remote_read', { path: remoteName + '.sha256' });
     assert.equal(digestRead.error, undefined, JSON.stringify(digestRead));
     const remoteDigest = digestRead.data.text.trim().split(' ')[0];
@@ -422,7 +378,7 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     await client.close().catch(() => undefined);
     await rm(localPath, { force: true });
     await rm(join((await import('node:path')).dirname(localPath), '.ssh-mcp-download-' + (partial ? partial.data.transferId : '')), { force: true });
-    await runTask(`rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${remoteName}' '${remoteName}.sha256'`).catch(() => undefined);
     runtime.close();
   }
 });
@@ -436,21 +392,6 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
   const call = async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: { sessionId, ...args } });
     return { error: result.isError, data: JSON.parse(result.content[0].text) };
-  };
-  const runTask = async command => {
-    const registration = await runtime.remote.call('task_register', { protocol: 2,
-      cwd: runtime.config.remoteRoot, command });
-    await runtime.remote.call('task_start', { protocol: 2, jobId: registration.jobId });
-    const deadline = Date.now() + 120000;
-    for (;;) {
-      const state = await runtime.remote.call('status', { jobId: registration.jobId });
-      if (['exited', 'cancelled', 'interrupted'].includes(state.state)) {
-        assert.equal(state.state, 'exited', JSON.stringify(state));
-        return state;
-      }
-      if (Date.now() > deadline) throw new Error('task did not finish: ' + JSON.stringify(state));
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
   };
   const localPath = join(config.localRoot, sessionId + '-up.bin');
   try {
@@ -484,7 +425,7 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
     assert.equal(dead.data.state, 'cancelled');
     // The uncommitted remote temp is gone (runTask's cwd is the remote root,
     // where the target and its sibling temp live).
-    await runTask(`test ! -e '.ssh-mcp-upload-${partial.data.transferId}'`);
+    await runTask(runtime, `test ! -e '.ssh-mcp-upload-${partial.data.transferId}'`);
     const smallPath = join(config.localRoot, sessionId + '-small.bin');
     await writeFile(smallPath, Buffer.from('committed before cancel'));
     const done = await call('remote_upload', { localPath: smallPath, path: sessionId + '-small-remote.txt' });
@@ -510,7 +451,7 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
     await client.close().catch(() => undefined);
     await rm(localPath, { force: true });
     await rm(join(config.localRoot, sessionId + '-small.bin'), { force: true });
-    await runTask(`rm -f '${sessionId}-up.bin' '${sessionId}-small-remote.txt'`).catch(() => undefined);
+    await runTask(runtime, `rm -f '${sessionId}-up.bin' '${sessionId}-small-remote.txt'`).catch(() => undefined);
     runtime.close();
   }
 });

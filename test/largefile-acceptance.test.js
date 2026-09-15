@@ -723,8 +723,8 @@ it('killed local drivers and torn half-blocks recover with matching digests and 
     const digestRead = await runtime.remote.call('file_read', { workspaceRoot: config.remoteRoot,
       sessionId, path: uploadRemote + '.sha256' });
     assert.equal(digestRead.text.trim().split(' ')[0], expected, 'the remote committed target matches');
-    await task(`test ! -e '.ssh-mcp-upload-${uploadId}'`,
-      'the upload temp is released after the commit');
+    // The upload temp must be released once the commit has published it.
+    await task(`test ! -e '.ssh-mcp-upload-${uploadId}'`);
     invokeSync('transfer', 'ack', '--transfer-id', uploadId);
     console.log('[issue #21] 128 MiB upload recovery: stopped at %d B, healed+resumed at %d B, resent %d blocks (bound %d)',
       uploadFirst, uploadResumedAt, uploadDone.blocksSent, uploadRemaining + 1);
