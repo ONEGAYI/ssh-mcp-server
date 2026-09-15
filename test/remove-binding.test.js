@@ -61,6 +61,7 @@ it('remove takes out exactly one binding and reports the remote directory withou
     assert.equal(removed.remoteStateDir, configMain.remoteStateDir);
     assert.match(removed.instructions, /No SSH connection/, 'the report states the zero-connection promise');
     assert.match(removed.instructions, /manual/, 'the report explains the remote directory needs manual cleanup');
+    assert.match(removed.instructions, /gitignore/, 'the report keeps the .gitignore suggestion from the #28 decisions');
     assert.equal(removed.lastBinding, false);
     assert.ok(!('legacyDocs' in removed), 'shared documents are untouched while a sibling binding remains');
     assert.doesNotMatch(JSON.stringify(removed), /secret-never-shown/, 'no credentials leak into the report');
@@ -180,9 +181,8 @@ it('remove reclaims legacy generated documents only when the last binding goes',
       eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'x' },
       other: { host: '127.0.0.2', port: 22, username: 'test', password: 'x' } }));
     const common = { localRoot: root, sshConfigFile: ssh, remoteStateDir: '/state', localStateDir: join(root, 'state') };
-    const bindings = [
-      await configureFromTool({ ...common, bindingName: 'eda-main', connectionName: 'eda', remoteRoot: '/main' }),
-      await configureFromTool({ ...common, bindingName: 'builder', connectionName: 'other', remoteRoot: '/build' })];
+    await configureFromTool({ ...common, bindingName: 'eda-main', connectionName: 'eda', remoteRoot: '/main' });
+    await configureFromTool({ ...common, bindingName: 'builder', connectionName: 'other', remoteRoot: '/build' });
     await writeFile(join(root, 'AGENTS.md'), legacyV3);
     await writeFile(join(root, 'CLAUDE.md'), '@AGENTS.md\n');
     await writeFile(join(root, 'SSH-WORKSPACE-GUIDE.md'), legacyV3);
@@ -201,7 +201,6 @@ it('remove reclaims legacy generated documents only when the last binding goes',
     for (const name of ['AGENTS.md', 'CLAUDE.md', 'SSH-WORKSPACE-GUIDE.md']) {
       await assert.rejects(readFile(join(root, name)), { code: 'ENOENT' }, name + ' is reclaimed with the last binding');
     }
-    void bindings;
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -289,4 +288,35 @@ it('the setup tool advertises remove as a destructive, revision-guarded action',
     assert.equal(rejected.isError, true);
     assert.match(rejected.content[0].text, /SETUP_REVISION_REQUIRED/);
   } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it('remove refuses cleanly when the SSH config is unreadable or the profile is invalid', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-remove-invalid-'));
+  try {
+    const ssh = join(root, 'ssh.json');
+    await writeFile(ssh, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'x' } }));
+    const configured = await configureFromTool({ localRoot: root, sshConfigFile: ssh, connectionName: 'eda',
+      remoteRoot: '/work', remoteStateDir: '/state', localStateDir: join(root, 'state') });
+    const revision = (await setupFromTool({ action: 'inspect', localRoot: root })).revision;
+    // The identity derivation needs the referenced SSH config; without it the
+    // profile must survive untouched.
+    await rm(ssh);
+    await assert.rejects(setupFromTool({ action: 'remove', localRoot: root, revision }),
+      (error) => error.code === 'SETUP_INVALID_SSH_CONFIG' && /left untouched/.test(error.message));
+    assert.ok(await readFile(configured.profilePath, 'utf8'), 'an aborted removal leaves the profile in place');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('remove rejects invalid profiles without touching them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-remove-badjson-'));
+  try {
+    await writeFile(join(root, 'ssh.json'), JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'x' } }));
+    const profile = join(root, '.ssh-mcp-workspace.json');
+    await writeFile(profile, 'not json at all');
+    await assert.rejects(setupFromTool({ action: 'remove', localRoot: root, revision: 'any' }), { code: 'SETUP_INVALID_CONFIG' });
+    await writeFile(profile, JSON.stringify({ workspaceId: 'x' }));
+    await assert.rejects(setupFromTool({ action: 'remove', localRoot: root, revision: 'any' }), { code: 'SETUP_INVALID_CONFIG' },
+      'a structurally invalid profile is rejected before anything else');
+    assert.equal(await readFile(profile, 'utf8'), JSON.stringify({ workspaceId: 'x' }), 'the profile content survives');
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

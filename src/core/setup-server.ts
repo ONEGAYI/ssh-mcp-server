@@ -72,12 +72,17 @@ const askLocalRoot = {
   instructions: "Ask the user for the local project directory, then call remote_setup again with the same action and that directory. Nothing was read or written.",
 };
 
-/** Locates and validates the existing profile an inspect/update call addresses. */
-async function loadProfileForAction(input: SetupInput): Promise<{ profilePath: string; content: string; raw: Record<string, unknown> }> {
+/** Resolves the profile file an inspect/update/remove call addresses. */
+async function resolveProfilePath(input: SetupInput): Promise<string> {
   if (!isAbsolute(input.localRoot!)) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
   const localRoot = await realpath(input.localRoot!);
   if (!await stat(localRoot).then(info => info.isDirectory())) throw new RemoteAgentError("SETUP_INVALID_PATH", "localRoot must be an existing directory");
-  const profilePath = join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
+  return join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
+}
+
+/** Locates and validates the existing profile an inspect/update call addresses. */
+async function loadProfileForAction(input: SetupInput): Promise<{ profilePath: string; content: string; raw: Record<string, unknown> }> {
+  const profilePath = await resolveProfilePath(input);
   let content: string;
   try { content = await readFile(profilePath, "utf8"); }
   catch (error) {
@@ -208,11 +213,7 @@ async function removeFromTool(input: SetupInput) {
   checkBindingName(input);
   if (!input.localRoot) return askLocalRoot;
   if (!input.revision) throw new RemoteAgentError("SETUP_REVISION_REQUIRED", "Remove requires the revision returned by a previous inspect of this binding; inspect first, then retry with that revision");
-  if (!isAbsolute(input.localRoot!)) throw new RemoteAgentError("SETUP_INVALID_PATH", "Local directories must be absolute");
-  const localRoot = await realpath(input.localRoot!);
-  if (!await stat(localRoot).then(info => info.isDirectory())) throw new RemoteAgentError("SETUP_INVALID_PATH", "localRoot must be an existing directory");
-  const profilePath = join(localRoot, input.bindingName ? `.ssh-mcp-workspace.${input.bindingName}.json` : ".ssh-mcp-workspace.json");
-  return removeWorkspaceBinding(profilePath, input.revision);
+  return removeWorkspaceBinding(await resolveProfilePath(input), input.revision);
 }
 
 /** Single entry the MCP tool calls; dispatches on the optional action field. */

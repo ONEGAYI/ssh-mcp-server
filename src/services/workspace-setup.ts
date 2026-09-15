@@ -196,7 +196,10 @@ async function samePath(candidate: string, target: string): Promise<boolean> {
 }
 
 /** Matches the MCP server entry and recovery hook configure generated for this
- * profile: our executor, our --workspace flag, and a path naming this profile. */
+ * profile: an executor whose basename is one of ours, our --workspace flag,
+ * and a path naming this profile. The command itself is deliberately not
+ * compared (a moved build root or a different node install still matches);
+ * the --workspace target naming this exact profile is the real anchor. */
 async function refersToProfile(entry: any, profilePath: string): Promise<boolean> {
   if (!entry || !Array.isArray(entry.args)) return false;
   const at = entry.args.indexOf(WORKSPACE_FLAG);
@@ -242,15 +245,18 @@ async function removalPending(config: WorkspaceConfig): Promise<RemovalPending> 
 async function planUnhook(projectConfig: Record<string, any>, config: WorkspaceConfig, profilePath: string) {
   const serverName = serverNameForWorkspaceId(config.workspaceId);
   let mcpServerEntry = false;
+  let note: string | undefined;
   if (projectConfig.mcp?.servers?.[serverName] !== undefined) {
     if (await refersToProfile(projectConfig.mcp.servers[serverName], profilePath)) {
       const servers = { ...projectConfig.mcp.servers };
       delete servers[serverName];
       projectConfig.mcp = { ...projectConfig.mcp, servers };
       mcpServerEntry = true;
+    } else {
+      // An entry squatted on our generated name but pointing elsewhere is not
+      // ours: it stays, and the report says why the entry was not removed.
+      note = `an entry uses the generated name ${serverName} but points at a different workspace; it was left untouched`;
     }
-    // An entry squatted on our generated name but pointing elsewhere is not
-    // ours: it stays, and the report shows the entry was not removed.
   }
   let recoveryHooks = 0;
   const groups = projectConfig.hooks?.events?.UserPromptSubmit;
@@ -269,7 +275,7 @@ async function planUnhook(projectConfig: Record<string, any>, config: WorkspaceC
   }
   const servers = projectConfig.mcp?.servers ?? {};
   const lastBinding = !Object.keys(servers).some(name => name.startsWith("ssh-workspace-"));
-  return { serverName, mcpServerEntry, recoveryHooks, lastBinding };
+  return { serverName, mcpServerEntry, recoveryHooks, lastBinding, ...(note ? { note } : {}) };
 }
 
 export interface RemovalPreview {
@@ -295,12 +301,13 @@ export interface RemoveOutcome {
   profilePath: string;
   bindingName?: string;
   serverName: string;
-  unhooked: { mcpServerEntry: boolean; recoveryHooks: number };
+  unhooked: { mcpServerEntry: boolean; recoveryHooks: number; note?: string };
   connectionFile: { path: string; removed: boolean; reason?: string };
   localStateDir: { path: string; removed: boolean; reason?: string };
   remoteStateDir: string;
   lastBinding: boolean;
   legacyDocs?: LegacyDocCleanup;
+  legacyCleanupError?: string;
   registryIssues?: RemovalPending["registryIssues"];
   instructions: string;
 }
@@ -368,6 +375,13 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   // connection file and the local identity state directory.
   const { original, config: projectConfig } = await readProjectConfig(configPath);
   const plan = await planUnhook(projectConfig, config, absolute);
+  // Close the inspect-to-delete window as far as cheaply possible (the same
+  // before-check writeAtomic uses): a profile rewritten behind our back
+  // aborts here, before any mutation has happened.
+  const fresh = await readOptional(absolute);
+  if (fresh !== undefined && revisionOf(fresh) !== revision) {
+    throw new RemoteAgentError("SETUP_CONFLICT", "The profile changed since it was inspected (stale revision); inspect again for the current revision and retry");
+  }
   if ((plan.mcpServerEntry || plan.recoveryHooks) && original !== undefined) {
     await writeAtomic(configPath, JSON.stringify(projectConfig, null, 2) + "\n", original);
   }
@@ -395,17 +409,28 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
     const code = (error as NodeJS.ErrnoException).code;
     localState = { path: statePath, removed: false, reason: `delete failed (${code ?? "unknown"}); remove the directory manually once nothing holds it` };
   }
-  const legacyDocs = plan.lastBinding ? await cleanupLegacyGeneratedDocs(config.localRoot) : undefined;
+  let legacyDocs: LegacyDocCleanup | undefined;
+  let legacyCleanupError: string | undefined;
+  if (plan.lastBinding) {
+    // Everything binding-specific is already gone; a locked project root must
+    // not cost the caller the removal report itself.
+    try { legacyDocs = await cleanupLegacyGeneratedDocs(config.localRoot); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      legacyCleanupError = `legacy document cleanup failed (${code ?? "unknown"}); check the project root manually`;
+    }
+  }
   return {
     status: "removed", profilePath: absolute,
     ...(config.bindingName ? { bindingName: config.bindingName } : {}),
     serverName: plan.serverName,
-    unhooked: { mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks },
+    unhooked: { mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks, ...(plan.note ? { note: plan.note } : {}) },
     connectionFile, localStateDir: localState,
     remoteStateDir: config.remoteStateDir,
     lastBinding: plan.lastBinding,
     ...(legacyDocs ? { legacyDocs } : {}),
+    ...(legacyCleanupError ? { legacyCleanupError } : {}),
     ...(pending.registryIssues.length ? { registryIssues: pending.registryIssues } : {}),
-    instructions: "No SSH connection was made. The remote state directory keeps its records until the workspace server's maintenance cycles reclaim them by retention; delete it manually over SSH if it must go now. If the deleted files were ever committed, commit the deletions yourself — remove never runs git commands.",
+    instructions: "No SSH connection was made. The remote state directory keeps its records until the workspace server's maintenance cycles reclaim them by retention; delete it manually over SSH if it must go now. Keep any remaining .ssh-mcp-*.json (other bindings, external SSH configs) in this project's .gitignore; if the deleted files were ever committed, commit the deletions yourself — remove never runs git commands.",
   };
 }
