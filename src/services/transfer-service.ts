@@ -34,6 +34,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { FileHandle, link, mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
+import { createServer } from "node:net";
+import { transferDriverEndpoint, transferDriverRunning } from "./transfer-driver.js";
+import { MaintenanceService } from "./maintenance.js";
 import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceConfig, identityStateDirectory } from "../config/workspace.js";
 import { loadPolicy } from "../config/policy.js";
@@ -63,6 +69,7 @@ const TERMINAL_TRANSFER_STATES = new Set(["completed", "failed", "cancelled", "i
 /** The remote surface this driver needs; satisfied by RemoteAgentClient and by
  * offline stubs (the recovery hook lists registrations without any network). */
 export interface TransferRemote {
+  call<T = Record<string, unknown>>(action: string, request: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<T>;
   exchange<T = Record<string, unknown>>(action: string, input: Buffer, options?: { timeoutMs?: number }): Promise<T>;
   exchangeBinary(action: string, input: Buffer, options?: { timeoutMs?: number }):
     Promise<{ control: Record<string, unknown>; payload: Buffer; result: Record<string, unknown> }>;
@@ -77,6 +84,7 @@ export interface PendingTransfer {
   confirmedOffset?: number;
   state?: string;
   createdAt: string;
+  totalBytesKnown?: boolean;
 }
 
 export interface UploadRequest {
@@ -114,6 +122,9 @@ export interface TransferOutcome {
   committedAt?: number;
   budgetExhausted?: boolean;
   message?: string;
+  totalBytesKnown?: boolean;
+  driverRunning?: boolean;
+  resumeRequired?: boolean;
 }
 
 /** The observed identity of a local overwrite target, scheme l1- (the local
@@ -152,6 +163,11 @@ interface LocalTransferRecord {
   expiresAt?: number;
   completedAt?: number | null;
   error?: { code: string; message: string } | null;
+  background?: boolean;
+  initialRequest?: UploadRequest | DownloadRequest;
+  totalBytesKnown?: boolean;
+  retryAfter?: number;
+  registrationPending?: boolean;
 }
 
 function isMissing(error: unknown): boolean {
@@ -223,6 +239,143 @@ export class TransferService {
     await atomicJson(join(this.directory, record.transferId, "record.json"), record);
   }
 
+  /** Persist before hashing or SSH, then hand execution to an independent process. */
+  async start(sessionId: string, direction: "upload" | "download", request: UploadRequest | DownloadRequest): Promise<TransferOutcome> {
+    if (process.platform !== "win32" && process.platform !== "linux") {
+      throw new RemoteAgentError("UNSUPPORTED_LOCAL_PLATFORM", "Independent transfer drivers require a Windows or Linux client; use synchronous transfer start in a native background Shell on this platform");
+    }
+    const chunkSize = this.validateChunk(request.chunkSize ?? DEFAULT_CHUNK_SIZE);
+    this.validateBudget(request.budgetMs ?? DEFAULT_BUDGET_MS);
+    const localPath = await this.files.localPath(request.localPath, direction === "download");
+    let sourceIdentity;
+    if (direction === "upload") {
+      const info = await stat(localPath);
+      if (!info.isFile()) throw new RemoteAgentError("UNSUPPORTED_FILE", "Upload requires a regular local file");
+      sourceIdentity = { size: info.size, mtimeMs: info.mtimeMs };
+    } else await this.checkLocalTarget(request, localPath);
+    if (request.create && request.overwrite) throw new RemoteAgentError("INVALID_REQUEST", "Choose create or overwrite, not both");
+    if (request.overwrite && !request.expectedVersion) throw new RemoteAgentError("INVALID_REQUEST", "overwrite requires expectedVersion");
+    const transferId = randomUUID().replaceAll("-", "");
+    const record: LocalTransferRecord = { schemaVersion: 1, transferId, workspaceId: this.config.workspaceId,
+      sessionId, direction, localPath, remotePath: request.path, sourceIdentity,
+      totalBytes: sourceIdentity?.size ?? 0, totalSha256: "", chunkSize,
+      overwrite: request.overwrite ?? false, create: request.create ?? false, expectedVersion: request.expectedVersion ?? null,
+      createdAt: new Date().toISOString(), expiresAt: Date.now() + TRANSFER_TTL_MS,
+      background: true, initialRequest: { ...request, localPath, chunkSize }, totalBytesKnown: direction === "upload",
+      state: "preparing", confirmedOffset: 0 };
+    await this.saveRecord(record);
+    try { await this.ensureDriver(sessionId, transferId); }
+    catch (error) {
+      const current = await this.localRecord(transferId, sessionId);
+      if (!TERMINAL_TRANSFER_STATES.has(current.state!) && current.state !== "unknown") await this.failLocal(current, "TRANSFER_DRIVER_START_FAILED", (error as Error).message);
+      Object.assign(error as Error, { transferId });
+      throw error;
+    }
+    return { transferId, direction, state: "preparing", path: record.remotePath, localPath,
+      totalBytes: record.totalBytes, totalBytesKnown: record.totalBytesKnown, confirmedOffset: 0,
+      message: "Durably registered locally; attach ssh-mcp-job transfer wait to this identifier for completion delivery" };
+  }
+
+  private async driver(transferId: string): Promise<{ pid: number; token: string } | null> {
+    try { return JSON.parse(await readFile(join(this.directory, transferId, "driver.json"), "utf8")); }
+    catch (error) { if (isMissing(error)) return null; throw error; }
+  }
+
+  private async ensureDriver(sessionId: string, transferId: string): Promise<void> {
+    const record = await this.localRecord(transferId, sessionId);
+    if (TERMINAL_TRANSFER_STATES.has(record.state!) || record.state === "unknown" || (record.retryAfter ?? 0) > Date.now()) return;
+    if (await transferDriverRunning(this.config.identity, transferId)) return;
+    const token = randomUUID();
+    const recordPath = join(this.directory, transferId, "record.json");
+    const log = await open(join(this.directory, transferId, "driver.log"), "a", 0o600);
+    const child = spawn(process.execPath,
+      [...process.execArgv, fileURLToPath(new URL("../cli/transfer-worker.js", import.meta.url)), "--workspace", this.config.profilePath, "--session", sessionId, "--transfer-id", transferId],
+      { detached: true, windowsHide: true, stdio: ["ignore", log.fd, log.fd, "ipc"] });
+    try {
+      await once(child, "spawn");
+      await Promise.race([
+        once(child, "message"),
+        once(child, "exit").then(() => { throw new RemoteAgentError("TRANSFER_DRIVER_START_FAILED", "Worker exited before its ownership handoff; inspect driver.log"); }),
+      ]);
+      await new Promise<void>((resolve, reject) => child.send({ token, recordPath }, error => error ? reject(error) : resolve()));
+      if (child.connected) child.disconnect();
+      child.unref();
+    } catch (error) {
+      child.kill();
+      throw error;
+    } finally { await log.close(); }
+  }
+
+  private async cancelRequested(transferId: string): Promise<boolean> {
+    try { await stat(join(this.directory, transferId, "cancel.json")); return true; }
+    catch (error) { if (isMissing(error)) return false; throw error; }
+  }
+
+  /** Called only by the process that received the durable driver token. */
+  async runBackground(sessionId: string, transferId: string, token: string): Promise<void> {
+    const endpoint = transferDriverEndpoint(this.config.identity, transferId);
+    const execution = createServer(socket => socket.destroy());
+    try { execution.listen(endpoint); await once(execution, "listening"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") return; // Another driver owns the OS endpoint.
+      throw error;
+    }
+    try {
+      await atomicJson(join(this.directory, transferId, "driver.json"), { pid: process.pid, token });
+      await new MaintenanceService(this.config, this.remote).maybeMaintain().catch(() => undefined);
+      for (;;) {
+        let record = await this.localRecord(transferId, sessionId);
+        if (TERMINAL_TRANSFER_STATES.has(record.state!) || record.state === "unknown") return;
+        if (Date.now() >= record.expiresAt!) {
+          await this.failLocal(record, "REQUEST_EXPIRED_OR_UNKNOWN", "Transfer preparation or progress expired; create a new transfer");
+          return;
+        }
+        try {
+          if (await this.cancelRequested(transferId)) {
+            const outcome = await this.cancel(sessionId, transferId, true);
+            record = await this.localRecord(transferId, sessionId);
+            record.state = outcome.state;
+            record.confirmedOffset = outcome.confirmedOffset;
+            record.completedAt = Date.now();
+            await this.saveRecord(record);
+            return;
+          }
+          const outcome = record.initialRequest
+            ? record.direction === "upload"
+              ? await this.upload(sessionId, record.initialRequest, transferId)
+              : await this.download(sessionId, record.initialRequest, transferId)
+            : await this.resume(sessionId, transferId, undefined, true);
+          record = await this.localRecord(transferId, sessionId);
+          record.state = outcome.state;
+          record.confirmedOffset = outcome.confirmedOffset;
+          record.error = null;
+          if (TERMINAL_TRANSFER_STATES.has(outcome.state)) record.completedAt = Date.now();
+          await this.saveRecord(record);
+        } catch (error) {
+          record = await this.localRecord(transferId, sessionId);
+          const fault = error as Error & { code?: string; retriable?: boolean };
+          if (fault.code === "TRANSFER_CANCEL_REQUESTED") continue;
+          if (fault.code === "TRANSFER_STATE_UNKNOWN") {
+            record.state = "unknown";
+            record.error = { code: fault.code, message: fault.message };
+            await this.saveRecord(record);
+          } else if (fault.retriable) {
+            record.error = { code: fault.code ?? "TRANSFER_INTERRUPTED", message: fault.message };
+            record.retryAfter = Date.now() + 1000;
+            await this.saveRecord(record);
+          } else if (record.state !== "unknown") await this.failLocal(record, fault.code ?? "TRANSFER_FAILED", fault.message);
+          return;
+        }
+      }
+    } finally {
+      try {
+        if ((await this.driver(transferId))?.token === token) await unlink(join(this.directory, transferId, "driver.json"));
+      } finally {
+        await new Promise<void>((resolve, reject) => execution.close(error => error ? reject(error) : resolve()));
+      }
+    }
+  }
+
   private async digest(handle: FileHandle, size: number): Promise<string> {
     const digest = createHash("sha256");
     const buffer = Buffer.alloc(DIGEST_BUFFER);
@@ -262,7 +415,7 @@ export class TransferService {
 
   // --- upload direction (issue #13) -------------------------------------------
 
-  async upload(sessionId: string, request: UploadRequest): Promise<TransferOutcome> {
+  async upload(sessionId: string, request: UploadRequest, assignedId?: string): Promise<TransferOutcome> {
     const chunkSize = this.validateChunk(request.chunkSize ?? DEFAULT_CHUNK_SIZE);
     const budgetMs = this.validateBudget(request.budgetMs ?? DEFAULT_BUDGET_MS);
     const localPath = await this.files.localPath(request.localPath, false);
@@ -271,21 +424,32 @@ export class TransferService {
       const info = await handle.stat();
       if (!info.isFile()) throw new RemoteAgentError("UNSUPPORTED_FILE", "Upload requires a regular local file");
       const sourceIdentity = { size: info.size, mtimeMs: info.mtimeMs };
+      const queued = assignedId ? await this.localRecord(assignedId, sessionId) : undefined;
+      if (queued && (queued.sourceIdentity!.size !== info.size || queued.sourceIdentity!.mtimeMs !== info.mtimeMs)) {
+        throw new RemoteAgentError("FILE_CONFLICT", "Local source changed since the durable start registration");
+      }
       const totalSha256 = await this.digest(handle, info.size);
       const after = await handle.stat();
       if (after.size !== info.size || after.mtimeMs !== info.mtimeMs) {
         throw new RemoteAgentError("FILE_CONFLICT", "Local upload source changed while digesting; register again after it settles");
       }
+      if (queued) {
+        if (await this.cancelRequested(queued.transferId)) throw new RemoteAgentError("TRANSFER_CANCEL_REQUESTED", "Cancellation requested before remote registration");
+        queued.registrationPending = true;
+        await this.saveRecord(queued);
+      }
       // Registration is durable on both ends before the first byte moves, so
       // a lost response can never anchor a duplicate transfer.
       const registration = await this.raw<{ transferId: string }>("transfer_register", sessionId, {
         protocol: 2, direction: "upload", targetPath: request.path,
+        transferId: assignedId, registrationExpiresAt: queued ? queued.expiresAt! / 1000 : undefined,
         chunkSize, totalBytes: info.size, totalSha256, sourceIdentity,
         overwrite: request.overwrite ?? false, create: request.create ?? false,
         expectedVersion: request.expectedVersion,
       });
       const record: LocalTransferRecord = { schemaVersion: 1, transferId: registration.transferId,
         workspaceId: this.config.workspaceId, sessionId, direction: "upload",
+        background: !!assignedId, totalBytesKnown: true, state: assignedId ? "prepared" : undefined,
         localPath, remotePath: request.path, sourceIdentity, totalBytes: info.size, totalSha256,
         chunkSize, overwrite: request.overwrite ?? false, create: request.create ?? false,
         expectedVersion: request.expectedVersion ?? null, createdAt: new Date().toISOString(),
@@ -314,6 +478,7 @@ export class TransferService {
     const buffer = Buffer.alloc(chunkSize);
     let blocksSent = 0;
     while (offset < totalBytes) {
+      if (record.background && await this.cancelRequested(record.transferId)) throw new RemoteAgentError("TRANSFER_CANCEL_REQUESTED", "Cancellation requested before the next block");
       if (Date.now() >= deadline) {
         return { transferId: record.transferId, direction: "upload", state: "transferring",
           path: record.remotePath, localPath: record.localPath, totalBytes, confirmedOffset: offset,
@@ -334,6 +499,11 @@ export class TransferService {
       }
       offset = confirmed.confirmedOffset;
       blocksSent += 1;
+      if (record.background) {
+        record.state = "transferring"; record.confirmedOffset = offset;
+        record.expiresAt = Date.now() + TRANSFER_TTL_MS;
+        await this.saveRecord(record);
+      }
     }
     // All blocks are confirmed now, but verify and commit each spend up to a
     // full exchange timeout (60 s apiece); running them past the deadline
@@ -397,20 +567,24 @@ export class TransferService {
     return { overwrite: true, create: false, expectedVersion: observed, targetIdentity: { size: info.size, mtimeMs: info.mtimeMs } };
   }
 
-  async download(sessionId: string, request: DownloadRequest): Promise<TransferOutcome> {
+  async download(sessionId: string, request: DownloadRequest, assignedId?: string): Promise<TransferOutcome> {
     const chunkSize = this.validateChunk(request.chunkSize ?? DEFAULT_CHUNK_SIZE);
     const budgetMs = this.validateBudget(request.budgetMs ?? DEFAULT_BUDGET_MS);
     const localPath = await this.files.localPath(request.localPath, true);
     const target = await this.checkLocalTarget(request, localPath);
+    const queued = assignedId ? await this.localRecord(assignedId, sessionId) : undefined;
+    if (queued) { queued.registrationPending = true; await this.saveRecord(queued); }
     // The sender digests its own source at registration and returns the
     // observed version: nothing about the remote file is caller-asserted.
     const registration = await this.raw<{ transferId: string; totalBytes: number; sha256: string;
       sourceVersion: string }>("transfer_register", sessionId, {
       protocol: 2, direction: "download", sourcePath: request.path, targetPath: localPath,
+      transferId: assignedId, registrationExpiresAt: queued ? queued.expiresAt! / 1000 : undefined,
       chunkSize, overwrite: target.overwrite, create: target.create, expectedVersion: target.expectedVersion,
     });
     const record: LocalTransferRecord = { schemaVersion: 1, transferId: registration.transferId,
       workspaceId: this.config.workspaceId, sessionId, direction: "download",
+      background: !!assignedId, totalBytesKnown: true,
       localPath, remotePath: request.path, totalBytes: registration.totalBytes, totalSha256: registration.sha256,
       chunkSize, overwrite: target.overwrite, create: target.create, expectedVersion: target.expectedVersion,
       sourceVersion: registration.sourceVersion, targetIdentity: target.targetIdentity,
@@ -502,6 +676,7 @@ export class TransferService {
     let blocksFetched = 0;
     try {
       while (offset < totalBytes) {
+        if (record.background && await this.cancelRequested(record.transferId)) throw new RemoteAgentError("TRANSFER_CANCEL_REQUESTED", "Cancellation requested before the next fetch");
         if (Date.now() >= deadline) {
           return { transferId: record.transferId, direction: "download", state: "transferring",
             path: record.remotePath, localPath: record.localPath, totalBytes, confirmedOffset: offset,
@@ -553,6 +728,7 @@ export class TransferService {
       try {
         await this.raw("transfer_verify", sessionId, { protocol: 2, transferId: record.transferId, sha256: receiverDigest });
       } catch (error) {
+        if ((error as { retriable?: boolean }).retriable === true) throw error;
         const code = (error as RemoteAgentError)?.code;
         await this.failLocal(record, code ?? "VERIFY_MISMATCH",
           (error as Error).message || "The download failed its final verification");
@@ -845,9 +1021,13 @@ export class TransferService {
 
   // --- shared follow-up entry points ------------------------------------------
 
-  async resume(sessionId: string, transferId: string, budgetMs?: number): Promise<TransferOutcome> {
+  async resume(sessionId: string, transferId: string, budgetMs?: number, driving = false): Promise<TransferOutcome> {
     const budget = this.validateBudget(budgetMs ?? DEFAULT_BUDGET_MS);
     const record = await this.localRecord(transferId, sessionId);
+    if (record.background && !driving) {
+      await this.ensureDriver(sessionId, transferId);
+      return this.status(sessionId, transferId);
+    }
     if (record.direction === "download") return this.resumeDownload(record, sessionId, budget);
     // The local source must still be the exact registered object before any
     // version of the transfer may continue.
@@ -860,6 +1040,10 @@ export class TransferService {
     }
     let state;
     try {
+      if (record.background && record.state === "prepared") {
+        const observed = await this.raw<{ state: string }>("transfer_status", sessionId, { transferId });
+        if (observed.state === "prepared") await this.raw("transfer_start", sessionId, { protocol: 2, transferId, sourceIdentity: record.sourceIdentity });
+      }
       state = await this.raw<{ state: string; confirmedOffset: number; totalBytes: number; sha256?: string; error?: { code: string; message: string } }>(
         "transfer_resume", sessionId, { protocol: 2, transferId, sourceIdentity: record.sourceIdentity });
     } catch (error) {
@@ -908,7 +1092,9 @@ export class TransferService {
       return this.stoppedOutcome(record);
     }
     if (record.state === "prepared") {
-      throw new RemoteAgentError("INVALID_STATE", "This transfer never started; call the download tool with action=start again with the same target");
+      if (!record.background) throw new RemoteAgentError("INVALID_STATE", "This transfer never started; call the download tool with action=start again with the same target");
+      await this.raw("transfer_start", sessionId, { protocol: 2, transferId: record.transferId, sourceVersion: record.sourceVersion });
+      await this.materializeDownload(record);
     }
     if (record.state === "completed" || record.state === "committing" || record.state === "verifying") {
       return this.finishLocalCommit(record, sessionId);
@@ -925,15 +1111,24 @@ export class TransferService {
     return this.driveDownload(record, sessionId, record.confirmedOffset!, Date.now() + budget);
   }
 
-  async status(sessionId: string, transferId: string): Promise<Record<string, unknown> & { localPath: string }> {
+  async status(sessionId: string, transferId: string): Promise<Record<string, unknown> & TransferOutcome> {
     const record = await this.localRecord(transferId, sessionId);
+    if (record.background) {
+      const driverRunning = await transferDriverRunning(this.config.identity, transferId);
+      return { ...this.stoppedOutcome(record), totalBytesKnown: record.totalBytesKnown,
+        bytesWritten: record.state === "completed" ? record.totalBytes : undefined,
+        diagnosticLog: join(this.directory, transferId, "driver.log"),
+        sha256: record.totalSha256 || undefined, error: record.error ?? undefined, driverRunning,
+        resumeRequired: !driverRunning && !TERMINAL_TRANSFER_STATES.has(record.state!) && record.state !== "unknown",
+        observation: "local-driver-snapshot" };
+    }
     if (record.direction === "upload") {
-      const remote = await this.raw("transfer_status", sessionId, { transferId });
-      return { localPath: record.localPath, ...remote };
+      const remote = await this.raw<TransferOutcome>("transfer_status", sessionId, { transferId });
+      return { ...remote, localPath: record.localPath };
     }
     if (record.state === "completed") await this.reconcileRemoteCompletion(record, sessionId);
     const remote = await this.raw<{ state?: string }>("transfer_status", sessionId, { transferId }).catch(() => null);
-    return { transferId, direction: "download", state: record.state, localPath: record.localPath,
+    return { transferId, direction: "download", state: record.state!, localPath: record.localPath,
       path: record.remotePath, remotePath: record.remotePath, totalBytes: record.totalBytes,
       sha256: record.totalSha256, confirmedOffset: record.confirmedOffset ?? 0,
       chunkCount: record.chunkCount ?? 0, chunkSize: record.chunkSize,
@@ -949,8 +1144,28 @@ export class TransferService {
    * proof: the remote per-transfer lock (uploads) or the reconciled local
    * evidence (downloads) confirms the stop before anything is deleted, and a
    * publication the evidence proves happened is never rolled back. */
-  async cancel(sessionId: string, transferId: string): Promise<TransferOutcome> {
+  async cancel(sessionId: string, transferId: string, driving = false): Promise<TransferOutcome> {
     const record = await this.localRecord(transferId, sessionId);
+    if (record.background && record.state === "unknown") {
+      throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN", "The transfer outcome is not verified; inspect it manually before cancelling");
+    }
+    if (record.background && !driving && !TERMINAL_TRANSFER_STATES.has(record.state!)) {
+      await atomicJson(join(this.directory, transferId, "cancel.json"), { requestedAt: Date.now() });
+      await this.ensureDriver(sessionId, transferId);
+      return { ...this.stoppedOutcome(record), state: "cancelling",
+        message: "Cancellation requested; inspect status or attach transfer wait until the driver confirms a terminal outcome" };
+    }
+    if (record.initialRequest) {
+      if (record.registrationPending) {
+        await this.raw("transfer_cancel", sessionId, { transferId }).catch(error => {
+          if ((error as RemoteAgentError).code !== "REQUEST_EXPIRED_OR_UNKNOWN") throw error;
+        });
+      }
+      record.state = "cancelled";
+      record.completedAt = Date.now();
+      await this.saveRecord(record);
+      return this.stoppedOutcome(record);
+    }
     return record.direction === "upload"
       ? this.cancelUpload(record, sessionId)
       : this.cancelDownload(record, sessionId);
@@ -1074,7 +1289,7 @@ export class TransferService {
 
   /** The observed outcome of a transfer that is no longer running. */
   private stoppedOutcome(record: LocalTransferRecord): TransferOutcome {
-    return { transferId: record.transferId, direction: "download", state: record.state ?? "failed",
+    return { transferId: record.transferId, direction: record.direction, state: record.state ?? "failed",
       path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
       confirmedOffset: record.confirmedOffset ?? 0, blocksFetched: 0,
       message: record.error ? `${record.error.code}: ${record.error.message}` : `The transfer stopped in state ${record.state}` };
@@ -1084,7 +1299,8 @@ export class TransferService {
    * stays a read-only observation; an unknown outcome is never acknowledged. */
   async acknowledge(sessionId: string, transferId: string): Promise<{ acknowledged: boolean; transferId: string; state: string }> {
     const record = await this.localRecord(transferId, sessionId);
-    const state = record.direction === "download"
+    const localOnly = record.background && record.initialRequest && !record.registrationPending;
+    const state = record.direction === "download" || localOnly
       ? record.state ?? "prepared"
       : await this.raw<{ state: string }>("transfer_status", sessionId, { transferId })
         .then(observed => observed.state)
@@ -1105,7 +1321,7 @@ export class TransferService {
     }
     // A reclaimed remote registration has nothing left to consume remotely;
     // the local ack.json is then the whole record.
-    await this.raw("transfer_ack", sessionId, { transferId }).catch(error => {
+    if (!localOnly) await this.raw("transfer_ack", sessionId, { transferId }).catch(error => {
       if ((error as RemoteAgentError).code !== "REQUEST_EXPIRED_OR_UNKNOWN") throw error;
     });
     await atomicJson(join(this.directory, transferId, "ack.json"),
@@ -1152,8 +1368,9 @@ export class TransferService {
       }
       pending.push({ transferId: entry.name, direction: record.direction,
         path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
-        confirmedOffset: record.direction === "download" ? record.confirmedOffset : undefined,
-        state: record.direction === "download" ? record.state : undefined,
+        totalBytesKnown: record.totalBytesKnown,
+        confirmedOffset: record.direction === "download" || record.background ? record.confirmedOffset : undefined,
+        state: record.direction === "download" || record.background ? record.state : undefined,
         createdAt: record.createdAt });
     }
     return pending.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -1196,8 +1413,9 @@ export class TransferService {
       }
       pending.push({ transferId: entry.name, direction: record.direction,
         path: record.remotePath, localPath: record.localPath, totalBytes: record.totalBytes,
-        confirmedOffset: record.direction === "download" ? record.confirmedOffset : undefined,
-        state: record.direction === "download" ? record.state : undefined,
+        totalBytesKnown: record.totalBytesKnown,
+        confirmedOffset: record.direction === "download" || record.background ? record.confirmedOffset : undefined,
+        state: record.direction === "download" || record.background ? record.state : undefined,
         createdAt: record.createdAt });
     }
     return pending.sort((a, b) => a.createdAt.localeCompare(b.createdAt));

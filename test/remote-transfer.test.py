@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -97,6 +98,69 @@ class RemoteTransferTest(unittest.TestCase):
         committed = self.call('transfer_commit', {'transferId': transfer_id})
         self.assertTrue(committed['ok'], committed)
         return transfer_id, committed['result']
+
+    def test_explicit_registration_id_replays_the_same_upload_and_rejects_changed_intent(self):
+        data = b'registration response can be lost'
+        transfer_id = 'a' * 32
+        first = self.register(data, transferId=transfer_id, registrationExpiresAt=time.time() + 3600)
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(first['result']['transferId'], transfer_id)
+        second = self.register(data, transferId=transfer_id, registrationExpiresAt=time.time() + 3600)
+        self.assertTrue(second['ok'], second)
+        self.assertEqual(second['result']['transferId'], transfer_id)
+        changed = self.register(b'different source', transferId=transfer_id, registrationExpiresAt=time.time() + 3600)
+        self.assertFalse(changed['ok'], changed)
+        self.assertEqual(changed['error']['code'], 'REQUEST_CONFLICT')
+        other = self.call('transfer_register', {'protocol': 2, 'direction': 'upload', 'transferId': transfer_id,
+            'registrationExpiresAt': time.time() + 3600, 'targetPath': 'target.bin', 'chunkSize': CHUNK,
+            'totalBytes': len(data), 'totalSha256': hashlib.sha256(data).hexdigest(),
+            'sourceIdentity': self.source(len(data)), 'overwrite': False, 'create': False}, session='other')
+        self.assertFalse(other['ok'], other)
+        self.assertEqual(other['error']['code'], 'TRANSFER_SCOPE_MISMATCH')
+
+    def test_explicit_download_registration_replay_keeps_original_source_version(self):
+        transfer_id = 'b' * 32
+        first = self.dregister(b'first', transferId=transfer_id, registrationExpiresAt=time.time() + 3600)
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(first['result']['transferId'], transfer_id)
+        second = self.dregister(b'changed', transferId=transfer_id, registrationExpiresAt=time.time() + 3600)
+        self.assertTrue(second['ok'], second)
+        self.assertEqual(second['result']['sha256'], hashlib.sha256(b'first').hexdigest())
+        self.assertEqual(second['result']['sourceVersion'], first['result']['sourceVersion'])
+
+    def test_expired_explicit_registration_cannot_create_a_new_transaction(self):
+        response = self.register(b'stale', transferId='c' * 32, registrationExpiresAt=time.time() - 1)
+        self.assertFalse(response['ok'], response)
+        self.assertEqual(response['error']['code'], 'REQUEST_EXPIRED_OR_UNKNOWN')
+
+    def test_reclaimed_explicit_registration_does_not_recreate_before_request_expiry(self):
+        transfer_id = 'd' * 32
+        expires_at = time.time() + 3600
+        first = self.register(b'old request', transferId=transfer_id, registrationExpiresAt=expires_at)
+        self.assertTrue(first['ok'], first)
+        shutil.rmtree(str(self.state / 'transfers' / transfer_id))
+        replay = self.register(b'old request', transferId=transfer_id, registrationExpiresAt=expires_at)
+        self.assertFalse(replay['ok'], replay)
+        self.assertEqual(replay['error']['code'], 'REQUEST_EXPIRED_OR_UNKNOWN')
+
+    def test_registration_receipt_expires_through_bounded_maintenance(self):
+        transfer_id = 'e' * 32
+        expires_at = time.time() + 3600
+        first = self.register(b'expiring receipt', transferId=transfer_id, registrationExpiresAt=expires_at)
+        self.assertTrue(first['ok'], first)
+        receipt = self.state / 'transfers' / ('.registration-' + transfer_id + '.json')
+        self.assertTrue(receipt.is_file())
+        previous = os.environ.get('SSH_MCP_TEST_CLOCK')
+        try:
+            os.environ['SSH_MCP_TEST_CLOCK'] = str(expires_at + 1)
+            result = self.call('maintenance', {'maxItemsPerRun': 100, 'timeBudgetMs': 2000})
+            self.assertTrue(result['ok'], result)
+            self.assertFalse(receipt.exists())
+        finally:
+            if previous is None:
+                os.environ.pop('SSH_MCP_TEST_CLOCK', None)
+            else:
+                os.environ['SSH_MCP_TEST_CLOCK'] = previous
 
     # --- download direction helpers (issue #14) --------------------------------
 

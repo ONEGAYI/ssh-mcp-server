@@ -248,6 +248,29 @@ def register(root, request):
         raise AgentError('INVALID_REQUEST', 'overwrite requires the expectedVersion observed for the target')
     if not overwriting and expected is not None:
         raise AgentError('INVALID_REQUEST', 'expectedVersion only pairs with overwrite=true')
+    assigned = request.get('transferId')
+    registration_key = hashlib.sha256(json.dumps({field: request.get(field) for field in (
+        'sessionId', 'workspaceRoot', 'direction', 'sourcePath', 'targetPath', 'chunkSize',
+        'overwrite', 'create', 'expectedVersion', 'totalBytes', 'totalSha256', 'sourceIdentity')},
+        sort_keys=True).encode('utf8')).hexdigest()
+    if assigned is not None:
+        assigned = _transfer_id(assigned)
+        receipt = transfers_directory(root) / ('.registration-' + assigned + '.json')
+        with acquire_slots(root, ['transfer-registry']):
+            registered = transfer_path(root, assigned) / 'record.json'
+            if registered.is_file():
+                record = _load_record(root, assigned)
+                _require_session(record, request)
+                if record.get('registrationKey') != registration_key:
+                    raise AgentError('REQUEST_CONFLICT', 'Transfer identifier is bound to another registration intent')
+                return describe(record)
+            if receipt.is_file():
+                raise AgentError('REQUEST_EXPIRED_OR_UNKNOWN', 'This registration was reclaimed; do not recreate the original request')
+        expires_at = request.get('registrationExpiresAt')
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            raise AgentError('INVALID_REQUEST', 'Explicit registration requires registrationExpiresAt')
+        if not _now() < expires_at <= _now() + TRANSFER_TTL_SECONDS + 300:
+            raise AgentError('REQUEST_EXPIRED_OR_UNKNOWN', 'Explicit registration expired or has an invalid expiry')
     if direction == 'upload':
         total = _require_int(request.get('totalBytes'), 'totalBytes', 0, 9007199254740991)
         digest = request.get('totalSha256')
@@ -286,9 +309,17 @@ def register(root, request):
             raise AgentError('INVALID_REQUEST', 'targetPath must report the local destination of the download')
         source = service.path(request.get('sourcePath'), writing=False)
         version, total, digest = _observe_source(source)
-    transfer_id = uuid.uuid4().hex
+    transfer_id = assigned or uuid.uuid4().hex
     path = transfer_path(root, transfer_id)
     with acquire_slots(root, ['transfer-registry']):
+        if assigned and (path / 'record.json').is_file():
+            record = _load_record(root, transfer_id)
+            _require_session(record, request)
+            if record.get('registrationKey') != registration_key:
+                raise AgentError('REQUEST_CONFLICT', 'Transfer identifier is bound to another registration intent')
+            return describe(record)
+        if assigned and receipt.is_file():
+            raise AgentError('REQUEST_EXPIRED_OR_UNKNOWN', 'This registration was reclaimed; do not recreate the original request')
         if direction == 'download':
             # The digest streamed outside the lock: re-verify cheaply that the
             # live file still is the observed version before anchoring it.
@@ -300,6 +331,7 @@ def register(root, request):
                              'At most {} active transfers are allowed per workspace'.format(MAX_ACTIVE_TRANSFERS))
         now = _now()
         record = {'schemaVersion': 1, 'transferId': transfer_id, 'direction': direction,
+                  'registrationKey': registration_key,
                   'sessionId': service.session,
                   'chunkSize': chunk, 'totalBytes': total, 'totalSha256': digest,
                   'overwrite': overwriting, 'create': creating,
@@ -319,8 +351,11 @@ def register(root, request):
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
-            raise AgentError('REQUEST_CONFLICT', 'Transfer identifier was already assigned')
+            if not assigned:
+                raise AgentError('REQUEST_CONFLICT', 'Transfer identifier was already assigned')
         _save_record(root, transfer_id, record)
+        if assigned:
+            atomic_json(receipt, {'transferId': assigned, 'expiresAt': request['registrationExpiresAt']})
     return describe(record)
 
 

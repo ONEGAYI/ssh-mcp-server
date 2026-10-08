@@ -13,7 +13,7 @@ import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
 const inputSchema = {
-  action: z.enum(["configure", "inspect", "update", "remove"]).optional().describe("Operation on a workspace binding. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision. 'remove' decommissions one binding from this project and requires that revision: it refuses while any task or transfer of the binding is unacknowledged, then unhooks the MCP entry and recovery hook, deletes the profile, the generated connection file and the local state — all without any SSH connection. Run it only on the user's explicit request"),
+  action: z.enum(["configure", "inspect", "update", "remove", "list_connections"]).optional().describe("Operation on a workspace binding. 'list_connections' is read-only: list registered connection names from the startup --config-file SSH MCP JSON library or an explicit sshConfigFile, without requiring workspace directories or exposing credentials. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision. 'remove' decommissions one binding from this project and requires that revision: it refuses while any task or transfer of the binding is unacknowledged, then unhooks the MCP entry and recovery hook, deletes the profile, the generated connection file and the local state — all without any SSH connection. Run it only on the user's explicit request"),
   revision: z.string().min(1).optional().describe("Revision token from a previous inspect; required for action='update' and action='remove' so concurrent changes are rejected instead of overwritten"),
   policy: policySectionSchema.optional().describe("Workspace policy: per-end space limits, retention periods, search filters and budgets, maintenance cadence. Provide only the fields to set; unspecified fields keep defaults or stored values. Saved values apply from the next operation or maintenance cycle and never recalculate existing records' expiry"),
   bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for this project's original unnamed binding"),
@@ -21,7 +21,7 @@ const inputSchema = {
   remoteRoot: optionalPath.describe("Existing absolute Linux source directory"),
   remoteStateDir: optionalPath.describe("Writable persistent absolute Linux directory for helper scripts and task state"),
   sshConfigFile: optionalPath.describe("Path to an existing original SSH MCP JSON config; credentials stay in that file"),
-  connectionName: z.string().min(1).optional(),
+  connectionName: z.string().min(1).optional().describe("Choose a name returned by action='list_connections' or configure discovery; host and authentication stay in the SSH MCP JSON library"),
   host: z.string().min(1).optional().describe("SSH host when no existing sshConfigFile is used"),
   port: z.number().int().min(1).max(65535).optional(),
   username: z.string().min(1).optional(),
@@ -216,9 +216,37 @@ async function removeFromTool(input: SetupInput) {
   return removeWorkspaceBinding(await resolveProfilePath(input), input.revision);
 }
 
+/** Read only named SSH MCP JSON connections; never return authentication. */
+function connectionNames(sshConfigFile: string): Promise<string[]> {
+  if (!isAbsolute(sshConfigFile)) throw new RemoteAgentError("SETUP_INVALID_PATH", "sshConfigFile must be an absolute local path");
+  return readFile(sshConfigFile, "utf8").then(text => {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length === 0) {
+      throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "The SSH config file contains no connections; fix the file or provide host/username fields instead of a config path");
+    }
+    return Object.keys(CommandLineParser.parseArgs(["--config-file", sshConfigFile]).configs);
+  }).catch(error => {
+    if (error instanceof RemoteAgentError) throw error;
+    throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not load the SSH config; check the file path and config format without sharing its credentials");
+  });
+}
+
+async function listConnectionsFromTool(input: SetupInput, defaultSshConfigFile?: string) {
+  const sshConfigFile = input.sshConfigFile ?? defaultSshConfigFile;
+  if (!sshConfigFile) return {
+    status: "needs_input", connections: [],
+    questions: [{ fields: ["sshConfigFile"], question: "请提供已登记服务器的 SSH MCP JSON 配置文件绝对路径；或为 setup 启动参数指定 --config-file。" }],
+    instructions: "Ask only for the SSH MCP JSON configuration path, then call remote_setup action='list_connections' again with sshConfigFile. Do not search ~/.ssh or infer an OpenSSH config path: that is a different configuration format. No files were written and no SSH connection was made.",
+  };
+  return {
+    status: "connections_listed", connections: await connectionNames(sshConfigFile),
+    instructions: "These names are complete connection choices from the SSH MCP JSON library; authentication stays in that file. Ask the user to choose a connectionName, then call remote_setup to configure the binding with that choice and the workspace directories. Reuse the same sshConfigFile when this call explicitly supplied one. Do not search ~/.ssh for host or authentication details. No files were written and no SSH connection was made.",
+  };
+}
 /** Single entry the MCP tool calls; dispatches on the optional action field. */
 export async function setupFromTool(input: SetupInput, defaultSshConfigFile?: string) {
   const action = input.action ?? "configure";
+  if (action === "list_connections") return listConnectionsFromTool(input, defaultSshConfigFile);
   if (action === "inspect") return inspectFromTool(input);
   if (action === "update") return updateFromTool(input);
   if (action === "remove") return removeFromTool(input);
@@ -250,20 +278,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
   let connectionName = input.connectionName;
   let connections: string[] = [];
   if (input.sshConfigFile) {
-    if (!isAbsolute(input.sshConfigFile)) throw new RemoteAgentError("SETUP_INVALID_PATH", "sshConfigFile must be an absolute local path");
-    let names: string[];
-    try {
-      // An empty library fails deep inside the parser with a misleading "missing parameters" message; name the real cause.
-      const parsed = JSON.parse(await readFile(input.sshConfigFile, "utf8"));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length === 0) {
-        throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "The SSH config file contains no connections; fix the file or provide host/username fields instead of a config path");
-      }
-      names = Object.keys(CommandLineParser.parseArgs(["--config-file", input.sshConfigFile]).configs);
-    }
-    catch (error) {
-      if (error instanceof RemoteAgentError) throw error;
-      throw new RemoteAgentError("SETUP_INVALID_SSH_CONFIG", "Could not load the SSH config; check the file path and config format without sharing its credentials");
-    }
+    const names = await connectionNames(input.sshConfigFile);
     if (!connectionName && names.length === 1) connectionName = names[0];
     connections = names;
     if (!connectionName) questions.push({ fields: ["connectionName"], question: `选择连接名：${names.slice(0, 20).join("、")}（选定即完成连接配置，主机与认证细节都在预存库内，无需另行查证）` });
@@ -322,9 +337,9 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "First call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. action='remove' decommissions a binding after inspect — run it only on the user's explicit request; it is local-only (no SSH connection) and refuses while the binding still has unacknowledged tasks or transfers. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
+    instructions: "To list already registered servers, call remote_setup action='list_connections' (optional sshConfigFile overrides the startup --config-file library). This lists JSON connection names without SSH, writes or credentials; do not search ~/.ssh for them. For configuring a binding, first call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. action='remove' decommissions a binding after inspect — run it only on the user's explicit request; it is local-only (no SSH connection) and refuses while the binding still has unacknowledged tasks or transfers. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
   });
-  server.registerTool("remote_setup", { description: "Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. action='remove': requires that revision and the user's explicit request; decommissions exactly this binding — unacknowledged tasks or transfers (any session) are a hard refusal with no force, then the MCP entry, recovery hook, profile, generated connection file and local state are removed; external SSH configs and the remote state directory are never touched. No manual setup command needed; no SSH connection during setup or removal.",
+  server.registerTool("remote_setup", { description: "action='list_connections': read-only listing of registered connection names from the startup --config-file SSH MCP JSON library or an explicit sshConfigFile; requires no localRoot or remote directories, exposes no credentials and never searches ~/.ssh. Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. action='remove': requires that revision and the user's explicit request; decommissions exactly this binding — unacknowledged tasks or transfers (any session) are a hard refusal with no force, then the MCP entry, recovery hook, profile, generated connection file and local state are removed; external SSH configs and the remote state directory are never touched. No manual setup command needed; no SSH connection during setup or removal.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async input => {
     try { return { content: [{ type: "text" as const, text: JSON.stringify(await setupFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {

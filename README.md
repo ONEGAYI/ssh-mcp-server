@@ -4,6 +4,18 @@
 
 这是 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 维护的 fork，基于 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server)。本文介绍本 fork 的离线预览包与 MCP 引导接入；上游 npm 发行版不代表包含这些新增能力。
 
+## 大文件传输
+
+MCP 的 `remote_upload` / `remote_download` 先在本机登记并返回 `preparing` 与 `transferId`，摘要计算和传输由独立后台进程执行。启动返回不代表传输完成；首次准备下载时 `totalBytesKnown=false`，不能把未知总量按零字节完成处理。
+
+用恢复钩子提供的真实会话标识，在 **ZCode 原生后台 Shell** 中执行 `ssh-mcp-job transfer wait --transfer-id {{原传输编号}} --workspace {{配置文件}} --session {{真实会话标识}}`，挂接完成通知。CLI 的同步 `transfer start` 仍可使用，但整个启动命令也应放入原生后台 Shell。
+
+启动超时或编号丢失时，调用 `remote_transfer_pending`（无需 SSH），或 CLI `transfer pending` 找回原编号；不要重复创建传输。结果处理完成后按返回的 `nextAction` 执行 `ack`。`pending` 表示尚未确认结果，已经完成的传输也会列出。
+
+本机路径须位于工作区或 SSH 配置的 `allowedLocalPaths` 内。工作区外的临时包应移入工作区暂存目录，或配置明确的允许根目录。Windows Git Bash 的 GNU tar 归档路径用 `/c/...` 等 MSYS 路径，或加 `--force-local`，避免把盘符冒号识别成远端主机前缀。
+
+上述改进随 v2.3.0 离线包分发，详细流程与旧传输兼容说明见 [usage.md](docs/design/usage.md)。真实 ZCode / CentOS 7 验收待完成。
+
 ## 1. 使用前准备
 
 | 位置 | 需要什么 |
@@ -62,6 +74,8 @@ Linux 不需要安装 ZCode、Node.js 或手工部署本项目。首次远端操
 ```
 
 配置一次后，Agent 在 setup 时只向你询问连接名（工具会列出可用的名字），不再需要每次提供地址、用户名或认证方式；文件中的凭据仍只留在本机文件里。两种配置结构的预存连接模板见 [examples/mcp-setup-config.json](examples/mcp-setup-config.json) 与 [examples/zcode-setup-config.json](examples/zcode-setup-config.json)。
+
+要先查看已登记的服务器，请让 Agent 调用 `remote_setup({"action":"list_connections"})`。这是只读操作，不需要填写工程目录；未预存配置时，提供 `sshConfigFile` 的绝对路径即可。这里的 `ssh-config.json` 是 SSH MCP 的 JSON 连接库，与 OpenSSH 的 `.ssh/config` 格式不同，不能相互替代。
 
 **如果直接编辑 ZCode 原生配置文件**（项目 `.zcode/config.json` 或用户 `.zcode/cli/config.json`），使用 `mcp.servers` 结构，而不是上面的导入结构：
 

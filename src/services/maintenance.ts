@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { loadPolicy } from "../config/policy.js";
 import { WorkspaceConfig, identityStateDirectory } from "../config/workspace.js";
 import { SpaceLedger } from "./space-ledger.js";
+import { transferDriverRunning } from "./transfer-driver.js";
 
 const TASK_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const TRANSFER_ID = /^[0-9a-f]{32}$/;
@@ -205,6 +206,7 @@ export class MaintenanceService {
     let record: Record<string, unknown>;
     try { record = JSON.parse(await readFile(join(directory, "record.json"), "utf8")); }
     catch (error) { if (isMissing(error)) return false; throw error; }
+    if (record.background && await transferDriverRunning(this.config.identity, transferId)) return false;
     const state = typeof record.state === "string" ? record.state : "prepared";
     if (TERMINAL_TRANSFER_STATES.has(state)) {
       let terminalAt = 0;

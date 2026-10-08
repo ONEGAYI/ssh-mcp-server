@@ -9,6 +9,7 @@
 - 为只能通过 SSH 使用的 CentOS 7 服务器提供接近远程原生 Agent 的操作体验。
 - 下列演进已合入 main 并发布 v2.0.0（2026-09-13）：首版工作区（PR #1，用户人工验收通过）、三项扩展（PR #2）、大文件扩展总规格 16 张票据（PR #22，三轮代码审查 44 项修复收口）、轻量打包脚本（PR #27）。
 - 绑定生命周期系列四张票据已全部合入：remote_help 按需指引（#30，PR #34）、configure 停止落盘加三代迁移清理（#31，PR #35）随 v2.1.0 发布；绑定移除动作（#32）与 CLI 收尾（#33）经三轮审查随 PR #36 合入并发布 v2.2.0（2026-09-15，机器审查通过、待用户人工验收）。票据见 `docs/design/binding-lifecycle-tickets.md`。
+- v2.3.0 交付大文件快速启动、离线传输发现与恢复指引，以及 setup 只读连接列表（PR #37）；本机回归与独立复核通过，真实 ZCode / CentOS 7 仍待用户验收。规格见 `docs/design/transfer-start-spec.md`。
 - 保留边界：用户已人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
@@ -29,12 +30,15 @@
 - `docs/design/discovery.md`：上游代码核实、候选方案与尚待回答的需求问题。
 - `docs/design/interactive-assessment.md`：交互式功能复杂度、延期影响及首版扩展边界评估。
 - `docs/design/binding-lifecycle-tickets.md`：按需指引（#29）与绑定移除（#28）的实施票据、依赖和验收条件。
+- `docs/design/transfer-start-spec.md` / `transfer-start-tickets.md`：大文件快速启动、离线恢复、结果提示与后台驱动规格及实施票据。
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。
 - `README.md`：本 fork 的中文入门、setup、日常使用与升级说明；每次离线打包放入包根目录。
 - `README_EN.md`：保留的上游英文旧模式说明。
 - `src/`：MCP 服务、工具、SSH 连接与配置实现。
 - `src/core/setup-server.ts`：通用 setup MCP，缺项询问与项目接入入口。
 - `src/services/workspace-setup.ts`：MCP 与手工 CLI 共用的项目配置合并逻辑。
+- `src/cli/transfer-worker.ts`：独立本机传输驱动入口，由持久编号与驱动执行权启动，不是人工 CLI 入口。
+- `src/services/transfer-driver.ts`：驱动、状态与维护共用的 IPC 执行权端点与存活判断。
 - `examples/`：标准 MCP 导入及 ZCode 原生配置的 setup 服务模板。
 - `remote/`：Python 3.6 标准库执行器、持久任务、受保护文件操作与有界搜索。
 - `test/` / `scripts/`：上游测试和构建脚本。

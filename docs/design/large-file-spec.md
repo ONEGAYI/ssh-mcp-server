@@ -123,6 +123,8 @@ find 独立使用 rg 文件枚举能力或 Python 遍历；grep 不用于文件�
 
 保留 remote_upload / remote_download，增加 start、status、resume、cancel、ack 操作，默认 start；后续操作只需 transferId 与 sessionId。start 返回持久标识和有界状态，不等待全文完成。所有方向均保持本机允许路径及远端边界检查。
 
+2026-10-08 补充：MCP start 在全文摘要和 SSH 之前持久登记，独立本机进程驱动；新增离线 `remote_transfer_pending`。启动、确认提示与旧同步入口兼容的详细契约见 [后续规格](transfer-start-spec.md) 和 [ADR 0012](../adr/0012-transfer-start-before-preparation.md)。
+
 扩展现有 job CLI，增加 transfer start/wait/status/resume/cancel/ack 子命令。由 ZCode 原生后台 Shell 执行传输等待器，等待器完成后输出有界结果；恢复钩子列出同会话待跟进传输并重新挂接原标识。不能依赖 MCP 服务内一个会随退出消失的 Promise 宣称持久后台完成。
 
 断线时等待器有界退避；本机退出导致传输中断，重启后续传。无需把本机离线期间不能传输描述为失败。进度仅按需查询，后台不持续向模型投递每块消息。

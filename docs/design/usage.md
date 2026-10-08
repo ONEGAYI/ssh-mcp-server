@@ -32,6 +32,8 @@
 
 setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用只要出现任一显式 SSH 字段（host/用户名/端口/私钥/agent），本次就整体改用显式信息，不与预存库做字段级合并。
 
+只列服务器时，调用 `remote_setup({"action":"list_connections"})`，只返回连接名和后续指引，不要求 `localRoot`、远端目录，也不创建绑定或连接 SSH。可用 `sshConfigFile` 指定另一个 JSON 连接库；随后 configure 须复用同一路径与选定连接名。未提供启动库或调用路径时，只询问 JSON 文件绝对路径，不去 `.ssh` 猜配置位置。SSH MCP JSON 与 OpenSSH `.ssh/config` 是两种配置格式。
+
 已知客户端限制（ZCode 3.11.2 实测）：完整配置导入会把 `args` 数组中含空格的元素按空格拆分成多个参数，破坏带空格的文件路径。预存连接文件请放在无空格路径；已有带空格路径的文件可用同盘硬链接建一个无空格名称（`New-Item -ItemType HardLink`），内容改动自动同步、凭据不重复存放。
 
 然后对 Agent 说：
@@ -193,28 +195,28 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 
 ### 上传大文件（可续传传输事务）
 
-`remote_upload` 任意大小可用（默认 1 MiB 分块、两端流式 SHA-256 校验，文件字节不经模型）。默认 `action=start` 在单次调用预算（`budgetMs`，默认 55 秒）内驱动传输：
+`remote_upload` 使用默认 1 MiB 分块与两端 SHA-256，文件字节不经模型。当前 MCP `action=start` 先验证本机路径与源元数据，持久化编号，然后快速返回 `state=preparing` 与 `transferId`；独立 Node 进程完成摘要、远端登记和传输。启动调用不触发在线维护，也不等待全文传完。
 
-- 正常完成返回 `state=completed` 与 `transferId`、`sha256`、`bytesWritten`。
-- 预算耗尽未传完时返回 `state=transferring`、`confirmedOffset` 与 `budgetExhausted=true`；用 `action=resume` 加同一 `transferId` 继续，只补未确认数据。预算也可调大（上限 600 秒）。
-- 传输中出错（断线、超时）时错误响应携带 `transferId`，同样以 resume 接回；本机源文件在传输期间变化则拒绝续传，需重新 start。
-- `action=status` 只读查询进度，无副作用。
+- 用原生后台 Shell 的 `transfer wait` 挂接终态结果。MCP `status` 对新传输返回本机驱动快照（`observation=local-driver-snapshot`），包括状态、已确认偏移与摘要；`completed` 结果要求确认。
+- 网络中断时保留原编号与已确认数据。`driverRunning=false`、`resumeRequired=true` 表示需要接回；`resume` 或 `transfer wait` 会重启原驱动。源文件在首次本机登记后变化则拒绝，不混合版本。
+- MCP 错误响应保留已有编号；后台错误在登记的 `error` 字段中可查。编号丢失时用 `remote_transfer_pending` 或 CLI `transfer pending`，不再 start。
+- `action=status` 不启动驱动，也不确认结果；本机登记列表属于快照，不等于实时远端状态。
 - 覆盖已有远端目标须先 `remote_read metadataOnly` 拿版本，再带 `overwrite=true` 与 `expectedVersion`；默认目标必须不存在。
-- `action=cancel` 主动取消（#15）：远端确认停止后才删除未提交的临时数据；已完成的提交不回滚（返回 `completed` 而非 `cancelled`）；结果未知时返回 `TRANSFER_STATE_UNKNOWN` 不猜。取消后 resume 只观察不复活。
+- 新传输的 `action=cancel` 可先返回 `cancelling`，只表示请求已保存；待驱动确认 `cancelled` / `completed` 后才算取消流程结束。未提交数据按原停止核实契约回收，已完成的提交不回滚，unknown 不猜。旧同步记录保留原取消行为。
 - `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
 
 ### 下载大文件（可续传传输事务）
 
-`remote_download` 自 #14 起与上传对称：远端源绑定其 `m1-` 观察版本，默认 1 MiB 分块、每块摘要校验后确认，两端各自流式 SHA-256；文件字节不经模型，**不签发 readToken**（下载不授予已读范围）。默认 `action=start` 在单次调用预算（`budgetMs`，默认 55 秒）内驱动：
+`remote_download` 的远端源绑定 `m1-` 观察版本，每块校验并持久化后才确认，全文摘要匹配后原子提交。**不签发 readToken**，下载不授予已读范围。MCP `start` 同样先返回 `preparing` 与本机持久编号，远端摘要由独立进程准备。
 
-- 正常完成返回 `state=completed` 与 `transferId`、`sha256`、`bytesWritten`、`blocksFetched`。
-- 预算耗尽未传完时返回 `state=transferring`、`confirmedOffset` 与 `budgetExhausted=true`；用 `action=resume` 加同一 `transferId` 继续，只补未确认数据（接收临时文件与块清单持久化在本机状态目录，恢复时先重校验再续传）。
+- 准备期 `totalBytesKnown=false`，总量暂未知；登记远端源后变为 true。按原编号 `transfer wait` 获取终态与摘要。
+- 新驱动被中断后通过 `resume` 或 `transfer wait` 接回；接收临时文件与块清单持久化在本机，恢复时先重校验，只补未确认数据。
 - 断线或本机进程退出后，同样以 resume 接回；错误响应携带 `transferId`。
 - 远端源文件在传输期间变化（`m1-` 版本不符）则拒绝原传输并置 `failed`（`TRANSFER_SOURCE_CHANGED`），需重新 start。
 - 本机目标默认必须不存在；覆盖须带 `overwrite=true` 与本机目标观察版本 `l1-<size>:<mtimeMs>`（首次拒绝的 `FILE_CONFLICT` 消息会给出该值），提交前复核，目标变化拒绝覆盖。
 - 本机磁盘写满（`STORAGE_FULL`）时清理接收临时文件后可重试，续传从零开始。
 - `action=status` 只读查询进度，无副作用。
-- `action=cancel` 主动取消（#15）：先停远端发送方，再删除本机未提交的接收临时数据与块清单、释放空间登记；已完成的提交不回滚；取消撞上提交窗口时按回执/意图证据核对，证据不足返回 `TRANSFER_STATE_UNKNOWN` 且不动数据。取消后 resume 只观察不复活。
+- `action=cancel` 可先返回 `cancelling`，待驱动沿原契约核实停止后再查询终态；先停发送方，再回收未提交接收数据。取消撞上提交窗口时仍按回执/意图核对，证据不足保持 unknown，正式文件不回滚。
 - `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
 
 ### 传输的后台等待与恢复（#15）
@@ -228,11 +230,14 @@ node <安装目录>/build/cli/job.js transfer status|resume|cancel|ack --transfe
 node <安装目录>/build/cli/job.js transfer pending --workspace <配置文件> --session <会话标识>
 ```
 
-- `transfer start` 单次预算内驱动；预算内完成输出 `transfer-result`，否则输出 `transfer-started` 与 durable 编号。也可继续用 MCP `remote_upload`/`remote_download` 的 start/resume 驱动，两种入口操作同一事务。
+- CLI `transfer start` 保持同步分段驱动，**整个启动命令必须放入原生后台 Shell**；完成输出 `transfer-result`，否则输出 `transfer-started` 与编号。默认 55 秒 budget 是步骤间检查的软预算，前置摘要/登记及在途 SSH 交换可越过它，不是客户端等待时限。旧记录的同步 resume 同样应通过后台 CLI 使用。
+- MCP start 创建的新传输由独立进程驱动；CLI wait 观察它，驱动退出后接回原编号。并发等待不会各自写入下载文件；结果仍回到原生后台 Shell 的等待器。
 - `transfer wait` 是后台等待器：循环驱动至终态，**期间不输出块级进度**，只在完成/失败/取消时输出一行 `transfer-result`（含 `acknowledgementRequired`）；断线按有界退避重试；`--wait-timeout` 到点输出 `transfer-wait-paused` 退出（durable 进度保留，重新 wait 即续）。
 - 等待器被结束不取消传输；MCP 服务与本机重启后，用同一 `transferId` 重挂即可继续（只重传未确认数据）。
 - 继续原对话时，恢复钩子除任务外还会列出同会话未确认的传输（离线读取本机登记），并给出 `transfer wait` 重挂模板；不要对同一目标重新 start 创建新传输。
 - 传输结果同样保持 pending 直到显式 `transfer ack`（或 MCP `action=ack`）；cancelled 结果也需要确认消费。
+- MCP 终态结果包含 `acknowledgementRequired=true` 与具体 `nextAction`；运行中及 unknown 不可确认。`remote_transfer_pending` 按会话分页（每页 50 条），不连接 SSH 或触发维护。
+- 本机源/目标须处于工作区或 `allowedLocalPaths`；不自动允许 `%TEMP%`。GNU tar 的 Windows 归档路径使用 `/c/...` 等 MSYS 路径或 `--force-local`，该规则不泛化到其他 tar 实现。
 
 ### 后台任务
 

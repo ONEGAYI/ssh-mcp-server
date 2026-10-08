@@ -24,6 +24,14 @@ const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 - 后台通知后检查 task-result 和日志，按 eventId 去重，处理后使用 remote_ack 或 CLI ack。
 - 本机等待退出不是远端取消；显式 cancel 后核实状态，unknown 不自动重跑。
 - SSH 不可达时本指引仍可调用：先核对连接配置与远端状态目录，不要盲目重试远端操作。
+
+大文件传输：
+- remote_upload / remote_download 的 start 先在本机持久登记并返回 preparing 与 transferId；独立后台进程再计算摘要、连接 SSH 并完成传输。start 返回不等于传输完成。
+- 使用恢复钩子的真实 sessionId，在 ZCode 原生后台 Shell 中运行 job CLI 的 transfer wait --transfer-id {{原传输编号}}，挂接结果回传。需要直接从 CLI 启动时，整个 transfer start（包括摘要计算）也放在原生后台 Shell 中，再以同一编号 transfer wait。
+- start 超时或编号丢失时，立即调用 remote_transfer_pending，或 CLI transfer pending；找到同会话、相同源与目标的原编号后挂接，不重复 start。pending 表示结果尚未确认，登记快照不等于远端实时进度。
+- 读取并处理终态结果后，按 nextAction 调用对应工具 action=ack，或 CLI transfer ack。unknown 和运行中传输不能确认；只查 status 不会消费结果。
+- 本机源/目标必须位于 localRoot 或 SSH 配置 allowedLocalPaths 内。工作区外临时包可放入工作区暂存目录，或配置明确的允许根目录；不默认允许整个临时目录。
+- Windows Git Bash 使用 GNU tar 打包时，归档路径用 /c/... 等 MSYS 路径，或加 --force-local；C: 可能被识别为远端主机前缀。该规则针对 GNU tar。
 `;
 
 export async function runWorkspaceServer(profile: string): Promise<void> {
@@ -53,15 +61,25 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
   const readToken = z.string().optional().describe("Server-issued token from reads of the current file version");
   const count = z.number().int().min(1).max(1000).optional();
   const register = (name: string, description: string, schema: z.ZodRawShape,
-    action: (input: Record<string, any>) => Promise<unknown>) => {
+    action: (input: Record<string, any>) => Promise<unknown>, online = true) => {
     server.registerTool(name, { description, inputSchema: schema }, async input => {
       try {
-        await maintenance.maybeMaintain().catch(() => undefined);
-        return { content: [{ type: "text" as const, text: JSON.stringify(await action(input)) }] };
+        if (online) await maintenance.maybeMaintain().catch(() => undefined);
+        let result = await action(input);
+        if (name === "remote_upload" || name === "remote_download") {
+          const transfer = result as Record<string, unknown>;
+          const acknowledgementRequired = transfer.acknowledged !== true
+            && ["completed", "failed", "cancelled", "interrupted"].includes(transfer.state as string);
+          result = { ...transfer, acknowledgementRequired,
+            nextAction: acknowledgementRequired ? { tool: name, arguments: {
+              action: "ack", sessionId: input.sessionId, transferId: transfer.transferId ?? input.transferId } } : undefined };
+        }
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       }
       catch (error) {
-        const fault = error as { code?: string; message?: string; retriable?: boolean };
-        return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ code: fault.code ?? "WORKSPACE_ERROR", message: fault.message ?? "Operation failed", retriable: fault.retriable ?? false }) }] };
+        const fault = error as { code?: string; message?: string; retriable?: boolean; transferId?: string };
+        return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ code: fault.code ?? "WORKSPACE_ERROR", message: fault.message ?? "Operation failed", retriable: fault.retriable ?? false,
+          transferId: fault.transferId ?? input.transferId }) }] };
       }
     });
   };
@@ -88,7 +106,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       // rejected before entering the request pipeline; the exact 16 MiB byte
       // gate stays with the remote helper (remote/files.py) as the authority.
       text: z.string().max(64 * 1024 * 1024).optional(), data: z.string().max(64 * 1024 * 1024).optional() }, input => files.call("file_write", input.sessionId, input));
-  register("remote_upload", "Upload a local file of any size through a resumable verified transfer: 1 MiB chunks stream over a binary SSH channel with per-chunk digests and a final two-sided SHA-256, and the model never carries file bytes. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId and bounded progress; if it returns state=transferring with budgetExhausted=true, call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is resent; a changed local source is refused). action=status observes without side effects. action=cancel stops the transfer after confirming nothing is in flight, releases its uncommitted data and never rolls back a committed target; action=ack acknowledges a terminal result after you inspected it (keep it separate from status). Creating requires an absent target; replacing an existing target requires overwrite=true plus its metadataOnly expectedVersion.",
+  register("remote_upload", "Upload a guarded local file through a resumable verified binary transfer. action=start durably registers locally and quickly returns preparing plus transferId before hashing or SSH; an independent local process drives the transfer. Attach ssh-mcp-job transfer wait in ZCode native background Shell for completion delivery. Recover a lost identifier with remote_transfer_pending. action=status returns a local driver snapshot for new transfers; action=resume reattaches an interrupted driver. Legacy registrations keep synchronous resume with a soft budget (default 55 s), so use the background CLI for them. Cancellation may return cancelling until the driver confirms its outcome; completed publication is never rolled back. Inspect terminal results then execute nextAction/ack; status never consumes them. Sources must be within localRoot or allowedLocalPaths. Replacement requires overwrite=true and the metadataOnly expectedVersion.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -97,7 +115,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent; must pair with expectedVersion"),
       expectedVersion: z.string().optional().describe("Version from a metadataOnly read; required with overwrite"),
       chunkSize: z.number().int().min(65536).max(8388608).optional().describe("Chunk size between 64 KiB and 8 MiB; default 1 MiB"),
-      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Driving budget for this call; on exhaustion the bounded progress returns with budgetExhausted=true"),
+      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Soft driving budget for legacy synchronous resume or the first background round; not a MCP wait timeout or a wall-clock guarantee"),
     }, async input => {
       if (input.action === "cancel" || input.action === "ack") {
         if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
@@ -107,14 +125,14 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       }
       if (input.action === "start") {
         if (!input.localPath || !input.path) throw new RemoteAgentError("INVALID_REQUEST", "start requires localPath and path");
-        return transfers.upload(input.sessionId, input as { localPath: string; path: string;
+        return transfers.start(input.sessionId, "upload", input as { localPath: string; path: string;
           create?: boolean; overwrite?: boolean; expectedVersion?: string; chunkSize?: number; budgetMs?: number });
       }
       if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
-    });
-  register("remote_download", "Download a remote file of any size through a resumable verified transfer, the reverse of remote_upload: the remote source is bound to its observed m1- version, each fetched 1 MiB chunk is digested locally before it is confirmed, and a final local SHA-256 must match the sender's register-time digest before the atomic commit. action=start registers the transfer and drives it within budgetMs (default 55 s), returning the durable transferId plus bounded progress; on budgetExhausted=true call again with action=resume and that transferId to continue from the confirmed offset (only unconfirmed data is refetched; a changed remote source is refused). action=status observes without side effects. action=cancel stops the transfer, releases the local uncommitted temp and never rolls back a committed target; a cancel racing the commit window reconciles by receipt/intent evidence and reports unknown rather than guessing; action=ack acknowledges a terminal result after inspection (unknown outcomes are never acknowledged). The local target must be absent by default; replacing it requires overwrite=true plus the expectedVersion reported for the local target in the FILE_CONFLICT guidance. Downloads never issue a readToken and never grant model read coverage.",
+    }, false);
+  register("remote_download", "Download a guarded remote file through a resumable verified binary transfer. action=start quickly returns a durable transferId and preparing before SSH or whole-file hashing; totalBytesKnown=false until source registration. An independent local process verifies chunks and SHA-256 before local atomic publication. Attach ssh-mcp-job transfer wait in ZCode native background Shell for completion delivery; remote_transfer_pending recovers lost identifiers. status returns a local driver snapshot for new transfers and resume reattaches an interrupted driver; legacy registrations retain synchronous resume with a soft budget. Cancellation is a request until the driver confirms a terminal outcome and never rolls back a proven commit. Inspect results then execute nextAction/ack; unknown outcomes cannot be acknowledged. Local targets stay inside localRoot or allowedLocalPaths. Replacement requires overwrite=true and the observed local expectedVersion; downloading grants no readToken.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -123,7 +141,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent for the local target; must pair with expectedVersion"),
       expectedVersion: z.string().optional().describe("Version reported for the existing local target; required with overwrite"),
       chunkSize: z.number().int().min(65536).max(8388608).optional().describe("Chunk size between 64 KiB and 8 MiB; default 1 MiB"),
-      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Driving budget for this call; on exhaustion the bounded progress returns with budgetExhausted=true"),
+      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Soft driving budget for legacy synchronous resume or the first background round; not a MCP wait timeout or a wall-clock guarantee"),
     }, async input => {
       if (input.action === "cancel" || input.action === "ack") {
         if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
@@ -133,13 +151,20 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       }
       if (input.action === "start") {
         if (!input.path || !input.localPath) throw new RemoteAgentError("INVALID_REQUEST", "start requires path and localPath");
-        return transfers.download(input.sessionId, input as { path: string; localPath: string;
+        return transfers.start(input.sessionId, "download", input as { path: string; localPath: string;
           create?: boolean; overwrite?: boolean; expectedVersion?: string; chunkSize?: number; budgetMs?: number });
       }
       if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
-    });
+    }, false);
+  register("remote_transfer_pending", "List this conversation's unacknowledged uploads and downloads from local durable registrations. No SSH or online maintenance. Use this after a lost start response to recover transferId; entries are registration snapshots, not live remote status. Query nextOffset for more.",
+    { sessionId, offset: z.number().int().nonnegative().default(0) }, async input => {
+      const pending = await transfers.pending(input.sessionId);
+      return { transfers: pending.slice(input.offset, input.offset + 50),
+        nextOffset: pending.length > input.offset + 50 ? input.offset + 50 : null,
+        registryIssueCount: transfers.transferRegistryIssues.length };
+    }, false);
   // Issue #20 / ADR 0007: remote_move/delete/mkdir/rmdir are retired. Moving,
   // deleting and directory management go through remote shell commands
   // (execute tasks); those shell paths never had the file tools' readToken
@@ -152,7 +177,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
     const pending = await runtime.tasks.pending(input.sessionId);
     return { tasks: pending.slice(input.offset, input.offset + 50).map(({ jobId, createdAt, command, cwd }) => ({ jobId, createdAt, commandPreview: command.slice(0, 200), cwd })),
       nextOffset: pending.length > input.offset + 50 ? input.offset + 50 : null, registryIssueCount: runtime.tasks.registryIssues.length };
-  });
+  }, false);
   register("remote_status", "Observe an owned task without restarting it.", job, async input => { await own(input); return runtime.tasks.status(input.jobId); });
   register("remote_output", "Read task stdout/stderr as separate base64 chunks with byte cursors, or tail=true for the end of each log.", { ...job, stdoutOffset: z.number().int().nonnegative().optional(), stderrOffset: z.number().int().nonnegative().optional(), tail: z.boolean().optional(), maxBytes: z.number().int().min(1).max(16000).default(16000) }, async input => { await own(input); return runtime.remote.call("output", input); });
   register("remote_wait", "Short bounded observation only. Use native background Shell + ssh-mcp-job wait for automatic completion delivery.", { ...job, waitTimeoutMs: z.number().int().min(0).max(10000).default(1000) }, async input => { await own(input); return runtime.tasks.wait(input.jobId, { waitTimeoutMs: input.waitTimeoutMs }); });
