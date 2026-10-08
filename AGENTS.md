@@ -37,6 +37,9 @@
 - `src/`：MCP 服务、工具、SSH 连接与配置实现。
 - `src/core/setup-server.ts`：通用 setup MCP，缺项询问与项目接入入口。
 - `src/services/workspace-setup.ts`：MCP 与手工 CLI 共用的项目配置合并逻辑。
+- `src/services/codex-integration.ts`：Codex 项目 MCP 与钩子合并、归属核对和移除规划。
+- `src/services/session-context.ts`：可选的远端根规则与技能目录读取、宿主筛选和注入预算。
+- `docs/design/session-start-context.md`：ZCode/Codex 会话注入、每绑定开关与验收边界。
 - `src/cli/transfer-worker.ts`：独立本机传输驱动入口，由持久编号与驱动执行权启动，不是人工 CLI 入口。
 - `src/services/transfer-driver.ts`：驱动、状态与维护共用的 IPC 执行权端点与存活判断。
 - `examples/`：标准 MCP 导入及 ZCode 原生配置的 setup 服务模板。

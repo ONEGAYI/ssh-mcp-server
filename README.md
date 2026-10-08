@@ -130,8 +130,8 @@ Agent 会先调用工具获取缺项，再向你询问：
 信息齐全后，Agent 再次调用 `remote_setup`，工具会自动：
 
 - 生成本机工作区的 `.ssh-mcp-workspace.json`；提供 `bindingName` 时生成独立的 `.ssh-mcp-workspace.<名称>.json`。
-- 合并项目 MCP 和恢复钩子到 `.zcode/config.json`，保留已有服务与规则；每个绑定一个 `ssh-workspace-*` MCP 服务和一个恢复钩子。
-- 合并生成项目级 ZCode MCP 与恢复钩子接入配置（Agent 操作指引由工作区 MCP 的 remote_help 按需提供，不再写任何 markdown）。
+- 默认合并 ZCode 项目 `.zcode/config.json`；指定 `clients: ["zcode", "codex"]` 时同时接入 Codex 的 `.codex/config.toml` 和 `.codex/hooks.json`。每绑定独立登记 MCP、恢复钩子及默认关闭的会话规则注入钩子，保留已有服务和自有钩子。
+- 操作指引由工作区 MCP 的 `remote_help` 按需提供，不再生成本机 markdown。
 - 在直接提供私钥路径／SSH agent 的模式下，生成 `.ssh-mcp-connection.json`（命名绑定为 `.ssh-mcp-connection.<名称>.json`）；只记录连接参数，不复制私钥。建议把 `.ssh-mcp-*.json` 加入本项目 `.gitignore`——它们含主机与认证参数，不宜入库（setup 不代改 .gitignore）。旧版本曾生成的 AGENTS.md / CLAUDE.md / SSH-WORKSPACE-GUIDE.md，若内容仍与已知生成文本一致，会在重新 configure 时自动回收并在返回中报告；用户改过的文件保留不动。
 
 不需要手工运行 setup 脚本。成功返回中的 `sshVerified=false` 表示**配置已准备好，但还没有验证远端连接**。
@@ -139,6 +139,8 @@ Agent 会先调用工具获取缺项，再向你询问：
 重新打开指定的本机项目（如果新工具尚未出现），并确认 ZCode 提示的**首次项目钩子信任**。随后让 Agent 调用 `remote_workspace` 验证 SSH、Python 和远端目录，再读取远端规则。
 
 setup 服务负责首次接入；日常文件和任务操作使用它生成的项目 MCP。
+
+**会话规则与技能注入**：已有绑定先 `inspect`，再带 `revision` 执行 `update`，传入 `sessionStart: { enabled: true }` 即开启远端 `AGENTS.md` 和 `.agents/skills` 目录注入；ZCode 还读取远端 `.zcode/skills`。技能只注入名称、描述和路径，使用时再读 `SKILL.md`。同一个开关可随时关闭，下一次 `SessionStart` 生效，已注入内容不会从旧对话撤回。每绑定独立设置；增加 Codex 接入时同次更新 `clients: ["zcode", "codex"]`。Codex 需完成项目与钩子信任；ZCode 按用户已确认可用的 3.14.x 项目钩子验收。预算、失败和版本边界见 [会话注入说明](docs/design/session-start-context.md)。
 
 ## 5. 添加更多绑定与解除目录边界
 

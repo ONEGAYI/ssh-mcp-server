@@ -103,6 +103,10 @@ it('workspace MCP serves the full usage guide through remote_help with zero remo
     assert.equal(result.isError, undefined, result.content?.[0]?.text);
     const data = JSON.parse(result.content[0].text);
     assert.equal(typeof data.guide, 'string');
+    assert.match(data.guide, /Codex/, 'shared guide covers the Codex host workflow');
+    for (const name of ['remote_upload', 'remote_download']) {
+      assert.match(tools.tools.find(tool => tool.name === name).description, /Codex/, `${name} describes the current-host waiting workflow`);
+    }
     assert.ok(data.guide.length > 200, 'the full guide is served, not a stub');
     for (const keyword of ['remote_workspace', 'remote_read', 'sessionId', '后台', 'wait', 'remote_ack']) {
       assert.ok(data.guide.includes(keyword), `guide covers ${keyword}`);

@@ -24,7 +24,7 @@ const HELP = `Usage: ssh-mcp-job <run|wait|status|cancel|pending|ack|cleanup|doc
   maintain                          Run one bounded expiry-reclamation round now (both ends);
                                     normally triggered automatically, at most hourly
   doctor                            Inspect remote capabilities and actual runtime libc
-Run this command through ZCode's native background Shell tool for automatic completion delivery.
+Run through your client's native command tool: ZCode background Shell, or Codex command-session continuation. Reattach remote jobs by their original jobId after a conversation restarts.
 Ending this local waiter does not cancel the remote task or transfer. Results remain pending until ack.`;
 
 const TASK_ACTIONS = ["run", "wait", "status", "cancel", "pending", "ack", "cleanup", "doctor", "maintain"];
@@ -132,7 +132,7 @@ async function main(): Promise<void> {
           process.exitCode = outcome.state === "completed" ? 0 : 1;
         } else {
           console.log(JSON.stringify({ kind: "transfer-started", ...outcome,
-            hint: "Attach ZCode's native background Shell to the durable id: ssh-mcp-job transfer wait --transfer-id " + outcome.transferId }));
+            hint: "Use the current client's command tool to follow the durable id: ssh-mcp-job transfer wait --transfer-id " + outcome.transferId }));
         }
         return;
       }

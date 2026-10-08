@@ -73,7 +73,7 @@ setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，�
 
 - `action: "inspect"`（提供 `localRoot`，多绑定时加 `bindingName`）返回脱敏配置、生效策略（含默认值）、凭据来源说明和 `revision`。凭据永不回显，inspect 不连接 SSH。
 - `action: "update"` 必须带上 inspect 返回的 `revision`：只改显式提供的字段，其余原样保留；revision 过期或配置已被并发修改会返回 SETUP_CONFLICT，重新 inspect 后再试。
-- 可更新字段：`policy`（组内深合并，见下表）、`directoryScope`、`pythonPath`。首次配置时也可以直接随调用提供 `policy`。
+- 可更新字段：`policy`（组内深合并，见下表）、`directoryScope`、`pythonPath`、`clients`、`sessionStart`。首次配置同样支持这些字段。
 - 服务器连接、认证、remoteRoot、remoteStateDir、localStateDir、workspaceId 属身份字段，update 显式修改即拒绝（SETUP_IDENTITY_LOCKED）：换目标请用新 `bindingName` 新建绑定，旧绑定保留到任务和状态清理完成。
 
 policy 组与默认值（未写的字段按默认生效）：
@@ -91,6 +91,14 @@ policy 组与默认值（未写的字段按默认生效）：
 生效时点：策略保存后由消费方在下一次操作或维护周期读取新值，无需重启；运行中的操作沿用启动时快照。保留期限变更只影响新生成记录，已有记录的到期时间不变。`directoryScope` 与 `pythonPath` 在工作区 MCP 服务下次启动时生效。额度预留（本机 SpaceLedger 自 #16 起每次额度检查经 loadPolicy 重读 `limits.localWorkspaceBytes`）与到期清理（见「到期回收与在线维护」）已接入强制执行；搜索预算的强制执行仍属后续票据，当前仅完成存储、校验与按次重读。
 
 手工编辑 profile 中的 policy 节同样受 schema 校验：未知字段、非正整数或布尔类型错误会让配置加载失败并明确报出字段位置。
+
+### 会话开始时加载规则和技能
+
+对现有绑定先 inspect，再携带 revision 更新 `clients: ["zcode", "codex"]` 和 `sessionStart: { enabled: true }`。每个绑定独立保存；省略 clients 保持 ZCode 默认，省略开关默认关闭。关闭用 `sessionStart: { enabled: false }`，其余预算字段保留。
+
+两端均读取远端根 `AGENTS.md` 与 `.agents/skills`；ZCode 额外读取 `.zcode/skills`，不支持 `.codex/skills`。技能注入名称、描述和远端 SKILL.md 路径，使用前仍需读取正文。可配总读取等待 `timeoutMs`（默认 5000）和注入大小 `maxBytes`（默认 8192）。缺失与失败可见，超限或超时不会静默注入半份规则。
+
+新配置在下一次 SessionStart 生效，旧对话中已注入的内容不会撤回。Codex 接入后需重开项目并信任项目配置与钩子（`/hooks`）；ZCode 接入目标为已确认项目钩子可用的 3.14.x。详见 [范围、协议与验收](session-start-context.md)。
 
 ### 移除绑定（remove）
 

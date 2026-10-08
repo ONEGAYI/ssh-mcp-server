@@ -333,3 +333,11 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 独立复核发现并修复：unknown 被误写为 failed、准备态上传未启动就续传、遗留接管文件阻塞驱动、初始化错误未落盘、PID 复用误阻止维护回收、unknown 让后台 wait 无限等待。相关契约测试先确认失败，再验证修复。
 
 本机全量 JS 325 项（308 通过、17 门控跳过、0 失败），WSL Python helper 八套共 192 项通过。构建与 MCP 协议测试通过，SSH 传输在边界模拟；另一台机器上的真实 ZCode / CentOS 7、大文件网络表现尚未验收。用户已授权合并与发布，本次交付版本为 v2.3.0，不能将本机回归称为用户验收。
+
+## 2026-10-08：双宿主会话规则与技能注入
+
+已实施 [会话注入契约](session-start-context.md)：每绑定可选 `sessionStart`，默认关闭，随 AGENTS 开关加载 `.agents/skills` 的名称、描述及路径；ZCode 额外加载 `.zcode/skills`，按用户最终要求不支持 `.codex/skills`。现有恢复钩子、MCP 接入、二次配置与移除一并支持 Codex；认证与绑定 identity 保留。
+
+工程约定与需求两轴独立审查发现的配置换行、单端移除、失败预算、宿主指引、握手/代理等待与宿主切换半写均已复现并修复，最终复核无阻断项。专用钩子进程完整输出 JSON 后退出；切换宿主的多文件保存失败会回滚，冲突时报告未恢复路径。
+
+本机全量 JS 334 项（317 通过、17 远端门控跳过、0 失败）；WSL Python helper 八套 192 项（1 跳过，其余通过）。真实 SSH 握手与 HTTP CONNECT 黑洞的钩子退出通过本机 TCP/子进程契约验证，远端规则内容在 SSH 边界模拟。ZCode 3.14.x 与 Codex 的实际会话触发、信任和 CentOS 7 现场使用仍待用户人工验收；本次仅通过 fork 草稿 PR 交付，不合并或发布版本。
