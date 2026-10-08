@@ -1,6 +1,6 @@
 # SSH MCP 工作区
 
-在 Windows 上运行 ZCode，通过 SSH 操作 Linux 工程。支持受保护文件编辑、后台任务完成回传，以及客户端重启后继续跟进原任务。
+在 Windows 上运行 ZCode 或 Codex，通过 SSH 操作 Linux 工程。支持受保护文件编辑、后台任务完成回传，以及客户端重启后继续跟进原任务。下方以 ZCode 的首次接入为例，Codex 和双宿主配置见 setup 与会话注入说明。
 
 这是 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 维护的 fork，基于 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server)。本文介绍本 fork 的离线预览包与 MCP 引导接入；上游 npm 发行版不代表包含这些新增能力。
 
@@ -8,19 +8,21 @@
 
 MCP 的 `remote_upload` / `remote_download` 先在本机登记并返回 `preparing` 与 `transferId`，摘要计算和传输由独立后台进程执行。启动返回不代表传输完成；首次准备下载时 `totalBytesKnown=false`，不能把未知总量按零字节完成处理。
 
-用恢复钩子提供的真实会话标识，在 **ZCode 原生后台 Shell** 中执行 `ssh-mcp-job transfer wait --transfer-id {{原传输编号}} --workspace {{配置文件}} --session {{真实会话标识}}`，挂接完成通知。CLI 的同步 `transfer start` 仍可使用，但整个启动命令也应放入原生后台 Shell。
+用恢复钩子提供的真实会话标识，执行 `ssh-mcp-job transfer wait --transfer-id {{原传输编号}} --workspace {{配置文件}} --session {{真实会话标识}}`，挂接完成通知。ZCode 使用原生后台 Shell；Codex 使用命令会话持续读取结果。CLI 的同步 `transfer start` 仍可使用，也应遵循当前宿主的后台等待流程。
 
 启动超时或编号丢失时，调用 `remote_transfer_pending`（无需 SSH），或 CLI `transfer pending` 找回原编号；不要重复创建传输。结果处理完成后按返回的 `nextAction` 执行 `ack`。`pending` 表示尚未确认结果，已经完成的传输也会列出。
 
 本机路径须位于工作区或 SSH 配置的 `allowedLocalPaths` 内。工作区外的临时包应移入工作区暂存目录，或配置明确的允许根目录。Windows Git Bash 的 GNU tar 归档路径用 `/c/...` 等 MSYS 路径，或加 `--force-local`，避免把盘符冒号识别成远端主机前缀。
 
-上述改进随 v2.3.0 离线包分发，详细流程与旧传输兼容说明见 [usage.md](docs/design/usage.md)。真实 ZCode / CentOS 7 验收待完成。
+v2.4.0 中，Windows 状态文件替换持续受阻会返回 `paused`，保留数据与原编号。解除访问问题后按原编号恢复，暂停结果不能 `ack`；旧 `failed` 的 `resume` 只返回原失败结果。取消文件传输使用对应上传/下载工具的 `action=cancel`，`remote_cancel` 用于命令任务。
+
+详细流程与旧传输兼容说明见 [usage.md](docs/design/usage.md)。真实 ZCode / Codex 与 CentOS 7 内网验收待完成。
 
 ## 1. 使用前准备
 
 | 位置 | 需要什么 |
 |---|---|
-| Windows | 已配置可用模型的 ZCode，以及本项目离线包；包内自带 Node.js 和运行依赖 |
+| Windows | 已配置可用模型的 ZCode 或 Codex，以及本项目离线包；包内自带 Node.js 和运行依赖 |
 | Linux | 可通过 SSH exec 连接，已有 Bash 和 Python 3.6+，工程目录及状态目录可写 |
 | 网络 | Windows 能通过 SSH 访问 Linux；Linux 不需要访问外网 |
 
