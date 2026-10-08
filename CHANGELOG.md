@@ -2,6 +2,38 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.4.0] - 2026-10-08
+
+新增 ZCode / Codex 双宿主接入与可选的会话规则、技能目录注入。Windows 传输状态保存持续受阻时保留编号和数据，解除占用后可恢复，不再误记为失败终态。
+
+### 新功能
+
+**双宿主接入与会话上下文（setup / 恢复钩子）（PR [#38](https://github.com/ONEGAYI/ssh-mcp-server/pull/38)）**
+
+- 每绑定可选择 ZCode、Codex 或同时接入两端，初始化、更新、恢复与移除保留其他绑定和用户自有配置
+- 新增默认关闭的 `sessionStart` 开关，会话启动时读取远端根规则与工作区技能目录，按绑定限定范围和注入预算
+- 技能只注入名称、描述和远端路径，正文按需读取；ZCode 使用 `.agents/skills` 与 `.zcode/skills`，Codex 使用 `.agents/skills`
+- 存量绑定通过 `inspect → update` 启用新能力，认证信息和任务、传输身份保持不变
+
+### Bug 修复
+
+**Windows 状态保存受阻后的传输恢复（MCP / CLI）（PR [#39](https://github.com/ONEGAYI/ssh-mcp-server/pull/39)）**
+
+- 小型传输状态 JSON 的原子替换遇到 Windows `EPERM/EBUSY` 时有限重试；持续拒绝则退出驱动并返回 `paused`，保留原编号、数据和诊断
+- 解除文件访问问题后按原编号恢复；CLI `transfer wait` 返回暂停结果，不无限等待，暂停记录不能确认
+- 上传远端已经提交、本机完成结果尚未保存时拒绝 `ack`，按原编号对账终态后再确认
+- 旧 `failed` 的 `resume` 明确返回已保存的失败结果，不启动新尝试；明确取消请求不被数据退避阻塞
+
+### 其他改进
+
+- 工具说明区分命令任务 `jobId` 与文件传输 `transferId` 的取消入口，并说明未完成传输中的 SHA-256 是预期摘要，不能证明接收文件已经完成整文件校验（PR #39）
+
+> **升级注意**：使用完整新离线包，包含新增的 `yaml`、`smol-toml` 依赖。存量绑定仍默认接入 ZCode、关闭会话注入；增加宿主或启用注入需先 `inspect`，再带 `revision` 更新 `clients` / `sessionStart`。Codex 项目与钩子信任需用户完成，ZCode 项目钩子按已确认的 3.14.x 环境验收。
+
+> **恢复边界**：新暂停记录保留数据，应解除访问问题后恢复原编号；旧失败记录保持终态，处理原因后按需创建新传输。现场持锁进程尚未确定。
+
+> **验收状态**：本机 Node 回归 327 项通过、17 项环境跳过、0 失败；真实 Windows 文件句柄探针验证释放占用后原编号完成 32 MiB 下载且字节一致。SSH 边界模拟，真实 ZCode / Codex 与 CentOS 7 内网使用仍待用户验收。本版附 Windows x64 离线包。
+
 ## [2.3.0] - 2026-10-08
 
 大文件启动改为先返回可恢复编号，再由独立进程传输；补全离线发现、后台等待和确认指引。setup 提供显式连接列表，初始化绑定时可直接选择预存服务器。
@@ -111,6 +143,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.4.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.1...v2.1.0
