@@ -332,4 +332,4 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 
 独立复核发现并修复：unknown 被误写为 failed、准备态上传未启动就续传、遗留接管文件阻塞驱动、初始化错误未落盘、PID 复用误阻止维护回收、unknown 让后台 wait 无限等待。相关契约测试先确认失败，再验证修复。
 
-本机全量 JS 325 项（308 通过、17 门控跳过、0 失败），WSL Python helper 八套共 192 项通过。构建与 MCP 协议测试通过，SSH 传输在边界模拟；另一台机器上的真实 ZCode / CentOS 7、大文件网络表现尚未验收。本轮尚未发布版本，不能将本机回归称为用户验收。
+本机全量 JS 325 项（308 通过、17 门控跳过、0 失败），WSL Python helper 八套共 192 项通过。构建与 MCP 协议测试通过，SSH 传输在边界模拟；另一台机器上的真实 ZCode / CentOS 7、大文件网络表现尚未验收。用户已授权合并与发布，本次交付版本为 v2.3.0，不能将本机回归称为用户验收。

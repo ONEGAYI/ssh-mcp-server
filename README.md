@@ -14,7 +14,7 @@ MCP 的 `remote_upload` / `remote_download` 先在本机登记并返回 `prepari
 
 本机路径须位于工作区或 SSH 配置的 `allowedLocalPaths` 内。工作区外的临时包应移入工作区暂存目录，或配置明确的允许根目录。Windows Git Bash 的 GNU tar 归档路径用 `/c/...` 等 MSYS 路径，或加 `--force-local`，避免把盘符冒号识别成远端主机前缀。
 
-详细流程与旧传输兼容说明见 [usage.md](docs/design/usage.md)。本轮代码尚未发布离线包，真实 ZCode / CentOS 7 验收待完成。
+上述改进随 v2.3.0 离线包分发，详细流程与旧传输兼容说明见 [usage.md](docs/design/usage.md)。真实 ZCode / CentOS 7 验收待完成。
 
 ## 1. 使用前准备
 

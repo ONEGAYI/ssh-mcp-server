@@ -2,6 +2,42 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.3.0] - 2026-10-08
+
+大文件启动改为先返回可恢复编号，再由独立进程传输；补全离线发现、后台等待和确认指引。setup 提供显式连接列表，初始化绑定时可直接选择预存服务器。
+
+### 新功能
+
+**快速启动与离线恢复（MCP / CLI）（PR [#37](https://github.com/ONEGAYI/ssh-mcp-server/pull/37)）**
+
+- 上传、下载在整文件摘要和 SSH 操作前持久登记编号，MCP 返回 `preparing` 后由独立 Node 进程驱动
+- 新增 `remote_transfer_pending`，按会话离线分页列出传输；错误响应保留 `transferId`，编号丢失时可找回原传输
+- `transfer wait` 观察或接回同一后台驱动，MCP 退出与驱动中断后可继续恢复；同一传输的执行权由操作系统 IPC 独占
+- 新下载尚未取得远端大小时明确标记 `totalBytesKnown=false`；新传输的 `status` 返回本机驱动快照、错误和接回提示
+
+**初始化绑定时列出预存服务器（setup）（PR [#37](https://github.com/ONEGAYI/ssh-mcp-server/pull/37)）**
+
+- `remote_setup(action="list_connections")` 只读列出启动 `--config-file` 或调用 `sshConfigFile` 指定的 SSH MCP JSON 连接库中的名字
+- 列表不要求工程目录，不写配置或连接 SSH，不回传主机及认证字段
+- 未提供配置路径时只询问 JSON 文件路径；工具说明明确入口及它与 OpenSSH `.ssh/config` 的区别
+
+### Bug 修复
+
+**大文件调用超时后的可观察性（MCP）（PR [#37](https://github.com/ONEGAYI/ssh-mcp-server/pull/37)）**
+
+- 全文摘要与数据驱动不再占用 MCP 启动调用的等待窗口，后台初始化错误写回登记并保存在 `driver.log`
+- 指定编号登记可按同一意图重放，登记响应丢失后不会创建另一传输
+- 结果状态与后续操作明确展示，未知发布状态结束 CLI 等待并返回非成功，不能作为可确认结果处理
+
+### 其他改进
+
+- 本机路径拒绝说明 `localRoot` / `allowedLocalPaths` 的允许范围；`remote_help` 与文档补全后台启动、等待、找回编号、显式确认和 Windows GNU tar 路径说明（PR #37）
+- 新增 `npm run test:py` 并行 Python 套件入口，并强化既有探针、命令白名单与断言覆盖（提交 [93969b7](https://github.com/ONEGAYI/ssh-mcp-server/commit/93969b7176604fe1f95ebcd6c70c92478f8fa7ad)、[f643714](https://github.com/ONEGAYI/ssh-mcp-server/commit/f643714b3305e62813e469f1fdffba0ef570a5b0)）
+
+> **升级注意**：MCP `start` 返回编号不代表完成，应在 ZCode 原生后台 Shell 中对原编号执行 `transfer wait`。已有同步 CLI 与旧传输记录仍可使用；结果处理后显式 `ack`，`unknown` 须人工核实且不能确认。
+
+> **验收状态**：本机 JS 与 WSL Python 回归通过，另一台机器的真实 ZCode / CentOS 7 和大文件网络表现仍待用户验收。本版分发为含 Windows Node 运行时与依赖的离线包。
+
 ## [2.2.0] - 2026-09-15
 
 绑定生命周期收口：remote_setup 新增移除绑定动作（remove），手工 CLI 提供对等入口，绑定从此具备完整的接入—调整—退役闭环。
@@ -75,6 +111,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.3.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.0.0...v2.0.1
