@@ -29,12 +29,15 @@
 - `docs/design/discovery.md`：上游代码核实、候选方案与尚待回答的需求问题。
 - `docs/design/interactive-assessment.md`：交互式功能复杂度、延期影响及首版扩展边界评估。
 - `docs/design/binding-lifecycle-tickets.md`：按需指引（#29）与绑定移除（#28）的实施票据、依赖和验收条件。
+- `docs/design/transfer-start-spec.md` / `transfer-start-tickets.md`：大文件快速启动、离线恢复、结果提示与后台驱动规格及实施票据。
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。
 - `README.md`：本 fork 的中文入门、setup、日常使用与升级说明；每次离线打包放入包根目录。
 - `README_EN.md`：保留的上游英文旧模式说明。
 - `src/`：MCP 服务、工具、SSH 连接与配置实现。
 - `src/core/setup-server.ts`：通用 setup MCP，缺项询问与项目接入入口。
 - `src/services/workspace-setup.ts`：MCP 与手工 CLI 共用的项目配置合并逻辑。
+- `src/cli/transfer-worker.ts`：独立本机传输驱动入口，由持久编号与驱动执行权启动，不是人工 CLI 入口。
+- `src/services/transfer-driver.ts`：驱动、状态与维护共用的 IPC 执行权端点与存活判断。
 - `examples/`：标准 MCP 导入及 ZCode 原生配置的 setup 服务模板。
 - `remote/`：Python 3.6 标准库执行器、持久任务、受保护文件操作与有界搜索。
 - `test/` / `scripts/`：上游测试和构建脚本。

@@ -4,6 +4,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { createServer } from 'node:net';
+import { once } from 'node:events';
 
 const MODULE_URL = new URL('../build/services/maintenance.js', import.meta.url).href;
 let MaintenanceService;
@@ -11,6 +13,44 @@ try { ({ MaintenanceService } = await import(MODULE_URL)); }
 catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }
 
 const DAY = 86400000;
+
+it('does not reclaim a background transfer while its driver holds execution ownership', async () => {
+  const fixture = await buildFixture();
+  const id = 'a'.repeat(32);
+  const name = 'ssh-mcp-transfer-' + createHash('sha256').update(fixture.config.identity + id).digest('hex').slice(0, 48);
+  const server = createServer(socket => socket.destroy());
+  try {
+    server.listen(process.platform === 'win32' ? '\\\\.\\pipe\\' + name : '\0' + name);
+    await once(server, 'listening');
+    const directory = await writeTransfer(fixture.identityDir, id, {
+      schemaVersion: 1, transferId: id, background: true, direction: 'upload',
+      state: 'preparing', expiresAt: Date.now() - DAY,
+    });
+    const result = await new MaintenanceService(fixture.config, recordingRemote()).maybeMaintain();
+    assert.ok(await stat(directory));
+    assert.deepEqual(result.local.removedTransfers, []);
+  } finally {
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+it('reclaims an expired background transfer despite a stale driver PID reused by a living process', async () => {
+  const fixture = await buildFixture();
+  try {
+    const id = 'b'.repeat(32);
+    const tempPath = join(fixture.root, 'expired-receiver.temp');
+    await writeFile(tempPath, 'stalled receiver data');
+    const directory = await writeTransfer(fixture.identityDir, id, {
+      schemaVersion: 1, transferId: id, background: true, direction: 'download',
+      state: 'transferring', expiresAt: Date.now() - DAY, tempPath,
+    }, { 'driver.json': { pid: process.pid, token: 'stale-driver' } });
+    const result = await new MaintenanceService(fixture.config, recordingRemote()).maybeMaintain();
+    assert.deepEqual(result.local.removedTransfers, [id]);
+    await assert.rejects(stat(directory), { code: 'ENOENT' });
+    await assert.rejects(stat(tempPath), { code: 'ENOENT' });
+  } finally { await rm(fixture.root, { recursive: true }); }
+});
 
 function hex32() { return randomUUID().replaceAll('-', ''); }
 

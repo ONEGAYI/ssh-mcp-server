@@ -325,3 +325,11 @@ node scripts/probes/zcode-background.mjs --cli <ZCode安装目录>/resources/glm
 验证：npm 238 tests/231 pass/0 fail/7 skip（VM 门控项）；WSL 五套件 remote-files 44、remote-agent 13、remote-ledger 12、remote-discovery 27、remote-transfer 46 全 OK；VM 串行门控 workspace-mcp 4/4（含 200 MiB 上传 61 s、下载 64.5 s、编辑 8.8 s）与 job-cli 2/2。注意：两个 VM 套件同 profile 并行执行存在 helper 部署竞争抖动（`node --test` 按文件并行），验证时串行执行或拆 profile。
 
 不修记档（后续票据对齐）：搜索预算参数未暴露 MCP schema 且 policy 层无消费者（#16/#19 接线时统一）；`_truncate_manifest` 固定临时名（锁内私有目录，可接受）；额度检查的递归扫描在锁内执行的性能特征（#19 汇总时观察）。
+
+## 2026-10-08：大文件启动与发现改进
+
+已实施用户授权的四项改进：离线 MCP 传输列表与错误编号保留、后台 CLI 操作指引、路径拒绝与确认提示、摘要计算前持久登记并由独立 Node 进程驱动。用户追加的 setup 服务器列表采用 `remote_setup(action="list_connections")`，只读指定或预存 JSON 库的连接名，工具说明明确与 `.ssh/config` 的区别。规格与票据见 [transfer-start-spec.md](transfer-start-spec.md)、[transfer-start-tickets.md](transfer-start-tickets.md)，驱动决策见 [ADR 0012](../adr/0012-transfer-start-before-preparation.md)。
+
+独立复核发现并修复：unknown 被误写为 failed、准备态上传未启动就续传、遗留接管文件阻塞驱动、初始化错误未落盘、PID 复用误阻止维护回收、unknown 让后台 wait 无限等待。相关契约测试先确认失败，再验证修复。
+
+本机全量 JS 325 项（308 通过、17 门控跳过、0 失败），WSL Python helper 八套共 192 项通过。构建与 MCP 协议测试通过，SSH 传输在边界模拟；另一台机器上的真实 ZCode / CentOS 7、大文件网络表现尚未验收。本轮尚未发布版本，不能将本机回归称为用户验收。

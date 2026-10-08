@@ -7,8 +7,35 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 const profile = process.env.SSH_MCP_TEST_WORKSPACE;
+const execFileAsync = promisify(execFile);
+
+async function settleTransfer(call, name, started) {
+  if (started.error) return started;
+  let observed = started;
+  const deadline = Date.now() + 240000;
+  for (;;) {
+    if (['completed', 'failed', 'cancelled', 'unknown'].includes(observed.data.state)) {
+      if (observed.data.state === 'failed') return { error: true, data: { ...observed.data, code: observed.data.error.code } };
+      return observed;
+    }
+    assert.ok(Date.now() < deadline, 'independent transfer did not finish');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    observed = await call(name, { action: 'resume', transferId: started.data.transferId });
+    assert.equal(observed.error, undefined, JSON.stringify(observed));
+  }
+}
+
+async function legacyTransferStart(sessionId, direction, localPath, remotePath, chunkSize) {
+  const args = [fileURLToPath(new URL('../build/cli/job.js', import.meta.url)), 'transfer', 'start', '--workspace', profile,
+    '--session', sessionId, '--direction', direction, '--local', localPath, '--remote', remotePath, '--budget', '1000'];
+  if (chunkSize) args.push('--chunk-size', String(chunkSize));
+  const { stdout } = await execFileAsync(process.execPath, args, { timeout: 240000, windowsHide: true });
+  return { error: undefined, data: JSON.parse(stdout.trim()) };
+}
 
 /** Register, start and wait for one shell task on the remote, asserting a
  * clean exit. Issue #20 retired remote_delete/remote_move (ADR 0007), so the
@@ -97,7 +124,9 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal('readToken' in page1.data, false);
     await runTask(runtime, `rm -f '${searchPath}'`);
     const partial = await call('remote_read', { path, fromLine: 1, toLine: 1 });
-    const transfer = await call('remote_download', { path, localPath: downloaded });
+    const downloadStarted = await call('remote_download', { path, localPath: downloaded });
+    assert.equal(downloadStarted.data.state, 'preparing');
+    const transfer = await settleTransfer(call, 'remote_download', downloadStarted);
     assert.equal(transfer.error, undefined, JSON.stringify(transfer));
     assert.equal(transfer.data.state, 'completed', JSON.stringify(transfer.data));
     assert.equal(transfer.data.bytesWritten, 'hello\nworld\n'.length, JSON.stringify(transfer.data));
@@ -124,11 +153,11 @@ it('real workspace MCP protects uploads and transfers binary data without granti
     assert.equal(repeated.data.rereadRequired, false);
     // Uploading over an existing target without an explicit overwrite is
     // refused by the create-only default (issue #10 / ADR 0008).
-    const blocked = await call('remote_upload', { path, localPath });
+    const blocked = await settleTransfer(call, 'remote_upload', await call('remote_upload', { path, localPath }));
     assert.equal(blocked.data.code, 'FILE_CONFLICT');
     const uploadMeta = await call('remote_read', { path, metadataOnly: true });
-    const upload = await call('remote_upload', { path, localPath,
-      overwrite: true, expectedVersion: uploadMeta.data.version });
+    const upload = await settleTransfer(call, 'remote_upload', await call('remote_upload', { path, localPath,
+      overwrite: true, expectedVersion: uploadMeta.data.version }));
     assert.equal(upload.error, undefined, JSON.stringify(upload));
     const binaryRead = await call('remote_read', { path, encoding: 'base64' });
     assert.deepEqual(Buffer.from(binaryRead.data.data, 'base64'), binary);
@@ -242,7 +271,7 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
     let partial;
     for (let attempt = 0; attempt < 5; attempt++) {
       const step = attempt === 0
-        ? await call('remote_upload', { localPath, path: remoteName, budgetMs: 1000 })
+        ? await legacyTransferStart(sessionId, 'upload', localPath, remoteName)
         : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
@@ -313,7 +342,7 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     // and the tool returns the persistent identifier plus bounded state.
     for (let attempt = 0; attempt < 5; attempt++) {
       const step = attempt === 0
-        ? await call('remote_download', { path: remoteName, localPath, budgetMs: 1000 })
+        ? await legacyTransferStart(sessionId, 'download', localPath, remoteName)
         : await call('remote_download', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
@@ -406,7 +435,7 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
     let partial;
     for (let attempt = 0; attempt < 6; attempt++) {
       const step = attempt === 0
-        ? await call('remote_upload', { localPath, path: remoteName, chunkSize: 65536, budgetMs: 1000 })
+        ? await legacyTransferStart(sessionId, 'upload', localPath, remoteName, 65536)
         : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, chunkSize: 65536, budgetMs: 1000 });
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
@@ -428,7 +457,7 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
     await runTask(runtime, `test ! -e '.ssh-mcp-upload-${partial.data.transferId}'`);
     const smallPath = join(config.localRoot, sessionId + '-small.bin');
     await writeFile(smallPath, Buffer.from('committed before cancel'));
-    const done = await call('remote_upload', { localPath: smallPath, path: sessionId + '-small-remote.txt' });
+    const done = await settleTransfer(call, 'remote_upload', await call('remote_upload', { localPath: smallPath, path: sessionId + '-small-remote.txt' }));
     assert.equal(done.data.state, 'completed');
     // A late cancel never rolls back the committed target.
     const kept = await call('remote_upload', { action: 'cancel', transferId: done.data.transferId });

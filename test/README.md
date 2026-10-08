@@ -21,7 +21,7 @@ test/
 ├── workspace-mcp-remote.test.js   # 工作区 MCP 与远端交互契约
 ├── workspace-write-schema.test.js # 写工具入参 schema
 ├── directory-scope.test.js        # restricted/unrestricted 目录边界
-├── setup-mcp.test.js              # remote_setup configure/inspect/update 契约与 #31 迁移
+├── setup-mcp.test.js              # remote_setup configure/inspect/update/list_connections 契约与 #31 迁移
 ├── setup-workspace.test.js        # 手工 CLI setup 入口
 ├── remove-binding.test.js         # 绑定移除契约（#28/#32/#33）
 ├── legacy-doc-generations.mjs     # 三代落盘文档契约快照（非测试，供引用）
@@ -30,6 +30,9 @@ test/
 ├── job-cli-remote.test.js         # job CLI 与远端协议
 ├── task-service.test.js           # 本地任务登记/确认/pendingAcross
 ├── transfer-service.test.js       # 传输事务：断点续传、预算、恢复、pendingAcross
+├── workspace-transfer-recovery.test.js # MCP 离线传输发现、错误编号、确认与启动提示
+├── transfer-background.test.js    # 独立驱动、服务退出、故障恢复、并发等待与取消
+├── fixtures/background-transport.mjs # 上述后台测试的 SSH 边界模拟
 ├── remote-agent-client.test.js    # SSH_MCP_V1 信封与传输客户端
 ├── space-ledger.test.js           # 本机空间额度账本
 ├── storage-report.test.js         # 空间用量报告

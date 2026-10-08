@@ -313,6 +313,11 @@ def _record_deletion_allowed(root, path):
 def _process_transfer(root, name, periods, now, summary):
     from locks import ensure_slot_protocol, lock_directory, slot_index
     path = Path(root) / 'transfers' / name
+    if re.fullmatch(r'[.]registration-[a-f0-9]{32}[.]json', name) and not path.is_symlink():
+        receipt = read_json(path)
+        if _numeric(receipt.get('expiresAt')) and now >= receipt['expiresAt']:
+            path.unlink()
+        return
     if not path.is_dir() or path.is_symlink():
         return
     ensure_slot_protocol(root)

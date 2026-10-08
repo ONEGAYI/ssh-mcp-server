@@ -14,6 +14,51 @@ import { TaskService } from '../build/services/task-service.js';
 import * as setupServer from '../build/core/setup-server.js';
 const { configureFromTool, setupFromTool } = setupServer;
 
+it('setup advertises an explicit read-only connection listing from the startup JSON library', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-list-connections-'));
+  const client = new Client({ name: 'connection-list-contract', version: '1' });
+  try {
+    const auth = join(root, 'ssh-config.json');
+    const content = JSON.stringify({ eda: { host: 'private.example', port: 22, username: 'private-user', password: 'list-secret' },
+      build: { host: 'other.example', port: 22, username: 'private-user', password: 'list-secret' } });
+    await writeFile(auth, content);
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+    const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
+    assert.ok(tool.inputSchema.properties.action.enum.includes('list_connections'));
+    assert.match(tool.description, /list_connections/);
+    const reply = await client.callTool({ name: 'remote_setup', arguments: { action: 'list_connections' } });
+    assert.equal(reply.isError, undefined, JSON.stringify(reply));
+    const result = JSON.parse(reply.content[0].text);
+    assert.equal(result.status, 'connections_listed');
+    assert.deepEqual(result.connections, ['eda', 'build']);
+    assert.doesNotMatch(JSON.stringify(result), /list-secret|private-user|private.example|other.example/);
+    assert.match(result.instructions, /\.ssh/);
+    assert.deepEqual(await readdir(root), ['ssh-config.json']);
+    assert.equal(await readFile(auth, 'utf8'), content);
+  } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it('connection listing asks only for a missing JSON path and accepts an explicit library without configuring a binding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-list-path-'));
+  try {
+    const missing = await setupFromTool({ action: 'list_connections' });
+    assert.equal(missing.status, 'needs_input');
+    assert.deepEqual(missing.questions.map(q => q.fields), [['sshConfigFile']]);
+    assert.deepEqual(missing.connections, []);
+    assert.match(missing.instructions, /\.ssh/);
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ vm: { host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture' } }));
+    const result = await setupFromTool({ action: 'list_connections', sshConfigFile: auth }, join(root, 'not-used.json'));
+    assert.deepEqual(result.connections, ['vm']);
+    await assert.rejects(setupFromTool({ action: 'list_connections', sshConfigFile: join(root, 'missing.json') }), { code: 'SETUP_INVALID_SSH_CONFIG' });
+    await assert.rejects(setupFromTool({ action: 'list_connections', sshConfigFile: 'relative.json' }), { code: 'SETUP_INVALID_PATH' });
+    await writeFile(auth, '{}');
+    await assert.rejects(setupFromTool({ action: 'list_connections', sshConfigFile: auth }), { code: 'SETUP_INVALID_SSH_CONFIG' });
+    assert.deepEqual(await readdir(root), ['ssh.json']);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it('named bindings coexist with legacy profiles and recover only their own tasks', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-bindings-'));
   try {

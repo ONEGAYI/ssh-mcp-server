@@ -37,6 +37,6 @@ export class FileService {
         return canonical;
       }
     }
-    throw new RemoteAgentError("PATH_NOT_ALLOWED", "Local transfer path is outside the workspace and configured allowed roots");
+    throw new RemoteAgentError("PATH_NOT_ALLOWED", `Local transfer path ${canonical} is outside the allowed roots: ${roots.join(", ")}. Place the source in the local workspace (${this.config.localRoot}), or configure a specific allowedLocalPaths root; temporary directories are not allowed automatically`);
   }
 }

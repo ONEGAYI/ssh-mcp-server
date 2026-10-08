@@ -1434,3 +1434,22 @@ it('pendingAcross lists unacknowledged transfers from every session for removal 
     assert.deepEqual((await transfers.pendingAcross()).map(entry => entry.transferId), ['b'.repeat(32)]);
   } finally { await rm(stateRoot, { recursive: true, force: true }); }
 });
+
+it('a background cancellation in an unverifiable commit window remains unknown and cannot be acknowledged', async () => {
+  const { fake, transfers } = await buildHarness();
+  try {
+    const { partial } = await downloadPartial(fake, transfers, 'background-unknown.bin');
+    const directory = join(localTransfersDir(fake), partial.transferId);
+    const record = JSON.parse(await readFile(join(directory, 'record.json'), 'utf8'));
+    record.background = true; record.state = 'committing';
+    await writeFile(join(directory, 'record.json'), JSON.stringify(record));
+    await writeFile(join(directory, 'intent.json'), JSON.stringify({ tempIdentity: 'missing-object', totalBytes: record.totalBytes, totalSha256: record.totalSha256 }));
+    await rm(record.tempPath);
+    await writeFile(join(directory, 'cancel.json'), '{}');
+    await writeFile(join(directory, 'driver.json'), JSON.stringify({ pid: process.pid, token: 'unknown-test' }));
+    await transfers.runBackground('session-a', partial.transferId, 'unknown-test');
+    assert.equal((await transfers.status('session-a', partial.transferId)).state, 'unknown');
+    await assert.rejects(transfers.cancel('session-a', partial.transferId), e => e.code === 'TRANSFER_STATE_UNKNOWN');
+    await assert.rejects(transfers.acknowledge('session-a', partial.transferId), e => e.code === 'TRANSFER_STATE_UNKNOWN');
+  } finally { await fake.cleanup(); }
+});
