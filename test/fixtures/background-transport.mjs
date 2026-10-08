@@ -2,9 +2,39 @@
 import { readFile, writeFile, appendFile, mkdir, rename, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { RemoteAgentClient } from '../../build/services/remote-agent-client.js';
 
 const root = process.env.SSH_MCP_BACKGROUND_FIXTURE;
+const stateFault = process.env.SSH_MCP_BACKGROUND_STATE_RENAME;
+if (stateFault && process.argv[1].endsWith('transfer-worker.js')) {
+  const originalRename = fs.promises.rename;
+  const originalLink = fs.promises.link;
+  let injected = false;
+  fs.promises.rename = async (source, target) => {
+    if (stateFault !== 'data-denied' && target.endsWith('record.json') && (!injected || stateFault === 'persistent' || stateFault === 'complete-denied')) {
+      const record = JSON.parse(await readFile(source, 'utf8'));
+      const available = await readFile(join(root, 'state-available')).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+      const refused = stateFault === 'complete-denied' ? record.state === 'completed'
+        : (record.state === 'transferring' && record.confirmedOffset >= 65536) || (injected && stateFault === 'persistent');
+      if (!available && refused) {
+        injected = true;
+        const code = stateFault === 'eio' ? 'EIO' : stateFault === 'busy' ? 'EBUSY' : 'EPERM';
+        await appendFile(join(root, 'state-faults.log'), code + '\n');
+        throw Object.assign(new Error(`${code}: operation not permitted, rename '${source}' -> '${target}'`),
+          { code, syscall: 'rename', path: source, dest: target });
+      }
+    }
+    return originalRename(source, target);
+  };
+  if (stateFault === 'data-denied') fs.promises.link = async (source, target) => {
+    if (target !== join(root, 'download.bin')) return originalLink(source, target);
+    await appendFile(join(root, 'state-faults.log'), 'EPERM\n');
+    throw Object.assign(new Error('EPERM: actual destination refuses publication'), { code: 'EPERM', syscall: 'link', path: source, dest: target });
+  };
+  syncBuiltinESMExports();
+}
 if (process.env.SSH_MCP_BACKGROUND_INIT_FAILURE === '1' && process.argv[1].endsWith('transfer-worker.js')) {
   const profile = JSON.parse(await readFile(join(root, 'workspace.json'), 'utf8'));
   profile.connectionName = 'missing-connection';

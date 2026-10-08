@@ -207,17 +207,22 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 
 - 用原生后台 Shell 的 `transfer wait` 挂接终态结果。MCP `status` 对新传输返回本机驱动快照（`observation=local-driver-snapshot`），包括状态、已确认偏移与摘要；`completed` 结果要求确认。
 - 网络中断时保留原编号与已确认数据。`driverRunning=false`、`resumeRequired=true` 表示需要接回；`resume` 或 `transfer wait` 会重启原驱动。源文件在首次本机登记后变化则拒绝，不混合版本。
+- Windows 状态文件替换在有限重试后仍被拒绝时，新驱动报告 `paused`，保留原编号和数据，返回 `error`、`diagnosticLog` 与 `retryAfter`。解除访问问题后按原编号接回；暂停不能 ack，CLI 等待返回 `transfer-wait-paused`（退出码 1）。实际目标发布拒绝及其他 I/O 错误仍为终态失败。
+- `resumeAttempted` 表示本次是否派发新驱动，不表示已完成新的传输。对 `failed` 调用 resume 只返回已保存的失败结果，明确没有开始新尝试；重复错误和同一临时文件名不能证明仍在占用。
 - MCP 错误响应保留已有编号；后台错误在登记的 `error` 字段中可查。编号丢失时用 `remote_transfer_pending` 或 CLI `transfer pending`，不再 start。
 - `action=status` 不启动驱动，也不确认结果；本机登记列表属于快照，不等于实时远端状态。
 - 覆盖已有远端目标须先 `remote_read metadataOnly` 拿版本，再带 `overwrite=true` 与 `expectedVersion`；默认目标必须不存在。
 - 新传输的 `action=cancel` 可先返回 `cancelling`，只表示请求已保存；待驱动确认 `cancelled` / `completed` 后才算取消流程结束。未提交数据按原停止核实契约回收，已完成的提交不回滚，unknown 不猜。旧同步记录保留原取消行为。
 - `action=ack` 在检查并处理完终态结果后确认消费（与 status 分离；`unknown` 结果不可确认）。
 
+命令任务的 `remote_cancel` 使用 `jobId`，传输取消使用对应 `remote_upload` / `remote_download` 的 `action=cancel` 和 `transferId`。切换传输通道前先确认原驱动已停止；ack 不负责取消。
+
 ### 下载大文件（可续传传输事务）
 
 `remote_download` 的远端源绑定 `m1-` 观察版本，每块校验并持久化后才确认，全文摘要匹配后原子提交。**不签发 readToken**，下载不授予已读范围。MCP `start` 同样先返回 `preparing` 与本机持久编号，远端摘要由独立进程准备。
 
 - 准备期 `totalBytesKnown=false`，总量暂未知；登记远端源后变为 true。按原编号 `transfer wait` 获取终态与摘要。
+- 未 completed 前的 `sha256` 是预期源文件摘要，不能证明接收文件已经完成整文件校验；须核对完成状态、总大小与回执。Windows 状态保存暂停及旧失败快照语义与上传一致，详见 [状态文件访问失败修复](windows-transfer-state.md)。
 - 新驱动被中断后通过 `resume` 或 `transfer wait` 接回；接收临时文件与块清单持久化在本机，恢复时先重校验，只补未确认数据。
 - 断线或本机进程退出后，同样以 resume 接回；错误响应携带 `transferId`。
 - 远端源文件在传输期间变化（`m1-` 版本不符）则拒绝原传输并置 `failed`（`TRANSFER_SOURCE_CHANGED`），需重新 start。
