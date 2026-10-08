@@ -56,7 +56,7 @@ it('remove takes out exactly one binding and reports the remote directory withou
 
     assert.equal(removed.status, 'removed');
     assert.equal(removed.serverName, main.serverName);
-    assert.deepEqual(removed.unhooked, { mcpServerEntry: true, recoveryHooks: 1 });
+    assert.deepEqual(removed.unhooked, { mcpServerEntry: true, recoveryHooks: 1, sessionStartHooks: 1 });
     assert.equal(removed.connectionFile.removed, false, 'the external SSH config stays');
     assert.ok(await readFile(ssh, 'utf8'), 'the external SSH config file survives');
     assert.equal(removed.remoteStateDir, configMain.remoteStateDir);
@@ -73,7 +73,8 @@ it('remove takes out exactly one binding and reports the remote directory withou
     assert.ok(config.mcp.servers[build.serverName], 'the sibling MCP entry stays');
     const groups = config.hooks.events.UserPromptSubmit;
     assert.equal(groups.length, 1, 'only the sibling recovery hook group stays');
-    assert.equal(groups[0].hooks[0].args.at(-1), build.profilePath);
+    const remainingArgs = groups[0].hooks[0].args;
+    assert.equal(remainingArgs[remainingArgs.indexOf('--workspace') + 1], build.profilePath);
     await assert.rejects(readdir(identityStateDirectory(configMain.localStateDir, configMain.identity)), { code: 'ENOENT' },
       'the removed binding local identity directory is deleted');
     const kept = await readdir(join(identityStateDirectory(configBuild.localStateDir, configBuild.identity), 'tasks'));
@@ -231,7 +232,7 @@ it('remove recognizes its hook and MCP entry through path spellings that differ 
 
     const removed = await setupFromTool({ action: 'remove', localRoot: root,
       revision: (await setupFromTool({ action: 'inspect', localRoot: root })).revision });
-    assert.deepEqual(removed.unhooked, { mcpServerEntry: true, recoveryHooks: 1 },
+    assert.deepEqual(removed.unhooked, { mcpServerEntry: true, recoveryHooks: 1, sessionStartHooks: 1 },
       'both entries are matched by file identity, not by exact text');
     const after = JSON.parse(await readFile(configPath, 'utf8'));
     assert.deepEqual(after.mcp.servers, {});

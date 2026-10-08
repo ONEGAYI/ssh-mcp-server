@@ -7,17 +7,19 @@ import { dirname, isAbsolute, join, posix, resolve } from "node:path";
 import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { setupWorkspaceIntegration, removeWorkspaceBinding, revisionOf, writeAtomic } from "../services/workspace-setup.js";
-import { bindingNamePattern, profileSchema } from "../config/workspace.js";
+import { bindingNamePattern, profileSchema, clientsSchema, sessionStartSchema, sessionStartDefaults } from "../config/workspace.js";
 import { policySectionSchema, resolvePolicy, StoredPolicy } from "../config/policy.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
 const inputSchema = {
+  clients: clientsSchema.optional().describe("Project integrations to install for this binding: zcode, codex, or both; omitted on creation defaults to ZCode. Existing bindings can opt into Codex through inspect/update without changing SSH identity."),
+  sessionStart: sessionStartSchema.optional().describe("Optional remote context for this binding: AGENTS.md and the .agents/skills catalog, plus .zcode/skills only in ZCode. enabled defaults false, timeoutMs defaults 5000, maxBytes defaults 8192. Partial updates preserve unnamed fields. Changes apply at the next SessionStart; disabling cannot retract context already injected."),
   action: z.enum(["configure", "inspect", "update", "remove", "list_connections"]).optional().describe("Operation on a workspace binding. 'list_connections' is read-only: list registered connection names from the startup --config-file SSH MCP JSON library or an explicit sshConfigFile, without requiring workspace directories or exposing credentials. Default 'configure' creates or idempotently re-confirms a binding. 'inspect' returns an existing binding's sanitized configuration and revision. 'update' changes only the fields you name and requires that revision. 'remove' decommissions one binding from this project and requires that revision: it refuses while any task or transfer of the binding is unacknowledged, then unhooks the MCP entry and recovery hook, deletes the profile, the generated connection file and the local state — all without any SSH connection. Run it only on the user's explicit request"),
   revision: z.string().min(1).optional().describe("Revision token from a previous inspect; required for action='update' and action='remove' so concurrent changes are rejected instead of overwritten"),
   policy: policySectionSchema.optional().describe("Workspace policy: per-end space limits, retention periods, search filters and budgets, maintenance cadence. Provide only the fields to set; unspecified fields keep defaults or stored values. Saved values apply from the next operation or maintenance cycle and never recalculate existing records' expiry"),
   bindingName: z.string().regex(bindingNamePattern).optional().describe("Unique lowercase binding name for this local project when several remote targets coexist, e.g. eda-main; omit for this project's original unnamed binding"),
-  localRoot: optionalPath.describe("Existing local Windows project directory to open in ZCode; ask the user, never assume the MCP process cwd"),
+  localRoot: optionalPath.describe("Existing local Windows project directory to open in the selected client; ask the user, never assume the MCP process cwd"),
   remoteRoot: optionalPath.describe("Existing absolute Linux source directory"),
   remoteStateDir: optionalPath.describe("Writable persistent absolute Linux directory for helper scripts and task state"),
   sshConfigFile: optionalPath.describe("Path to an existing original SSH MCP JSON config; credentials stay in that file"),
@@ -124,13 +126,15 @@ async function inspectFromTool(input: SetupInput) {
       ...(profile.localRoot ? { localRoot: profile.localRoot } : {}),
       ...(profile.localStateDir ? { localStateDir: profile.localStateDir } : {}),
       policy: resolvePolicy(profile.policy),
+      clients: profile.clients ?? ["zcode"],
+      sessionStart: { ...sessionStartDefaults, ...profile.sessionStart },
     },
     authentication: {
       source: resolve(dirname(profilePath), profile.sshConfigFile),
       connectionName: profile.connectionName,
       note: "Credentials stay inside the referenced SSH config file; inspect never reads, echoes, or rewrites passwords, passphrases, or private key contents",
     },
-    updatable: ["policy", "directoryScope", "pythonPath"],
+    updatable: ["policy", "directoryScope", "pythonPath", "clients", "sessionStart"],
     identityLocked: Object.keys(IDENTITY_LOCKED),
     instructions: "config shows effective values including defaults. Change updatable fields with action='update' plus this revision. identityLocked fields (server connection, directories, workspaceId) cannot change in place: configure a new binding with a new bindingName for a new target and keep this binding until its tasks and state are finished and cleaned up. No SSH connection was made.",
   };
@@ -158,6 +162,18 @@ async function updateFromTool(input: SetupInput) {
   const changed: string[] = [];
   // Mutate a copy of the parsed JSON so unnamed fields and key order survive byte-for-byte.
   const updated: Record<string, unknown> = { ...raw };
+  if (input.clients !== undefined) {
+    updated.clients = clientsSchema.parse(input.clients);
+    if (JSON.stringify(updated.clients) !== JSON.stringify(raw.clients ?? ["zcode"])) changed.push("clients");
+  }
+  if (input.sessionStart !== undefined) {
+    const patch = sessionStartSchema.parse(input.sessionStart);
+    const before = { ...sessionStartDefaults, ...(raw.sessionStart as object) };
+    updated.sessionStart = { ...(raw.sessionStart as object), ...patch };
+    for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+      if (patch[key] !== before[key]) changed.push(`sessionStart.${key}`);
+    }
+  }
   if (input.directoryScope !== undefined) {
     const before = (updated.directoryScope as string | undefined) ?? "restricted";
     if (input.directoryScope === "unrestricted") updated.directoryScope = "unrestricted";
@@ -198,7 +214,11 @@ async function updateFromTool(input: SetupInput) {
     throw new RemoteAgentError("SETUP_INVALID_POLICY", `The update would produce an invalid profile (${firstIssue(finalCheck.error)}); nothing was written`);
   }
   const next = JSON.stringify(updated, null, 2) + "\n";
-  await writeAtomic(profilePath, next, content);
+  const integrationProfile = { ...finalCheck.data, localRoot: input.localRoot, profilePath,
+    previousClients: profileSchema.parse(raw).clients ?? ["zcode" as const] };
+  if (input.clients !== undefined || input.sessionStart !== undefined) {
+    await setupWorkspaceIntegration(integrationProfile, true, { path: profilePath, content: next, original: content });
+  } else await writeAtomic(profilePath, next, content);
   return {
     status: "updated", profilePath, revision: revisionOf(next), changed,
     policy: resolvePolicy(updated.policy),
@@ -264,7 +284,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     throw new RemoteAgentError("SETUP_INVALID_SCOPE", "directoryScope must be 'restricted' or 'unrestricted'; an unrestricted scope requires the user's explicit decision, never a default");
   }
   const initialPolicy = parsePolicyPatch(input.policy);
-  if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为 ZCode 工作区？请选择独立项目目录。" });
+  if (!input.localRoot) questions.push({ fields: ["localRoot"], question: "用哪个本机绝对路径作为工作区？请选择独立项目目录。" });
   if (!input.remoteRoot || !input.remoteStateDir) questions.push({ fields: ["remoteRoot", "remoteStateDir"], question: input.directoryScope === "unrestricted"
     ? "无边界绑定的远端默认执行目录（建议远端 home，如 /home/user）和可写的持久状态目录分别是什么？均需绝对路径。"
     : "远端 Linux 的源码目录和可写的持久状态目录分别是什么？均需绝对路径。" });
@@ -309,10 +329,12 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     remoteRoot: input.remoteRoot, remoteStateDir: input.remoteStateDir, pythonPath: input.pythonPath ?? "/usr/bin/python3",
     ...(input.directoryScope === "unrestricted" ? { directoryScope: "unrestricted" as const } : {}),
     ...(input.localStateDir ? { localStateDir: input.localStateDir } : {}),
+    ...(input.clients ? { clients: clientsSchema.parse(input.clients) } : {}),
+    ...(input.sessionStart ? { sessionStart: sessionStartSchema.parse(input.sessionStart) } : {}),
     ...(initialPolicy && Object.keys(initialPolicy).length ? { policy: initialPolicy } : {}) };
   const content = JSON.stringify(profile, null, 2) + "\n";
   // Dry-run integration first: a rejected binding must not leave a profile file behind.
-  await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, false);
+  await setupWorkspaceIntegration({ ...profile, localRoot, workspaceId, profilePath }, false);
   let old: string | undefined;
   try { old = await readFile(profilePath, "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -327,7 +349,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
     await writeAtomic(sshConfigFile, auth, previous);
   }
   await writeAtomic(profilePath, content, old);
-  const integration = await setupWorkspaceIntegration({ localRoot, workspaceId, profilePath }, true);
+  const integration = await setupWorkspaceIntegration({ ...profile, localRoot, workspaceId, profilePath }, true);
   return { status: "configured", localRoot, profilePath, serverName: integration.serverName, mcpServer: integration.mcpServer,
     directoryScope: input.directoryScope === "unrestricted" ? "unrestricted" : "restricted",
     hooksInstalled: true, sshVerified: false,
@@ -337,9 +359,9 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "To list already registered servers, call remote_setup action='list_connections' (optional sshConfigFile overrides the startup --config-file library). This lists JSON connection names without SSH, writes or credentials; do not search ~/.ssh for them. For configuring a binding, first call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath fields. action='remove' decommissions a binding after inspect — run it only on the user's explicit request; it is local-only (no SSH connection) and refuses while the binding still has unacknowledged tasks or transfers. This setup service does not execute remote commands or replace ZCode hook trust. Use the generated project MCP for remote file and task operations.",
+    instructions: "To list already registered servers, call remote_setup action='list_connections' (optional sshConfigFile overrides the startup --config-file library). This lists JSON connection names without SSH, writes or credentials; do not search ~/.ssh for them. For configuring a binding, first call remote_setup without arguments to discover required connection/workspace information. Ask the user for missing values and call it again to configure this project. Call it again with a bindingName whenever the user wants to add another remote target to the same project; each binding gets its own MCP server and recovery hook. Existing bindings are adjustable without re-entering SSH details: action='inspect' returns a sanitized view with a revision, action='update' changes only the named policy/directoryScope/pythonPath/clients/sessionStart fields. action='remove' decommissions a binding after inspect — run it only on the user's explicit request; it is local-only (no SSH connection) and refuses while the binding still has unacknowledged tasks or transfers. This setup service does not execute remote commands or replace client hook trust. Use the generated project MCP for remote file and task operations.",
   });
-  server.registerTool("remote_setup", { description: "action='list_connections': read-only listing of registered connection names from the startup --config-file SSH MCP JSON library or an explicit sshConfigFile; requires no localRoot or remote directories, exposes no credentials and never searches ~/.ssh. Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges project MCP and recovery hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. action='remove': requires that revision and the user's explicit request; decommissions exactly this binding — unacknowledged tasks or transfers (any session) are a hard refusal with no force, then the MCP entry, recovery hook, profile, generated connection file and local state are removed; external SSH configs and the remote state directory are never touched. No manual setup command needed; no SSH connection during setup or removal.",
+  server.registerTool("remote_setup", { description: "action='list_connections': read-only listing of registered connection names from the startup --config-file SSH MCP JSON library or an explicit sshConfigFile; requires no localRoot or remote directories, exposes no credentials and never searches ~/.ssh. Configure one binding to a remote SSH workspace for this project, or adjust an existing binding. Default action (or action='configure'): with missing fields returns questions for you to ask the user; with complete fields creates or updates that binding's profile, merges selected-client project MCP and recovery/SessionStart hooks, and prepares background CLI guidance; supply a bindingName to add another remote target alongside existing ones — repeat identical calls are safe. action='inspect': returns an existing binding's sanitized configuration, effective policy, and revision; credentials are never read or echoed. action='update': requires that revision and changes only the fields you name (policy, directoryScope, pythonPath, clients, sessionStart); identity and authentication fields are rejected — configure a new bindingName for a new server or directory target. action='remove': requires that revision and the user's explicit request; decommissions exactly this binding — unacknowledged tasks or transfers (any session) are a hard refusal with no force, then the MCP entry, recovery hook, profile, generated connection file and local state are removed; external SSH configs and the remote state directory are never touched. No manual setup command needed; no SSH connection during setup or removal.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async input => {
     try { return { content: [{ type: "text" as const, text: JSON.stringify(await setupFromTool(input, defaultSshConfigFile)) }] }; }
     catch (error) {

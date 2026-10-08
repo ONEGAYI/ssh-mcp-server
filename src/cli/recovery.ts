@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { loadWorkspaceConfig, serverNameForWorkspaceId } from "../config/workspace.js";
+import { clientSchema, loadWorkspaceConfig, serverNameForWorkspaceId } from "../config/workspace.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { TaskService } from "../services/task-service.js";
 import { TransferService } from "../services/transfer-service.js";
@@ -21,8 +21,9 @@ async function findProfile(cwd: string): Promise<string | undefined> {
 }
 
 async function main() {
-  const { values } = parseArgs({ options: { workspace: { type: "string" }, help: { type: "boolean" } } });
-  if (values.help) { console.log("ssh-mcp-recover [--workspace profile.json] — ZCode UserPromptSubmit hook; input and output are JSON"); return; }
+  const { values } = parseArgs({ options: { workspace: { type: "string" }, client: { type: "string" }, help: { type: "boolean" } } });
+  const client = clientSchema.parse(values.client ?? "zcode");
+  if (values.help) { console.log("ssh-mcp-recover [--workspace profile.json] [--client zcode|codex] — UserPromptSubmit JSON hook; local-only recovery discovery"); return; }
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const chunk of process.stdin) {
@@ -39,6 +40,7 @@ async function main() {
   const profile = values.workspace ?? await findProfile(input.cwd);
   if (!profile) { console.log("{}"); return; }
   const config = await loadWorkspaceConfig(profile);
+  if (!config.clients.includes(client)) { console.log("{}"); return; }
   const within = relative(config.localRoot, resolve(input.cwd));
   if (isAbsolute(within) || within === ".." || within.startsWith(".." + sep)) { console.log("{}"); return; }
   // Recovery discovery deliberately performs no network calls.
@@ -59,7 +61,8 @@ async function main() {
   const context = [
     `SSH 远端工作区绑定：${config.workspaceId}${config.bindingName ? `（绑定 ${config.bindingName}）` : ""}；连接：${config.connectionName}；MCP 服务：${serverNameForWorkspaceId(config.workspaceId)}；远端工程根：${config.remoteRoot}；目录边界：${config.directoryScope === "unrestricted" ? "unrestricted（用户已明确解除目录限制，文件工具可按远端绝对路径访问）" : "restricted（文件工具限制在远端工程根内）"}。`,
     `当前真实对话标识：${input.session_id}。本机路径与远端路径不要混用；存在多个绑定时，本条上下文只描述上面这一个绑定。`,
-    "文件读写优先使用该工作区的 MCP 文件工具。命令用 ZCode 原生后台 Shell 执行，不要仅在命令后添加 &。",
+    client === "zcode" ? "文件读写优先使用该工作区的 MCP 文件工具。命令用 ZCode 原生后台 Shell 的 run_in_background: true 执行，不要仅在命令后添加 &。"
+      : "当前宿主是 Codex。文件读写优先使用该工作区的 MCP 文件工具。远端命令通过 job CLI 执行；本机命令工具返回等待会话后，用其会话续读功能跟进 job CLI 输出。跨对话恢复时按远端原 jobId 重新 wait，不能借用或猜测本机等待会话。",
     `启动命令的 argv 模板（按当前 Shell 正确引用每个参数）：${JSON.stringify([...commandPrefix, "run", ...sharedArgs, "--command", "{{远端命令}}"])}`,
     "本机等待退出不等于远端任务结束。收到后台通知后检查 task-result，必要时查询远端状态；读取和处理终态结果后再调用 job-ack 确认。",
   ];

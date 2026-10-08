@@ -6,6 +6,8 @@ import { identityStateDirectory, loadWorkspaceConfig, profileSchema, serverNameF
 import { TaskService } from "./task-service.js";
 import { TransferService } from "./transfer-service.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
+import { WorkspaceClient } from "../config/workspace.js";
+import { IntegrationWrite, ownsProfile, planCodexIntegration } from "./codex-integration.js";
 
 async function readOptional(path: string): Promise<string | undefined> {
   try { return await readFile(path, "utf8"); }
@@ -38,11 +40,41 @@ export async function writeAtomic(path: string, content: string, expected?: stri
   } finally { await unlink(temporary).catch(error => { if (error.code !== "ENOENT") throw error; }); }
 }
 
+/** A host switch changes several files. Restore only writes still containing
+ * our exact output; concurrent edits are reported rather than overwritten. */
+async function applyIntegrationWrites(writes: IntegrationWrite[]) {
+  const saved: IntegrationWrite[] = [];
+  try {
+    for (const write of writes) {
+      await mkdir(dirname(write.path), { recursive: true });
+      await writeAtomic(write.path, write.content, write.original);
+      if (write.content !== write.original) saved.push(write);
+    }
+  } catch (error) {
+    const failures = [];
+    for (const write of saved.reverse()) {
+      try {
+        if (write.original !== undefined) await writeAtomic(write.path, write.original, write.content);
+        else {
+          if (await readOptional(write.path) !== write.content) throw new RemoteAgentError("SETUP_CONFLICT", "Configuration changed before rollback");
+          await unlink(write.path);
+        }
+      } catch (rollbackError) {
+        failures.push(`${write.path} (${(rollbackError as NodeJS.ErrnoException).code ?? "unknown"})`);
+      }
+    }
+    if (failures.length) throw new RemoteAgentError("SETUP_ROLLBACK_INCOMPLETE", `Integration save failed and rollback could not restore these files: ${failures.join(", ")}. Inspect the profile and client configurations before retrying; concurrent edits were not overwritten.`);
+    throw error;
+  }
+}
+
 /** The profile fields integration needs; callers load or construct it, so checks can run before the profile file is written. */
 export interface IntegrationProfile {
   localRoot: string;
   workspaceId: string;
   profilePath: string;
+  clients?: WorkspaceClient[];
+  previousClients?: WorkspaceClient[];
 }
 
 /** Reads and structurally validates the project ZCode config; setup merges into
@@ -62,45 +94,72 @@ async function readProjectConfig(configPath: string): Promise<{ original: string
       throw new RemoteAgentError("SETUP_INVALID_CONFIG", "Existing MCP and hook configuration sections must be JSON objects");
     }
   }
-  const existing = config.hooks?.events?.UserPromptSubmit ?? [];
-  if (!Array.isArray(existing) || existing.some(group => !group || !Array.isArray(group.hooks))) {
-    throw new RemoteAgentError("SETUP_INVALID_CONFIG", "Existing UserPromptSubmit hooks must be valid hook groups");
+  for (const event of ["UserPromptSubmit", "SessionStart"]) {
+    const existing = config.hooks?.events?.[event] ?? [];
+    if (!Array.isArray(existing) || existing.some(group => !group || !Array.isArray(group.hooks))) {
+      throw new RemoteAgentError("SETUP_INVALID_CONFIG", `Existing ${event} hooks must be valid hook groups`);
+    }
   }
   return { original, config };
 }
 
-export async function setupWorkspaceIntegration(profile: IntegrationProfile, apply: boolean) {
+export async function setupWorkspaceIntegration(profile: IntegrationProfile, apply: boolean, profileWrite?: IntegrationWrite) {
   const buildRoot = fileURLToPath(new URL("../", import.meta.url));
   const configPath = join(profile.localRoot, ".zcode", "config.json");
-  const { original, config } = await readProjectConfig(configPath);
-  if (apply) await mkdir(dirname(configPath), { recursive: true });
+  const clients = profile.clients ?? ["zcode"];
+  const manageZcode = clients.includes("zcode") || profile.previousClients?.includes("zcode");
+  const { original, config } = manageZcode ? await readProjectConfig(configPath) : { original: undefined, config: {} };
+  const codex = clients.includes("codex") || profile.previousClients?.includes("codex")
+    ? await planCodexIntegration(profile, clients.includes("codex")) : undefined;
   const serverName = serverNameForWorkspaceId(profile.workspaceId);
-  const hook = { type: "process", command: process.execPath,
-    args: [join(buildRoot, "cli", "recovery.js"), "--workspace", profile.profilePath] };
   const events = config.hooks?.events ?? {};
-  const existing = events.UserPromptSubmit ?? [];
-  const sameHook = (candidate: any) => candidate.type === hook.type && candidate.command === hook.command && JSON.stringify(candidate.args) === JSON.stringify(hook.args);
-  const hooks = existing.some((group: any) => group.hooks.some(sameHook)) ? existing : [...existing, { hooks: [hook] }];
+  for (const event of ["UserPromptSubmit", "SessionStart"]) {
+    const hook = { type: "process", command: process.execPath,
+      args: [join(buildRoot, "cli", event === "SessionStart" ? "session-start.js" : "recovery.js"), "--workspace", profile.profilePath, "--client", "zcode"],
+      ...(event === "SessionStart" ? { timeoutMs: 65000 } : {}) };
+    const groups = [];
+    let placed = false;
+    for (const group of events[event] ?? []) {
+      const kept = [];
+      for (const candidate of group.hooks) {
+        if (await ownsProfile(candidate, profile.profilePath)) {
+          if (clients.includes("zcode") && !placed) { kept.push(hook); placed = true; }
+        } else kept.push(candidate);
+      }
+      if (kept.length) groups.push({ ...group, hooks: kept });
+    }
+    if (clients.includes("zcode") && !placed) groups.push({ hooks: [hook] });
+    if (manageZcode) events[event] = groups;
+  }
   const mcpServer = { command: process.execPath, args: [join(buildRoot, "index.js"), "--workspace", profile.profilePath] };
   const previous = config.mcp?.servers?.[serverName];
-  if (previous && (!Array.isArray(previous.args) || !previous.args.includes(profile.profilePath))) {
+  if (previous && !await ownsProfile(previous, profile.profilePath)) {
     throw new RemoteAgentError("SETUP_CONFLICT", "A different MCP server already uses the generated name; choose another workspaceId");
   }
+  const servers = { ...config.mcp?.servers };
+  if (clients.includes("zcode")) servers[serverName] = { ...mcpServer, enable: true };
+  else delete servers[serverName];
   const updated = { ...config,
-    mcp: { ...config.mcp, servers: { ...config.mcp?.servers, [serverName]: { ...mcpServer, enable: true } } },
-    hooks: { ...config.hooks, enabled: true, events: { ...events, UserPromptSubmit: hooks } },
+    mcp: { ...config.mcp, servers },
+    hooks: { ...config.hooks, ...(clients.includes("zcode") ? { enabled: true } : {}), events },
   };
   // Issue #31: configure no longer writes project markdown — remote_help is
   // the single guidance source. The one-time migration below reclaims files
   // whose content still matches a known generated generation.
   let legacyDocs: LegacyDocCleanup | undefined;
   if (apply) {
-    await writeAtomic(configPath, JSON.stringify(updated, null, 2) + "\n", original);
-    legacyDocs = await cleanupLegacyGeneratedDocs(profile.localRoot);
+    const writes: IntegrationWrite[] = [
+      ...(manageZcode ? [{ path: configPath, content: JSON.stringify(updated, null, 2) + "\n", original }] : []),
+      ...(codex?.writes ?? []),
+      ...(profileWrite ? [profileWrite] : []),
+    ];
+    await applyIntegrationWrites(writes);
+    if (!profileWrite) legacyDocs = await cleanupLegacyGeneratedDocs(profile.localRoot);
   }
   return { applied: apply, configPath, config: updated, serverName, mcpServer,
+    clients, ...(codex ? { codex: { configPath: codex.configPath, hooksPath: codex.hooksPath } } : {}),
     ...(legacyDocs ? { legacyDocs } : {}),
-    note: "Project integration is prepared. Reopen this local project if its tools are not loaded yet, and confirm ZCode's first-time workspace-hook trust. No global config was changed. Suggest adding .ssh-mcp-*.json to this project's .gitignore — they carry host and authentication parameters; setup does not edit .gitignore itself." };
+    note: "Project integration is prepared. Reopen the project to load new MCP and hooks. Review and trust hooks in each selected client (Codex: /hooks and project trust). ZCode integration targets the user's verified 3.14.x project-hook support; versions ignoring project hooks need another supported registration source. No global config was changed. Suggest adding .ssh-mcp-*.json to .gitignore; setup does not edit .gitignore." };
 }
 
 /** Frozen history of every markdown generation configure ever wrote. Never extend
@@ -205,7 +264,7 @@ async function refersToProfile(entry: any, profilePath: string): Promise<boolean
   const at = entry.args.indexOf(WORKSPACE_FLAG);
   if (at < 0 || at + 1 >= entry.args.length || typeof entry.args[at + 1] !== "string") return false;
   const executor = typeof entry.args[0] === "string" ? basename(entry.args[0]) : "";
-  if (executor !== "index.js" && executor !== "recovery.js") return false;
+  if (executor !== "index.js" && executor !== "recovery.js" && executor !== "session-start.js") return false;
   return await samePath(entry.args[at + 1], profilePath);
 }
 
@@ -259,23 +318,26 @@ async function planUnhook(projectConfig: Record<string, any>, config: WorkspaceC
     }
   }
   let recoveryHooks = 0;
-  const groups = projectConfig.hooks?.events?.UserPromptSubmit;
+  let sessionStartHooks = 0;
+  for (const event of ["UserPromptSubmit", "SessionStart"]) {
+  const groups = projectConfig.hooks?.events?.[event];
   if (Array.isArray(groups)) {
     const rebuilt: typeof groups = [];
     for (const group of groups) {
       const hooks: typeof group.hooks = [];
       for (const hook of group.hooks) {
-        if (await refersToProfile(hook, profilePath)) recoveryHooks++;
+        if (await refersToProfile(hook, profilePath)) { if (event === "UserPromptSubmit") recoveryHooks++; else sessionStartHooks++; }
         else hooks.push(hook);
       }
       // A group that still holds foreign hooks keeps them; emptied groups drop.
       if (hooks.length) rebuilt.push(hooks.length === group.hooks.length ? group : { ...group, hooks });
     }
-    projectConfig.hooks.events.UserPromptSubmit = rebuilt;
+    projectConfig.hooks.events[event] = rebuilt;
+  }
   }
   const servers = projectConfig.mcp?.servers ?? {};
   const lastBinding = !Object.keys(servers).some(name => name.startsWith("ssh-workspace-"));
-  return { serverName, mcpServerEntry, recoveryHooks, lastBinding, ...(note ? { note } : {}) };
+  return { serverName, mcpServerEntry, recoveryHooks, sessionStartHooks, lastBinding, ...(note ? { note } : {}) };
 }
 
 export interface RemovalPreview {
@@ -290,6 +352,8 @@ export interface RemovalPreview {
   wouldRemove: {
     mcpServerEntry: boolean;
     recoveryHooks: number;
+    sessionStartHooks: number;
+    codex?: { mcpServerEntry: boolean; recoveryHooks: number; sessionStartHooks: number };
     connectionFile: { path: string; generated: boolean };
     localStateDir: string;
     lastBinding: boolean;
@@ -302,7 +366,8 @@ export interface RemoveOutcome {
   profilePath: string;
   bindingName?: string;
   serverName: string;
-  unhooked: { mcpServerEntry: boolean; recoveryHooks: number; note?: string };
+  unhooked: { mcpServerEntry: boolean; recoveryHooks: number; sessionStartHooks: number; note?: string;
+    codex?: { mcpServerEntry: boolean; recoveryHooks: number; sessionStartHooks: number } };
   connectionFile: { path: string; removed: boolean; reason?: string };
   localStateDir: { path: string; removed: boolean; reason?: string };
   remoteStateDir: string;
@@ -345,9 +410,12 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   const generated = await samePath(config.sshConfigFile, generatedConnection);
   const statePath = identityStateDirectory(config.localStateDir, config.identity);
   const configPath = join(config.localRoot, ".zcode", "config.json");
+  const codex = config.clients.includes("codex") ? await planCodexIntegration(config, false) : undefined;
+  const codexReport = codex ? { mcpServerEntry: codex.mcpServerEntry, recoveryHooks: codex.recoveryHooks,
+    sessionStartHooks: codex.sessionStartHooks } : undefined;
 
   if (revision === undefined) {
-    const { config: projectConfig } = await readProjectConfig(configPath);
+    const { config: projectConfig } = config.clients.includes("zcode") ? await readProjectConfig(configPath) : { config: {} };
     const plan = await planUnhook(projectConfig, config, absolute);
     return {
       status: "removal_preview", revision: revisionOf(content), profilePath: absolute,
@@ -357,9 +425,10 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
       blocked: pending.tasks.length + pending.transfers.length > 0,
       pending,
       wouldRemove: {
-        mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks,
+        mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks, sessionStartHooks: plan.sessionStartHooks,
+        ...(codexReport ? { codex: codexReport } : {}),
         connectionFile: { path: config.sshConfigFile, generated },
-        localStateDir: statePath, lastBinding: plan.lastBinding,
+        localStateDir: statePath, lastBinding: plan.lastBinding && (codex?.lastBinding ?? true),
       },
       instructions: "Pass this revision back to execute the removal. Blocked until every pending task and transfer is acknowledged; registryIssues list local registration defects worth checking first. Close other sessions and MCP servers still using this binding before removing — registrations they create during removal would be deleted or orphaned. No SSH connection is ever made.",
     };
@@ -375,7 +444,7 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   // Surgery order (issue #28): unhook first so the recovery hook never runs
   // against a deleted profile, then delete the profile, then the generated
   // connection file and the local identity state directory.
-  const { original, config: projectConfig } = await readProjectConfig(configPath);
+  const { original, config: projectConfig } = config.clients.includes("zcode") ? await readProjectConfig(configPath) : { original: undefined, config: {} };
   const plan = await planUnhook(projectConfig, config, absolute);
   // Close the inspect-to-delete window as far as cheaply possible (the same
   // before-check writeAtomic uses): a profile rewritten behind our back
@@ -384,9 +453,10 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   if (fresh !== undefined && revisionOf(fresh) !== revision) {
     throw new RemoteAgentError("SETUP_CONFLICT", "The profile changed since it was inspected (stale revision); inspect again for the current revision and retry");
   }
-  if ((plan.mcpServerEntry || plan.recoveryHooks) && original !== undefined) {
+  if ((plan.mcpServerEntry || plan.recoveryHooks || plan.sessionStartHooks) && original !== undefined) {
     await writeAtomic(configPath, JSON.stringify(projectConfig, null, 2) + "\n", original);
   }
+  for (const write of codex?.writes ?? []) await writeAtomic(write.path, write.content, write.original);
   try { await unlink(absolute); }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -413,7 +483,7 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
   }
   let legacyDocs: LegacyDocCleanup | undefined;
   let legacyCleanupError: string | undefined;
-  if (plan.lastBinding) {
+  if (plan.lastBinding && (codex?.lastBinding ?? true)) {
     // Everything binding-specific is already gone; a locked project root must
     // not cost the caller the removal report itself.
     try { legacyDocs = await cleanupLegacyGeneratedDocs(config.localRoot); }
@@ -426,10 +496,11 @@ export async function removeWorkspaceBinding(profilePath: string, revision?: str
     status: "removed", profilePath: absolute,
     ...(config.bindingName ? { bindingName: config.bindingName } : {}),
     serverName: plan.serverName,
-    unhooked: { mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks, ...(plan.note ? { note: plan.note } : {}) },
+    unhooked: { mcpServerEntry: plan.mcpServerEntry, recoveryHooks: plan.recoveryHooks,
+      sessionStartHooks: plan.sessionStartHooks, ...(codexReport ? { codex: codexReport } : {}), ...(plan.note ? { note: plan.note } : {}) },
     connectionFile, localStateDir: localState,
     remoteStateDir: config.remoteStateDir,
-    lastBinding: plan.lastBinding,
+    lastBinding: plan.lastBinding && (codex?.lastBinding ?? true),
     ...(legacyDocs ? { legacyDocs } : {}),
     ...(legacyCleanupError ? { legacyCleanupError } : {}),
     ...(pending.registryIssues.length ? { registryIssues: pending.registryIssues } : {}),

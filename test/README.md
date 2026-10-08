@@ -26,6 +26,8 @@ test/
 ├── remove-binding.test.js         # 绑定移除契约（#28/#32/#33）
 ├── legacy-doc-generations.mjs     # 三代落盘文档契约快照（非测试，供引用）
 ├── recovery-hook.test.js          # 恢复钩子注入与离线纪律
+├── session-context.test.js        # 根规则、技能目录、宿主选择与有界失败
+├── session-integration.test.js    # 每绑定开关、ZCode/Codex 配置与移除
 ├── job-cli.test.js                # job CLI 本地行为
 ├── job-cli-remote.test.js         # job CLI 与远端协议
 ├── task-service.test.js           # 本地任务登记/确认/pendingAcross

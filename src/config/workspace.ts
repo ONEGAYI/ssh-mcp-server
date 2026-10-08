@@ -11,6 +11,16 @@ import { policySectionSchema, resolvePolicy, WorkspacePolicy } from "./policy.js
 const remotePath = z.string().min(1).refine(value => posix.isAbsolute(value) && !value.includes("\0"), "Expected an absolute POSIX path");
 /** Shared so setup accepts exactly the names profile loading will later accept. */
 export const bindingNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export const clientSchema = z.enum(["zcode", "codex"]);
+export const clientsSchema = z.array(clientSchema).min(1).max(2).refine(value => new Set(value).size === value.length, "Clients must be unique");
+export const sessionStartSchema = z.object({
+  enabled: z.boolean().optional(),
+  timeoutMs: z.number().int().min(100).max(60000).optional(),
+  maxBytes: z.number().int().min(1024).max(16384).optional(),
+}).strict();
+export const sessionStartDefaults = { enabled: false, timeoutMs: 5000, maxBytes: 8192 };
+export type WorkspaceClient = z.infer<typeof clientSchema>;
+export type SessionStartConfig = typeof sessionStartDefaults;
 export const profileSchema = z.object({
   workspaceId: z.string().min(1).max(128),
   bindingName: z.string().regex(bindingNamePattern).optional(),
@@ -27,6 +37,8 @@ export const profileSchema = z.object({
   // Absent leaves keep spec defaults; consumers resolve per operation via loadPolicy.
   // Ticket #8's quota reads limits.localWorkspaceBytes from this resolved policy.
   policy: policySectionSchema.optional(),
+  clients: clientsSchema.optional(),
+  sessionStart: sessionStartSchema.optional(),
 }).strict();
 
 /** The MCP server name shown to ZCode; setup integration and recovery must derive it identically. */
@@ -55,6 +67,8 @@ export interface WorkspaceConfig {
   localRoot: string;
   pythonPath: string;
   policy: WorkspacePolicy;
+  clients: WorkspaceClient[];
+  sessionStart: SessionStartConfig;
 }
 
 export async function loadWorkspaceConfig(profilePath: string): Promise<WorkspaceConfig> {
@@ -75,5 +89,7 @@ export async function loadWorkspaceConfig(profilePath: string): Promise<Workspac
     localStateDir: profile.localStateDir ? resolve(dirname(absolute), profile.localStateDir) : join(homedir(), ".ssh-mcp-agent"),
     localRoot: profile.localRoot ? resolve(dirname(absolute), profile.localRoot) : dirname(absolute),
     policy: resolvePolicy(profile.policy),
+    clients: profile.clients ?? ["zcode"],
+    sessionStart: { ...sessionStartDefaults, ...profile.sessionStart },
   };
 }
