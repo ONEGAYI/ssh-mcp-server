@@ -30,7 +30,7 @@ Ending this local waiter does not cancel the remote task or transfer. Results re
 const TASK_ACTIONS = ["run", "wait", "status", "cancel", "pending", "ack", "cleanup", "doctor", "maintain"];
 const TRANSFER_ACTIONS = ["start", "wait", "status", "resume", "cancel", "ack", "pending"];
 /** Unknown publication also ends a waiter, but must never be acknowledged. */
-const WAIT_END_STATES = new Set(["completed", "failed", "cancelled", "unknown"]);
+const WAIT_END_STATES = new Set(["completed", "failed", "cancelled", "unknown", "paused"]);
 
 function numberOption(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
@@ -58,7 +58,7 @@ async function driveTransfer(transfers: TransferService, sessionId: string, tran
   for (;;) {
     try {
       const outcome = await transfers.resume(sessionId, transferId, options.budgetMs);
-      if (WAIT_END_STATES.has(outcome.state)) return { outcome, timedOut: false };
+      if (WAIT_END_STATES.has(outcome.state) && !(outcome.state === "paused" && outcome.resumeAttempted)) return { outcome, timedOut: false };
       retryDelay = 500; // progress happened; keep driving without backoff
     } catch (error) {
       if ((error as { retriable?: boolean })?.retriable !== true) {
@@ -127,8 +127,8 @@ async function main(): Promise<void> {
         const outcome = values.direction === "upload"
           ? await transfers.upload(values.session, request)
           : await transfers.download(values.session, request);
-        if (WAIT_END_STATES.has(outcome.state)) {
-          console.log(JSON.stringify({ kind: "transfer-result", ...outcome, acknowledgementRequired: outcome.state !== "unknown" }));
+        if (WAIT_END_STATES.has(outcome.state) && !(outcome.state === "paused" && outcome.resumeAttempted)) {
+          console.log(JSON.stringify({ kind: "transfer-result", ...outcome, acknowledgementRequired: outcome.state !== "unknown" && outcome.state !== "paused" }));
           process.exitCode = outcome.state === "completed" ? 0 : 1;
         } else {
           console.log(JSON.stringify({ kind: "transfer-started", ...outcome,
@@ -146,8 +146,8 @@ async function main(): Promise<void> {
       }
       if (action === "resume") {
         const outcome = await transfers.resume(values.session, transferId, numberOption(values.budget));
-        if (WAIT_END_STATES.has(outcome.state)) {
-          console.log(JSON.stringify({ kind: "transfer-result", ...outcome, acknowledgementRequired: outcome.state !== "unknown" }));
+        if (WAIT_END_STATES.has(outcome.state) && !(outcome.state === "paused" && outcome.resumeAttempted)) {
+          console.log(JSON.stringify({ kind: "transfer-result", ...outcome, acknowledgementRequired: outcome.state !== "unknown" && outcome.state !== "paused" }));
           process.exitCode = outcome.state === "completed" ? 0 : 1;
         } else {
           console.log(JSON.stringify({ kind: "transfer-progress", ...outcome }));
@@ -163,7 +163,8 @@ async function main(): Promise<void> {
         return;
       }
       const outcome = waited.outcome!;
-      console.log(JSON.stringify({ kind: "transfer-result", ...outcome, acknowledgementRequired: outcome.state !== "unknown" }));
+      console.log(JSON.stringify({ kind: outcome.state === "paused" ? "transfer-wait-paused" : "transfer-result", ...outcome,
+        acknowledgementRequired: outcome.state !== "unknown" && outcome.state !== "paused" }));
       process.exitCode = outcome.state === "completed" ? 0 : 1;
       return;
     }

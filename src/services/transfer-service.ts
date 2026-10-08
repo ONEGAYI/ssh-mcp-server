@@ -46,6 +46,7 @@ import { loadPolicy } from "../config/policy.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
 import { FileService } from "./file-service.js";
 import { SpaceLedger, workspaceLedgerDirectory } from "./space-ledger.js";
+import { writeTransferState as atomicJson, TransferStateWriteError } from "./transfer-state.js";
 
 export const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 export const MIN_CHUNK_SIZE = 64 * 1024;
@@ -125,6 +126,7 @@ export interface TransferOutcome {
   totalBytesKnown?: boolean;
   driverRunning?: boolean;
   resumeRequired?: boolean;
+  resumeAttempted?: boolean;
 }
 
 /** The observed identity of a local overwrite target, scheme l1- (the local
@@ -162,7 +164,7 @@ interface LocalTransferRecord {
   lastProgressAt?: number | null;
   expiresAt?: number;
   completedAt?: number | null;
-  error?: { code: string; message: string } | null;
+  error?: { code: string; message: string; retriable?: boolean; phase?: string } | null;
   background?: boolean;
   initialRequest?: UploadRequest | DownloadRequest;
   totalBytesKnown?: boolean;
@@ -172,18 +174,6 @@ interface LocalTransferRecord {
 
 function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException)?.code === "ENOENT";
-}
-
-async function atomicJson(path: string, value: unknown): Promise<void> {
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    const handle = await open(temporary, "wx", 0o600);
-    try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); }
-    finally { await handle.close(); }
-    await rename(temporary, path);
-  } finally {
-    await unlink(temporary).catch(error => { if (!isMissing(error)) throw error; });
-  }
 }
 
 /** Durable local ownership of transfer identities; the remote record stays authoritative. */
@@ -276,15 +266,18 @@ export class TransferService {
       message: "Durably registered locally; attach ssh-mcp-job transfer wait to this identifier for completion delivery" };
   }
 
-  private async driver(transferId: string): Promise<{ pid: number; token: string } | null> {
+  private async driver(transferId: string): Promise<{ pid: number; token: string;
+    error?: ReturnType<TransferStateWriteError["toJSON"]>; retryAfter?: number } | null> {
     try { return JSON.parse(await readFile(join(this.directory, transferId, "driver.json"), "utf8")); }
     catch (error) { if (isMissing(error)) return null; throw error; }
   }
 
-  private async ensureDriver(sessionId: string, transferId: string): Promise<void> {
+  private async ensureDriver(sessionId: string, transferId: string, cancel = false): Promise<boolean> {
     const record = await this.localRecord(transferId, sessionId);
-    if (TERMINAL_TRANSFER_STATES.has(record.state!) || record.state === "unknown" || (record.retryAfter ?? 0) > Date.now()) return;
-    if (await transferDriverRunning(this.config.identity, transferId)) return;
+    if (TERMINAL_TRANSFER_STATES.has(record.state!) || record.state === "unknown") return false;
+    if (!cancel && (record.retryAfter ?? 0) > Date.now()) return false;
+    if (await transferDriverRunning(this.config.identity, transferId)) return false;
+    if (!cancel && ((await this.driver(transferId))?.retryAfter ?? 0) > Date.now()) return false;
     const token = randomUUID();
     const recordPath = join(this.directory, transferId, "record.json");
     const log = await open(join(this.directory, transferId, "driver.log"), "a", 0o600);
@@ -300,6 +293,7 @@ export class TransferService {
       await new Promise<void>((resolve, reject) => child.send({ token, recordPath }, error => error ? reject(error) : resolve()));
       if (child.connected) child.disconnect();
       child.unref();
+      return true;
     } catch (error) {
       child.kill();
       throw error;
@@ -353,6 +347,14 @@ export class TransferService {
           await this.saveRecord(record);
         } catch (error) {
           record = await this.localRecord(transferId, sessionId);
+          if (error instanceof TransferStateWriteError) {
+            // The progress file itself may still be locked. Keep the cause in
+            // driver metadata, leaving the last durable state and bytes intact.
+            console.error(JSON.stringify(error));
+            await atomicJson(join(this.directory, transferId, "driver.json"), {
+              pid: process.pid, token, error, retryAfter: Date.now() + 1000 });
+            return;
+          }
           const fault = error as Error & { code?: string; retriable?: boolean };
           if (fault.code === "TRANSFER_CANCEL_REQUESTED") continue;
           if (fault.code === "TRANSFER_STATE_UNKNOWN") {
@@ -369,7 +371,8 @@ export class TransferService {
       }
     } finally {
       try {
-        if ((await this.driver(transferId))?.token === token) await unlink(join(this.directory, transferId, "driver.json"));
+        const driver = await this.driver(transferId);
+        if (driver?.token === token && !driver.error) await unlink(join(this.directory, transferId, "driver.json"));
       } finally {
         await new Promise<void>((resolve, reject) => execution.close(error => error ? reject(error) : resolve()));
       }
@@ -1025,8 +1028,13 @@ export class TransferService {
     const budget = this.validateBudget(budgetMs ?? DEFAULT_BUDGET_MS);
     const record = await this.localRecord(transferId, sessionId);
     if (record.background && !driving) {
-      await this.ensureDriver(sessionId, transferId);
-      return this.status(sessionId, transferId);
+      const resumeAttempted = await this.ensureDriver(sessionId, transferId);
+      const snapshot = await this.status(sessionId, transferId);
+      return { ...snapshot, resumeAttempted,
+        ...(snapshot.state === "failed" && !resumeAttempted ? {
+          message: "This is the previously stored failed result. Resume did not start a new attempt. Resolve the cause and create a new transfer if needed; acknowledge only after handling this result." } : {}),
+        ...(resumeAttempted && snapshot.state === "paused" ? {
+          message: "A new background driver was dispatched; this is its previous paused snapshot. Observe status or attach transfer wait for new progress." } : {}) };
     }
     if (record.direction === "download") return this.resumeDownload(record, sessionId, budget);
     // The local source must still be the exact registered object before any
@@ -1115,11 +1123,16 @@ export class TransferService {
     const record = await this.localRecord(transferId, sessionId);
     if (record.background) {
       const driverRunning = await transferDriverRunning(this.config.identity, transferId);
-      return { ...this.stoppedOutcome(record), totalBytesKnown: record.totalBytesKnown,
+      const driver = driverRunning ? null : await this.driver(transferId);
+      const resumeRequired = !driverRunning && !TERMINAL_TRANSFER_STATES.has(record.state!) && record.state !== "unknown";
+      const failure = driver?.error ?? record.error;
+      const paused = resumeRequired && failure?.phase === "transfer-state";
+      return { ...this.stoppedOutcome(record), state: paused ? "paused" : record.state!, totalBytesKnown: record.totalBytesKnown,
         bytesWritten: record.state === "completed" ? record.totalBytes : undefined,
         diagnosticLog: join(this.directory, transferId, "driver.log"),
-        sha256: record.totalSha256 || undefined, error: record.error ?? undefined, driverRunning,
-        resumeRequired: !driverRunning && !TERMINAL_TRANSFER_STATES.has(record.state!) && record.state !== "unknown",
+        sha256: record.totalSha256 || undefined, error: paused ? failure : record.error ?? undefined, driverRunning,
+        resumeRequired, retryAfter: resumeRequired ? driver?.retryAfter ?? record.retryAfter : undefined,
+        ...(paused ? { message: "Transfer paused while saving local state. Receiver data and its original identifier were kept. Resolve file access, then resume this transferId; do not acknowledge it as a failed result." } : {}),
         observation: "local-driver-snapshot" };
     }
     if (record.direction === "upload") {
@@ -1151,7 +1164,7 @@ export class TransferService {
     }
     if (record.background && !driving && !TERMINAL_TRANSFER_STATES.has(record.state!)) {
       await atomicJson(join(this.directory, transferId, "cancel.json"), { requestedAt: Date.now() });
-      await this.ensureDriver(sessionId, transferId);
+      await this.ensureDriver(sessionId, transferId, true);
       return { ...this.stoppedOutcome(record), state: "cancelling",
         message: "Cancellation requested; inspect status or attach transfer wait until the driver confirms a terminal outcome" };
     }
@@ -1299,6 +1312,13 @@ export class TransferService {
    * stays a read-only observation; an unknown outcome is never acknowledged. */
   async acknowledge(sessionId: string, transferId: string): Promise<{ acknowledged: boolean; transferId: string; state: string }> {
     const record = await this.localRecord(transferId, sessionId);
+    if (record.background && record.state === "unknown") {
+      throw new RemoteAgentError("TRANSFER_STATE_UNKNOWN", "An unverified outcome cannot be acknowledged; inspect it first");
+    }
+    if (record.background && !TERMINAL_TRANSFER_STATES.has(record.state ?? "preparing")) {
+      throw new RemoteAgentError("TRANSFER_NOT_FINISHED",
+        "Resume the original transfer until its local result is saved before acknowledging it");
+    }
     const localOnly = record.background && record.initialRequest && !record.registrationPending;
     const state = record.direction === "download" || localOnly
       ? record.state ?? "prepared"

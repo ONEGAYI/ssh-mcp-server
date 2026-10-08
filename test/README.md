@@ -34,6 +34,7 @@ test/
 ├── transfer-service.test.js       # 传输事务：断点续传、预算、恢复、pendingAcross
 ├── workspace-transfer-recovery.test.js # MCP 离线传输发现、错误编号、确认与启动提示
 ├── transfer-background.test.js    # 独立驱动、服务退出、故障恢复、并发等待与取消
+├── transfer-state.test.js         # Windows 状态文件替换重试、清理拒绝与其他 I/O 错误
 ├── fixtures/background-transport.mjs # 上述后台测试的 SSH 边界模拟
 ├── remote-agent-client.test.js    # SSH_MCP_V1 信封与传输客户端
 ├── space-ledger.test.js           # 本机空间额度账本

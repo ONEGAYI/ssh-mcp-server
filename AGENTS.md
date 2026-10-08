@@ -42,6 +42,7 @@
 - `docs/design/session-start-context.md`：ZCode/Codex 会话注入、每绑定开关与验收边界。
 - `src/cli/transfer-worker.ts`：独立本机传输驱动入口，由持久编号与驱动执行权启动，不是人工 CLI 入口。
 - `src/services/transfer-driver.ts`：驱动、状态与维护共用的 IPC 执行权端点与存活判断。
+- `src/services/transfer-state.ts`：传输 JSON 状态原子写入、Windows 有限重试及可恢复错误；规格见 `docs/design/windows-transfer-state.md`。
 - `examples/`：标准 MCP 导入及 ZCode 原生配置的 setup 服务模板。
 - `remote/`：Python 3.6 标准库执行器、持久任务、受保护文件操作与有界搜索。
 - `test/` / `scripts/`：上游测试和构建脚本。
