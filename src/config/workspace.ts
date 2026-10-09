@@ -16,7 +16,7 @@ export const clientsSchema = z.array(clientSchema).min(1).max(2).refine(value =>
 export const sessionStartSchema = z.object({
   enabled: z.boolean().optional(),
   timeoutMs: z.number().int().min(100).max(60000).optional(),
-  maxBytes: z.number().int().min(1024).max(16384).optional(),
+  maxBytes: z.union([z.literal(0), z.number().int().min(1024).max(16384)]).optional(),
 }).strict();
 export const sessionStartDefaults = { enabled: false, timeoutMs: 5000, maxBytes: 8192 };
 export type WorkspaceClient = z.infer<typeof clientSchema>;
