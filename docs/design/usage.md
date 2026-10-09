@@ -96,7 +96,9 @@ policy 组与默认值（未写的字段按默认生效）：
 
 对现有绑定先 inspect，再携带 revision 更新 `clients: ["zcode", "codex"]` 和 `sessionStart: { enabled: true }`。每个绑定独立保存；省略 clients 保持 ZCode 默认，省略开关默认关闭。关闭用 `sessionStart: { enabled: false }`，其余预算字段保留。
 
-两端均读取远端根 `AGENTS.md` 与 `.agents/skills`；ZCode 额外读取 `.zcode/skills`，不支持 `.codex/skills`。技能注入名称、描述和远端 SKILL.md 路径，使用前仍需读取正文。可配总读取等待 `timeoutMs`（默认 5000）和注入大小 `maxBytes`（默认 8192）。缺失与失败可见，超限或超时不会静默注入半份规则。
+两端均读取远端根 `AGENTS.md` 与 `.agents/skills`；ZCode 额外读取 `.zcode/skills`，不支持 `.codex/skills`。技能只访问入口 `SKILL.md`，注入名称、描述、远端路径和按需读取引导，使用前仍需读取正文，不预读引用文件。可配总读取等待 `timeoutMs`（默认 5000）和注入大小 `maxBytes`（默认 8192）。缺失与失败可见，超限或超时不会静默注入半份规则。
+
+约定 `sessionStart: { enabled: true, maxBytes: 0, timeoutMs: 10000 }` 表示取消本程序的大小限制，以 10 秒约束整批远端拉取，超时返回 `CONTEXT_TIMEOUT` 并跳过全部已拉取内容。宿主输出限制继续适用，尤其 ZCode 默认 32 KiB 的接收限制需按实际版本核实；详见 [会话注入说明](session-start-context.md)。
 
 新配置在下一次 SessionStart 生效，旧对话中已注入的内容不会撤回。Codex 接入后需重开项目并信任项目配置与钩子（`/hooks`）；ZCode 接入目标为已确认项目钩子可用的 3.14.x。详见 [范围、协议与验收](session-start-context.md)。
 

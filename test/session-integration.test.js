@@ -21,15 +21,15 @@ it('updates session context per binding without changing identity or requiring S
     const inspected = await setupFromTool({ action: 'inspect', localRoot: root, bindingName: 'first' });
     assert.deepEqual(inspected.config.sessionStart, { enabled: false, timeoutMs: 5000, maxBytes: 8192 });
     const changed = await setupFromTool({ action: 'update', localRoot: root, bindingName: 'first',
-      revision: inspected.revision, sessionStart: { enabled: true, maxBytes: 12000 } });
+      revision: inspected.revision, sessionStart: { enabled: true, maxBytes: 0 } });
     const after = await loadWorkspaceConfig(first.profilePath);
     assert.equal(after.identity, original.identity);
-    assert.deepEqual(after.sessionStart, { enabled: true, timeoutMs: 5000, maxBytes: 12000 });
+    assert.deepEqual(after.sessionStart, { enabled: true, timeoutMs: 5000, maxBytes: 0 });
     assert.equal((await loadWorkspaceConfig(second.profilePath)).sessionStart.enabled, false);
     const disabled = await setupFromTool({ action: 'update', localRoot: root, bindingName: 'first',
       revision: changed.revision, sessionStart: { enabled: false } });
     assert.deepEqual((await setupFromTool({ action: 'inspect', localRoot: root, bindingName: 'first' })).config.sessionStart,
-      { enabled: false, timeoutMs: 5000, maxBytes: 12000 });
+      { enabled: false, timeoutMs: 5000, maxBytes: 0 });
     assert.ok(disabled.changed.includes('sessionStart.enabled'));
     await setupFromTool({ action: 'update', localRoot: root, bindingName: 'first', revision: disabled.revision, clients: ['zcode', 'codex'] });
     assert.equal((await loadWorkspaceConfig(first.profilePath)).identity, original.identity);
@@ -113,7 +113,7 @@ it('rejects invalid or colliding Codex config before changing an existing bindin
     await writeFile(join(root, '.codex/config.toml'), 'broken = [');
     await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision: inspected.revision, clients: ['codex'] }), { code: 'SETUP_INVALID_CONFIG' });
     assert.equal(await readFile(configured.profilePath, 'utf8'), before);
-    for (const sessionStart of [{ timeoutMs: 0 }, { maxBytes: 0 }, { enabled: 'yes' }, { unknown: true }]) {
+    for (const sessionStart of [{ timeoutMs: 0 }, { maxBytes: -1 }, { maxBytes: 1023 }, { maxBytes: 16385 }, { enabled: 'yes' }, { unknown: true }]) {
       await assert.rejects(setupFromTool({ action: 'update', localRoot: root, revision: inspected.revision, sessionStart }));
       assert.equal(await readFile(configured.profilePath, 'utf8'), before);
     }

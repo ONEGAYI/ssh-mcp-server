@@ -8,28 +8,47 @@ import { RemoteAgentError } from "./remote-agent-client.js";
 
 interface ContextRuntime { files: Pick<FileService, "call">; close(): void }
 
+const skillFrontmatter = /^\ufeff?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+
 async function openWorkspace(profilePath: string): Promise<ContextRuntime> {
   const runtime = await createWorkspaceRuntime(profilePath);
   return { files: new FileService(runtime.remote, runtime.config), close: runtime.close };
 }
 
 async function collect(config: WorkspaceConfig, client: WorkspaceClient, sessionId: string,
-  files: ContextRuntime["files"], stopped: () => boolean) {
+  files: ContextRuntime["files"], checkDeadline: () => void) {
   const lines = [
     `远端规则与技能：绑定 ${config.bindingName ?? config.workspaceId}；工作区 ${config.workspaceId}；远端根 ${config.remoteRoot}；宿主 ${client}。`,
     "以下内容仅适用于这个远端绑定，不适用于本机或其他绑定。技能列表只包含名称、描述和远端路径；任务匹配时先用该绑定的 remote_read 读取 SKILL.md，再按需读取其引用文件。路径按远端目录解释。",
   ];
   const append = (text: string) => {
     lines.push(text);
-    if (Buffer.byteLength(lines.join("\n"), "utf8") > config.sessionStart.maxBytes) {
+    if (config.sessionStart.maxBytes !== 0 && Buffer.byteLength(lines.join("\n"), "utf8") > config.sessionStart.maxBytes) {
       throw new RemoteAgentError("CONTEXT_TOO_LARGE", "Remote context exceeded the configured byte limit");
     }
   };
   const call = async (action: string, request: Record<string, unknown>) => {
-    if (stopped()) throw new RemoteAgentError("CONTEXT_TIMEOUT", "Session context timed out");
-    return files.call(action, sessionId, request) as Promise<any>;
+    checkDeadline();
+    const result = await files.call(action, sessionId, request) as any;
+    checkDeadline();
+    return result;
   };
-  const read = (path: string) => call("file_read", { path, maxBytes: config.sessionStart.maxBytes, grantRead: false });
+  const read = async (path: string, headerOnly = false) => {
+    const request = { path, maxBytes: config.sessionStart.maxBytes || 65536, grantRead: false };
+    if (config.sessionStart.maxBytes !== 0) return call("file_read", request);
+    const chunks: string[] = [];
+    let offset = 0, version: string | undefined;
+    for (;;) {
+      const result = await call("file_read", { ...request, offset, ...(version === undefined ? {} : { expectedVersion: version }) });
+      chunks.push(result.text);
+      const header = headerOnly ? skillFrontmatter.exec(chunks.join("")) : null;
+      if (!result.truncated || header?.[0].endsWith("\n")) {
+        return { ...result, text: chunks.join("") };
+      }
+      offset = result.nextOffset;
+      version = result.version;
+    }
+  };
   const issue = (path: string, error: unknown) => {
     const code = error instanceof RemoteAgentError ? error.code : "CONTEXT_READ_FAILED";
     if (code === "CONTEXT_TOO_LARGE" || code === "CONTEXT_TIMEOUT") throw error;
@@ -50,9 +69,11 @@ async function collect(config: WorkspaceConfig, client: WorkspaceClient, session
       if (entry.type !== "directory" && entry.type !== "symlink") continue;
       const path = posix.join(directory, posix.basename(entry.path), "SKILL.md");
       try {
-        const result = await read(path);
-        const header = /^\ufeff?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(result.text);
-        if (!header) throw new RemoteAgentError("INVALID_SKILL_METADATA", "Missing or oversized skill frontmatter");
+        const result = await read(path, true);
+        const header = skillFrontmatter.exec(result.text);
+        if (!header || (result.truncated && !header[0].endsWith("\n"))) {
+          throw new RemoteAgentError("INVALID_SKILL_METADATA", "Missing or oversized skill frontmatter");
+        }
         let metadata;
         try { metadata = parseYaml(header[1], { maxAliasCount: 0 }); }
         catch { throw new RemoteAgentError("INVALID_SKILL_METADATA", "Skill frontmatter is invalid YAML"); }
@@ -82,13 +103,17 @@ export async function sessionStartContext(profilePath: string, client: Workspace
   const runtime = await open(profilePath);
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;
+  const deadline = Date.now() + config.sessionStart.timeoutMs;
+  const checkDeadline = () => {
+    if (stopped || Date.now() >= deadline) throw new RemoteAgentError("CONTEXT_TIMEOUT", "Session context timed out");
+  };
   try {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => { stopped = true; reject(new RemoteAgentError("CONTEXT_TIMEOUT", "Remote context timed out")); }, config.sessionStart.timeoutMs);
     });
-    const context = await Promise.race([collect(config, client, input.session_id, runtime.files, () => stopped), timeout]);
+    const context = await Promise.race([collect(config, client, input.session_id, runtime.files, checkDeadline), timeout]);
+    checkDeadline();
     const output = { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } };
-    if (Buffer.byteLength(JSON.stringify(output)) > 32768) throw new RemoteAgentError("CONTEXT_TOO_LARGE", "Encoded hook output exceeds the client limit");
     return output;
   } catch (error) {
     const code = error instanceof RemoteAgentError ? error.code : "CONTEXT_READ_FAILED";
