@@ -2,6 +2,20 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.4.1] - 2026-10-09
+
+补全会话上下文的不限大小约定，以整批远端拉取时间控制等待；超时跳过已拉取的全部文件内容。
+
+### 其他改进
+
+- 每绑定可设 `sessionStart.maxBytes: 0`，取消本程序的上下文大小限制及固定 32 KiB JSON 输出上限；默认 8192 字节与原有限大小配置保持兼容（PR [#41](https://github.com/ONEGAYI/ssh-mcp-server/pull/41)）
+- AGENTS.md 按同一文件版本分页读取；技能只访问 SKILL.md 入口，确认完整 frontmatter 后停止，仅注入名称、描述、路径和按需读取引导，不预读正文引用的文件
+- `timeoutMs` 约束整批远端读取，每页不重新计时；超时返回 `CONTEXT_TIMEOUT`，丢弃整批已拉取内容，避免注入不完整规则或技能目录
+
+> **使用边界**：`maxBytes: 0` 仅取消本程序的大小限制，宿主与模型的限制继续适用。ZCode 官网列出的默认钩子输出上限为 32 KiB，本程序不自动改写该设置；ZCode 3.14.x / Codex 大输出接收仍待实测。
+
+> **验证状态**：构建通过，Node 回归 330 项通过、17 项环境跳过；WSL Python 回归 191 项通过、1 项环境跳过。需求与工程规范两轴独立复核通过，仍不等同于真实宿主或 CentOS 7 现场验收。本版附 Windows x64 离线包。
+
 ## [2.4.0] - 2026-10-08
 
 新增 ZCode / Codex 双宿主接入与可选的会话规则、技能目录注入。Windows 传输状态保存持续受阻时保留编号和数据，解除占用后可恢复，不再误记为失败终态。
@@ -143,6 +157,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.4.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.1.0...v2.2.0
