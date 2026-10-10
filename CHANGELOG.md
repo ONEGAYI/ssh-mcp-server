@@ -2,6 +2,34 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.5.0] - 2026-10-10
+
+精确编辑新增已读范围全部替换，同一会话可并行发起同文件中不重叠的修改。保留读后写保护和整批原子提交。
+
+### 新功能
+
+**已读范围全部替换**（remote_edit）（PR [#42](https://github.com/ONEGAYI/ssh-mcp-server/pull/42)）
+
+- 每条 `edits` 项可设置 `replace_all: true`，替换该读取凭据已读范围内的全部完整命中；默认 `false` 仍要求全文件唯一匹配
+- 一次调用可以混合两种模式，任一项校验失败则整批不提交
+- 返回各项实际替换数量与字节范围；整次调用最多展示 128 个范围，截断时明确标记，计数仍准确
+- 每次最多规划 65,536 个替换区间，超出时返回 `EDIT_LIMIT`，整批不提交
+
+**同文件不重叠并行编辑**（同一 sessionId）（PR #42）
+
+- 同一会话的多个调用可共享旧 `readToken` 并行发出；服务端持锁依次提交，自动调整前方增删造成的目标位置变化
+- 按读取版本中的实际修改区间判断冲突；区间重叠即整次拒绝，即使两个调用希望写入相同结果
+- 每个会话与文件保留最近 10 分钟、最多 128 次提交、最多 4 MiB 的变更记录；历史失效或断链时要求重新读取
+- 返回 `rebased` 与 `concurrentReplayAvailable`，说明是否使用变更链以及本次修改是否可供后续旧凭据追踪
+
+### 其他改进
+
+- `remote_help`、README 和使用说明补全替换范围、并行调用、返回结果及重读指引
+
+> **使用边界**：`replace_all` 仅覆盖凭据已读范围，未读命中不修改。同一会话的精确编辑之外，不同会话、Shell、整文件覆盖和上传仍使旧凭据失效；后续优先使用最新返回的凭据。
+
+> **验证状态**：Node 回归 330 项通过、17 项远端环境门控跳过；WSL Python 八套共 203 项全部通过，Python 3.6 语法检查通过。工程规范与需求两轴独立复核通过，真实 ZCode / Codex 和 CentOS 7 人工验收仍待完成。本版附含 Node 运行时与完整依赖的 Windows x64 离线包。
+
 ## [2.4.1] - 2026-10-09
 
 补全会话上下文的不限大小约定，以整批远端拉取时间控制等待；超时跳过已拉取的全部文件内容。
@@ -157,6 +185,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.5.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.2.0...v2.3.0
