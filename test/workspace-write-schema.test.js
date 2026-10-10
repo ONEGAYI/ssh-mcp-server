@@ -27,6 +27,12 @@ it('remote_write bounds inline text and data with a coarse schema-level cap', as
       assert.ok(property, 'remote_write exposes ' + field);
       assert.equal(property.maxLength, 64 * 1024 * 1024, field + ' carries the coarse inline cap');
     }
+    const edit = tools.tools.find(tool => tool.name === 'remote_edit');
+    const replaceAll = edit.inputSchema.properties.edits.items.properties.replace_all;
+    assert.ok(replaceAll, 'remote_edit exposes replace_all on each edit item');
+    assert.equal(replaceAll.type, 'boolean');
+    assert.equal(replaceAll.default, false);
+    assert.equal(edit.inputSchema.properties.replace_all, undefined);
   } finally {
     await client.close();
     const child = relative(tmpdir(), directory);

@@ -197,11 +197,32 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 
 ### 连续编辑无需反复读取
 
-成功的 `remote_edit` 返回新 `readToken`。下一次编辑使用这个新凭据即可，无需 read；不能继续使用旧凭据。原已读范围随编辑长度变化而调整，自己提交的替换文本成为已知内容，未读区间仍保持保护。
+成功的 `remote_edit` 返回新 `readToken`。下一次编辑优先使用这个新凭据，无需再次 read。原已读范围随编辑长度变化而调整，自己提交的替换文本成为已知内容，未读区间仍保持保护。
 
 例如 `read → token A → edit → token B → edit → token C`。若初始只读了一部分文件，后续依然不能凭此覆盖整个文件；外部修改仍会使新凭据失效。
 
 如果返回 `written=true`、`rereadRequired=true`、`readToken=null`，说明编辑已提交，但凭据更新未能确认（例如提交后发生外部替换或状态文件保存失败）。此时应重新 read 当前内容，不能直接重试同一编辑。该续期行为只适用于 edit，write/upload 不自动续期。
+
+### 已读范围全部替换与同文件并行编辑
+
+每条 `edits` 项独立设置 `replace_all`，默认 `false` 保持全文件唯一匹配；`true` 替换该凭据已读范围内的全部完整命中。一次调用可以混合两种模式：
+
+```json
+{
+  "edits": [
+    { "oldText": "settings mcp.%s", "newText": "settings next.%s", "replace_all": true },
+    { "oldText": "const defaultPort = 22", "newText": "const defaultPort = 2222" }
+  ]
+}
+```
+
+**全部替换的范围由已读凭据决定**：未读命中不修改。`editResults` 按输入项返回 `scope`、`replacementsApplied` 与实际匹配的 `ranges`；区间是 `beforeVersion` 中的 UTF-8 字节偏移，左闭右开。整个请求最多展示 128 个区间，`rangesTruncated=true` 表示范围列表省略了部分条目，计数仍准确。`scope=readRanges` 不能表述为全文件已替换。每次最多规划 65,536 个替换区间，超出返回 `EDIT_LIMIT`，整次不提交；可采用更具体的原文缩小目标。
+
+**同一会话的不重叠修改可以并行发出**：多个调用可使用同一旧凭据。服务端在文件锁内依次提交，通过同一 `sessionId` 的精确编辑历史还原读取版本并移动后方目标；重叠即拒绝，即使两个调用想写相同结果。每次调用保持原子性，任一项失败则整次不提交。
+
+旧凭据的变更追踪保留最近 10 分钟，且每个会话/文件索引最多 128 次提交、4 MiB。`rebased=true` 表示本次使用了变更链；`concurrentReplayAvailable=false` 表示本次修改未进入可追踪记录，后续旧凭据需要重读。历史超期、超额、丢失、不同会话、Shell 或 write/upload 变更仍触发 `FILE_CONFLICT`。普通读取凭据的 3 天闲置期限不变，后续优先使用最新返回的凭据。
+
+机制和验收项见 [精确编辑扩展规格](scoped-edit-spec.md)。
 
 ### 上传大文件（可续传传输事务）
 

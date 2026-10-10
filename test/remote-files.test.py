@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 
 HELPER = Path(__file__).resolve().parents[1] / 'remote' / 'agent.py'
@@ -23,6 +24,198 @@ class RemoteFilesTest(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.cleanup()
+
+    def test_replace_all_only_changes_read_matches_and_reports_scope(self):
+        path = self.work / 'scoped.txt'
+        path.write_bytes(b'header\nfirst needle\nunread needle\nlast needle\ntail\n')
+        self.call('file_read', {'path': 'scoped.txt', 'fromLine': 2, 'toLine': 2})
+        read = self.call('file_read', {'path': 'scoped.txt', 'fromLine': 4, 'toLine': 4})['result']
+        edited = self.call('file_edit', {'path': 'scoped.txt', 'readToken': read['readToken'], 'edits': [
+            {'oldText': 'needle', 'newText': 'UPDATED', 'replace_all': True},
+            {'oldText': 'first', 'newText': 'FIRST'},
+        ]})
+        self.assertTrue(edited['ok'], edited)
+        self.assertEqual(path.read_bytes(), b'header\nFIRST UPDATED\nunread needle\nlast UPDATED\ntail\n')
+        result = edited['result']
+        self.assertEqual(result['editsApplied'], 3)
+        self.assertEqual(result['beforeVersion'], read['version'])
+        self.assertEqual(result['editResults'], [
+            {'scope': 'readRanges', 'replacementsApplied': 2, 'ranges': [[13, 19], [39, 45]], 'rangesTruncated': False},
+            {'scope': 'file', 'replacementsApplied': 1, 'ranges': [[7, 12]], 'rangesTruncated': False},
+        ])
+
+    def test_parallel_edits_rebase_disjoint_ranges_with_the_same_old_token(self):
+        path = self.work / 'parallel.txt'
+        path.write_text('alpha\ngap\nbeta\ntrailer\n')
+        token = self.call('file_read', {'path': 'parallel.txt'})['result']['readToken']
+        gate = Barrier(2)
+
+        def edit(pair):
+            gate.wait(timeout=5)
+            return self.call('file_edit', {'path': 'parallel.txt', 'readToken': token, 'edits': [pair]})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(edit, [
+                {'oldText': 'alpha', 'newText': 'ALPHA\nextra'},
+                {'oldText': 'beta', 'newText': 'BETA'},
+            ]))
+        self.assertTrue(all(result['ok'] for result in results), results)
+        self.assertEqual(path.read_text(), 'ALPHA\nextra\ngap\nBETA\ntrailer\n')
+        self.assertEqual(sorted(result['result']['rebased'] for result in results), [False, True])
+        final = self.call('file_edit', {'path': 'parallel.txt', 'readToken': token,
+                                       'edits': [{'oldText': 'gap', 'newText': 'GAP'}]})
+        self.assertTrue(final['ok'], final)
+        self.assertEqual(path.read_text(), 'ALPHA\nextra\nGAP\nBETA\ntrailer\n')
+
+    def test_old_token_requires_reread_after_ten_minute_history_window(self):
+        path = self.work / 'window.txt'
+        path.write_text('alpha\nbeta\n')
+        start = 1000000.0
+        read = self.call_at(start, 'file_read', {'path': 'window.txt'})['result']
+        first = self.call_at(start + 1, 'file_edit', {'path': 'window.txt', 'readToken': read['readToken'],
+                                                   'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})['result']
+        expired = self.call_at(start + 602, 'file_edit', {'path': 'window.txt', 'readToken': read['readToken'],
+                                                       'edits': [{'oldText': 'beta', 'newText': 'lost'}]})
+        self.assertFalse(expired['ok'], expired)
+        self.assertEqual(expired['error']['code'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_text(), 'ALPHA\nbeta\n')
+        current = self.call_at(start + 603, 'file_edit', {'path': 'window.txt', 'readToken': first['readToken'],
+                                                       'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertTrue(current['ok'], current)
+
+    def test_old_token_requires_reread_when_history_count_or_bytes_are_evicted(self):
+        sys.path.insert(0, str(HELPER.parent))
+        from files import FileService
+        from common import AgentError
+        state = self.root / 'state'
+        state.mkdir()
+        service = FileService(state, str(self.work), 'session-one')
+        for name, count, prefix in [('count.txt', 129, 'counter:'), ('bytes.txt', 110, 'a' * 30000 + ':')]:
+            with self.subTest(name=name):
+                path = self.work / name
+                path.write_text(prefix + '000\nstable\n')
+                read = service.read({'path': name})
+                token = read['readToken']
+                for index in range(count):
+                    result = service.edit({'path': name, 'readToken': token, 'edits': [
+                        {'oldText': prefix + '{:03d}'.format(index), 'newText': prefix + '{:03d}'.format(index + 1)},
+                    ]})
+                    token = result['readToken']
+                with self.assertRaises(AgentError) as failure:
+                    service.edit({'path': name, 'readToken': read['readToken'],
+                                  'edits': [{'oldText': 'stable', 'newText': 'lost'}]})
+                self.assertEqual(failure.exception.code, 'FILE_CONFLICT')
+                current = service.edit({'path': name, 'readToken': token,
+                                        'edits': [{'oldText': 'stable', 'newText': 'STABLE'}]})
+                self.assertFalse(current['rebased'])
+                self.assertTrue(path.read_text().endswith('\nSTABLE\n'))
+
+    def test_rebased_edit_ignores_new_duplicate_text_and_preserves_unread_gaps(self):
+        path = self.work / 'duplicate.txt'
+        path.write_text('unread header\nalpha\nsecret gap\nbeta\nunread tail\n')
+        self.call('file_read', {'path': 'duplicate.txt', 'fromLine': 2, 'toLine': 2})
+        original = self.call('file_read', {'path': 'duplicate.txt', 'fromLine': 4, 'toLine': 4})['result']
+        self.assertTrue(self.call('file_edit', {'path': 'duplicate.txt', 'readToken': original['readToken'],
+                                              'edits': [{'oldText': 'alpha', 'newText': 'beta-copy\nextra'}]})['ok'])
+        tail = self.call('file_edit', {'path': 'duplicate.txt', 'readToken': original['readToken'],
+                                      'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertTrue(tail['ok'], tail)
+        self.assertTrue(tail['result']['rebased'])
+        self.assertEqual(path.read_text(), 'unread header\nbeta-copy\nextra\nsecret gap\nBETA\nunread tail\n')
+        denied = self.call('file_edit', {'path': 'duplicate.txt', 'readToken': tail['result']['readToken'],
+                                        'edits': [{'oldText': 'secret gap', 'newText': 'lost'}]})
+        self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+
+    def test_rebased_replace_all_rejects_any_overlap_without_partial_commit(self):
+        path = self.work / 'overlap.txt'
+        path.write_text('first needle\nsecond needle\nstable\n')
+        original = self.call('file_read', {'path': 'overlap.txt'})['result']
+        first = self.call('file_edit', {'path': 'overlap.txt', 'readToken': original['readToken'],
+                                       'edits': [{'oldText': 'first needle', 'newText': 'FIRST changed'}]})
+        self.assertTrue(first['ok'], first)
+        before = path.read_bytes()
+        conflicted = self.call('file_edit', {'path': 'overlap.txt', 'readToken': original['readToken'], 'edits': [
+            {'oldText': 'needle', 'newText': 'UPDATED', 'replace_all': True},
+            {'oldText': 'stable', 'newText': 'lost'},
+        ]})
+        self.assertEqual(conflicted['error']['code'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_bytes(), before)
+        # Even a no-op write consumes its original target interval.
+        unchanged = self.call('file_edit', {'path': 'overlap.txt', 'readToken': first['result']['readToken'],
+                                           'edits': [{'oldText': 'stable', 'newText': 'stable'}]})
+        self.assertTrue(unchanged['ok'], unchanged)
+        repeated = self.call('file_edit', {'path': 'overlap.txt', 'readToken': first['result']['readToken'],
+                                          'edits': [{'oldText': 'stable', 'newText': 'stable'}]})
+        self.assertEqual(repeated['error']['code'], 'FILE_CONFLICT')
+
+    def test_rebased_edit_refuses_shell_and_other_session_modifications(self):
+        for source in ['shell', 'other-session', 'overwrite']:
+            with self.subTest(source=source):
+                path = self.work / (source + '.txt')
+                path.write_text('alpha\nbeta\n')
+                read = self.call('file_read', {'path': path.name})['result']
+                first = self.call('file_edit', {'path': path.name, 'readToken': read['readToken'],
+                                               'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})['result']
+                if source == 'shell':
+                    path.write_text('external\nbeta\n')
+                elif source == 'other-session':
+                    other = self.call('file_read', {'path': path.name}, session='another')['result']
+                    self.assertTrue(self.call('file_edit', {'path': path.name, 'readToken': other['readToken'],
+                                                           'edits': [{'oldText': 'ALPHA', 'newText': 'OTHER'}]}, session='another')['ok'])
+                else:
+                    self.assertTrue(self.call('file_write', {'path': path.name, 'overwrite': True,
+                                                            'expectedVersion': first['version'], 'text': 'overwrite\nbeta\n'})['ok'])
+                before = path.read_bytes()
+                refused = self.call('file_edit', {'path': path.name, 'readToken': read['readToken'],
+                                                 'edits': [{'oldText': 'beta', 'newText': 'lost'}]})
+                self.assertEqual(refused['error']['code'], 'FILE_CONFLICT')
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_replace_all_streams_cross_chunk_utf8_bom_crlf_and_keeps_permissions(self):
+        boundary = 256 * 1024
+        prefix = b'\xef\xbb\xbf' + b'a' * (boundary - 6)
+        path = self.work / 'chunk-all.txt'
+        path.write_bytes(prefix + b'needle\r\nsuffixneedle\r\n')
+        path.chmod(0o751)
+        read = self.call('file_read', {'path': path.name, 'offset': boundary - 10, 'maxBytes': 100})['result']
+        edited = self.call('file_edit', {'path': path.name, 'readToken': read['readToken'],
+                                        'edits': [{'oldText': 'needle', 'newText': '变\n字', 'replace_all': True}]})
+        self.assertTrue(edited['ok'], edited)
+        self.assertEqual(path.read_bytes(), prefix + '变\r\n字\r\nsuffix变\r\n字\r\n'.encode('utf8'))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o751)
+        self.assertEqual(edited['result']['editsApplied'], 2)
+        self.assertEqual(edited['result']['editResults'][0]['ranges'],
+                         [[boundary - 3, boundary + 3], [boundary + 11, boundary + 17]])
+
+    def test_replace_all_reports_bounded_ranges_and_refuses_invalid_or_overlapping_edits(self):
+        path = self.work / 'report.txt'
+        path.write_text('a' * 130 + ' end')
+        token = self.call('file_read', {'path': path.name})['result']['readToken']
+        for edits in [
+            [{'oldText': 'a', 'newText': 'x', 'replace_all': 'true'}],
+            [{'oldText': 'a', 'newText': 'x', 'replace_all': True}, {'oldText': 'aa' * 65, 'newText': 'lost'}],
+        ]:
+            result = self.call('file_edit', {'path': path.name, 'readToken': token, 'edits': edits})
+            self.assertEqual(result['error']['code'], 'INVALID_EDIT')
+            self.assertEqual(path.read_text(), 'a' * 130 + ' end')
+        edited = self.call('file_edit', {'path': path.name, 'readToken': token, 'edits': [
+            {'oldText': 'a', 'newText': 'x', 'replace_all': True}, {'oldText': 'end', 'newText': 'END'},
+        ]})['result']
+        self.assertEqual(edited['editsApplied'], 131)
+        self.assertEqual([item['replacementsApplied'] for item in edited['editResults']], [130, 1])
+        self.assertEqual(sum(len(item['ranges']) for item in edited['editResults']), 128)
+        self.assertTrue(all(item['rangesTruncated'] for item in edited['editResults']))
+        self.assertEqual(path.read_text(), 'x' * 130 + ' END')
+
+    def test_replace_all_plan_budget_refuses_without_a_partial_write(self):
+        path = self.work / 'many.txt'
+        path.write_bytes(b'a' * 65537)
+        first = self.call('file_read', {'path': path.name, 'maxBytes': 1048576})['result']
+        read = self.call('file_read', {'path': path.name, 'offset': first['nextOffset'], 'maxBytes': 1048576})['result']
+        refused = self.call('file_edit', {'path': path.name, 'readToken': read['readToken'],
+                                         'edits': [{'oldText': 'a', 'newText': 'x', 'replace_all': True}]})
+        self.assertEqual(refused['error']['code'], 'EDIT_LIMIT')
+        self.assertEqual(path.read_bytes(), b'a' * 65537)
 
     def call(self, action, request, session='session-one'):
         data = dict(request, workspaceRoot=str(self.work), sessionId=session)

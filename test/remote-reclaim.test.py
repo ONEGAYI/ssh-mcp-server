@@ -35,6 +35,25 @@ class RemoteReclaimTest(unittest.TestCase):
     def tearDown(self):
         self.fixture.cleanup()
 
+    def test_maintenance_prunes_edit_history_without_expiring_the_live_read_token(self):
+        (self.work / 'history.txt').write_text('alpha\nbeta\n')
+        start = 1000000.0
+        read = self.call('file_read', {'path': 'history.txt'}, clock=start)['result']
+        edited = self.call('file_edit', {'path': 'history.txt', 'readToken': read['readToken'],
+                                        'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]}, clock=start + 1)['result']
+        index_path = next((self.state / 'reads').glob('index-*.json'))
+        token_path = self.state / 'reads' / (edited['readToken'] + '.json')
+        token_before = json.loads(token_path.read_text())
+        self.assertEqual(len(json.loads(index_path.read_text())['editHistory']), 1)
+        maintained = self.maintenance(clock=start + 602)
+        self.assertTrue(maintained['ok'], maintained)
+        self.assertEqual(json.loads(index_path.read_text())['editHistory'], [])
+        self.assertEqual(json.loads(token_path.read_text()), token_before)
+        self.assertEqual(json.loads(index_path.read_text())['readToken'], edited['readToken'])
+        next_edit = self.call('file_edit', {'path': 'history.txt', 'readToken': edited['readToken'],
+                                          'edits': [{'oldText': 'beta', 'newText': 'BETA'}]}, clock=start + 603)
+        self.assertTrue(next_edit['ok'], next_edit)
+
     # --- helpers ---------------------------------------------------------------
 
     @property

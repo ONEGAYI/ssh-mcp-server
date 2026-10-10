@@ -11,6 +11,7 @@ reads for delete/move) together with those tools (ADR 0007); version
 observation above is metadata-only and stays.
 """
 from contextlib import contextmanager
+from bisect import bisect_right
 import base64
 import codecs
 import errno
@@ -31,6 +32,11 @@ MAX_FILE_BYTES = 16 * 1024 * 1024  # inline write request budget (spec 4.3), not
 MAX_STREAM_CHUNK = 256 * 1024
 READ_BUDGET = 65536 - 8192
 READ_TOKEN_TTL_SECONDS = 3 * 24 * 3600
+MAX_EDIT_REPLACEMENTS = 65536
+MAX_REPORTED_EDIT_RANGES = 128
+EDIT_HISTORY_TTL_SECONDS = 600
+MAX_EDIT_HISTORY_ENTRIES = 128
+MAX_EDIT_HISTORY_BYTES = 4 * 1024 * 1024
 BOM = b'\xef\xbb\xbf'
 
 
@@ -305,7 +311,7 @@ def replaceable(info):
 # chunked pass over the file (spec 4.3): nothing buffers the whole text.
 
 def validate_edits(edits):
-    """Validate an edit list; returns [(oldText, newText)] pairs."""
+    """Validate an edit list; returns (oldText, newText, replace_all)."""
     if not isinstance(edits, list) or not edits or len(edits) > 100:
         raise AgentError('INVALID_EDIT', 'Provide between 1 and 100 exact replacements')
     pairs = []
@@ -315,7 +321,10 @@ def validate_edits(edits):
         old, new = edit.get('oldText'), edit.get('newText')
         if not isinstance(old, str) or not old or not isinstance(new, str):
             raise AgentError('INVALID_EDIT', 'Replacement text must be strings with a nonempty oldText')
-        pairs.append((old, new))
+        replace_all = edit.get('replace_all', False)
+        if not isinstance(replace_all, bool):
+            raise AgentError('INVALID_EDIT', 'replace_all must be boolean')
+        pairs.append((old, new, replace_all))
     return pairs
 
 
@@ -325,16 +334,16 @@ def locate_replacements(stream, pairs, ranges, chunk_size=MAX_STREAM_CHUNK):
     Byte-level matching over chunked reads with an overlap carry reproduces
     the first-version whole-text semantics: UTF-8 is self-synchronizing, so
     the byte spans of oldText.encode('utf8') are exactly the whole-text spans,
-    and each edit must match exactly once with the whole span inside ranges
-    granted by reads. The same pass validates the file is UTF-8 (text edits
+    default edits match exactly once; replace_all searches only complete
+    spans inside read ranges. The same pass validates the file is UTF-8 (text edits
     keep refusing binary targets) and takes the newline census that CRLF
     preservation needs. Nothing but the carry tail is held between chunks.
 
-    Returns (replacements, byte_edits): sorted (start, end, new_bytes) byte
+    Returns (replacements, byte_edits): sorted (start, end, new_bytes, edit_index)
     spans ready to splice, plus the original-coordinate facts credential
     renewal needs.
     """
-    patterns = [old.encode('utf8') for old, new in pairs]
+    patterns = [old.encode('utf8') for old, new, replace_all in pairs]
     carry = max(max(len(pattern) for pattern in patterns) - 1, 1)
     validate_chunk = utf8_stream_validator()
     census = NewlineCensus()
@@ -343,6 +352,8 @@ def locate_replacements(stream, pairs, ranges, chunk_size=MAX_STREAM_CHUNK):
     stream.seek(0)
     tail = b''
     position = 0  # absolute offset of the bytes consumed from previous buffers
+    range_index = 0
+    all_matches = 0
     while True:
         block = stream.read(chunk_size)
         if not block:
@@ -350,8 +361,27 @@ def locate_replacements(stream, pairs, ranges, chunk_size=MAX_STREAM_CHUNK):
         buffer = tail + block if tail else block
         buffer_start = position - len(tail)
         validate_chunk(census.feed(block))
+        while range_index < len(ranges) and ranges[range_index][1] <= buffer_start:
+            range_index += 1
         for index, pattern in enumerate(patterns):
             matches = found[index]
+            if pairs[index][2]:
+                for left, right in ranges[range_index:]:
+                    if left >= buffer_start + len(buffer):
+                        break
+                    relative = max(left, search_from[index], buffer_start) - buffer_start
+                    limit = min(right - buffer_start, len(buffer))
+                    while True:
+                        at = buffer.find(pattern, relative, limit)
+                        if at < 0:
+                            break
+                        matches.append(buffer_start + at)
+                        all_matches += 1
+                        if all_matches > MAX_EDIT_REPLACEMENTS:
+                            raise AgentError('EDIT_LIMIT', 'Too many replacements; narrow oldText or the edit target')
+                        search_from[index] = buffer_start + at + len(pattern)
+                        relative = at + len(pattern)
+                continue
             relative = max(0, search_from[index] - buffer_start)
             while len(matches) < 2:
                 at = buffer.find(pattern, relative)
@@ -364,21 +394,131 @@ def locate_replacements(stream, pairs, ranges, chunk_size=MAX_STREAM_CHUNK):
         tail = buffer[-carry:] if carry else b''
     validate_chunk(b'', True)
     replacements = []
-    for index, (old, new) in enumerate(pairs):
+    for index, (old, new, replace_all) in enumerate(pairs):
         matches = found[index]
         if not matches:
             raise AgentError('EDIT_MATCH_ERROR', 'oldText was not found; read the current file around the target and retry')
-        if len(matches) > 1:
+        if not replace_all and len(matches) > 1:
             raise AgentError('EDIT_MATCH_ERROR', 'oldText matches more than once; widen it with surrounding context until it is unique')
-        start = matches[0]
-        end = start + len(patterns[index])
-        if not covers(ranges, start, end):
-            raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
-        replacements.append((start, end, preserve_newlines_census(new, census).encode('utf8')))
+        new_bytes = preserve_newlines_census(new, census).encode('utf8')
+        for start in matches:
+            end = start + len(patterns[index])
+            if not covers(ranges, start, end):
+                raise AgentError('READ_REQUIRED', 'The edited range has not been delivered by a read')
+            if len(replacements) >= MAX_EDIT_REPLACEMENTS:
+                raise AgentError('EDIT_LIMIT', 'Too many replacements; narrow oldText or the edit target')
+            replacements.append((start, end, new_bytes, index))
     replacements.sort()
     if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
         raise AgentError('INVALID_EDIT', 'Replacement ranges must not overlap')
-    return replacements, [(start, end, len(new_bytes)) for start, end, new_bytes in replacements]
+    return replacements, [(start, end, len(new_bytes)) for start, end, new_bytes, index in replacements]
+
+
+def report_edits(pairs, replacements):
+    results = [{'scope': 'readRanges' if replace_all else 'file', 'replacementsApplied': 0,
+                'ranges': [], 'rangesTruncated': False} for old, new, replace_all in pairs]
+    remaining = MAX_REPORTED_EDIT_RANGES
+    for start, end, new_bytes, index in replacements:
+        result = results[index]
+        result['replacementsApplied'] += 1
+        if remaining:
+            result['ranges'].append([start, end])
+            remaining -= 1
+        else:
+            result['rangesTruncated'] = True
+    return results
+
+
+def prune_edit_history(history, now):
+    history = [entry for entry in history if now <= entry['at'] + EDIT_HISTORY_TTL_SECONDS][-MAX_EDIT_HISTORY_ENTRIES:]
+    sizes = [len(json.dumps(entry, ensure_ascii=True, sort_keys=True)) for entry in history]
+    total = sum(sizes) + 2 * len(history) + 2
+    remove = 0
+    while remove < len(history) and total > MAX_EDIT_HISTORY_BYTES:
+        total -= sizes[remove] + 2
+        remove += 1
+    return history[remove:]
+
+
+class HistoricalReader:
+    """Read a prior version using current-file slices and recorded old text."""
+    def __init__(self, source, size, history):
+        self.source = source
+        pieces = [(0, size, None)] if size else []
+        for entry in reversed(history):
+            old_texts = [base64.b64decode(value) for value in entry['oldTexts']]
+            inverse, delta = [], 0
+            for start, end, new_size, index in entry['changes']:
+                inverse.append((start + delta, start + delta + new_size, old_texts[index]))
+                delta += new_size - (end - start)
+            output = []
+            piece_index, offset, position = 0, 0, 0
+
+            def advance(limit, keep):
+                nonlocal piece_index, offset, position
+                while position < limit:
+                    start, length, data = pieces[piece_index]
+                    count = min(length - offset, limit - position)
+                    if keep:
+                        output.append((start + offset, count, data))
+                    offset += count
+                    position += count
+                    if offset == length:
+                        piece_index += 1
+                        offset = 0
+
+            for start, end, old in inverse:
+                advance(start, True)
+                advance(end, False)
+                output.append((0, len(old), old))
+            advance(sum(length for start, length, data in pieces), True)
+            pieces = output
+        self.pieces = pieces
+        self.ends = []
+        size = 0
+        for start, length, data in pieces:
+            size += length
+            self.ends.append(size)
+        self.size = size
+        self.position = 0
+
+    def seek(self, position):
+        self.position = position
+
+    def read(self, limit):
+        end = min(self.position + limit, self.size)
+        chunks = []
+        while self.position < end:
+            index = bisect_right(self.ends, self.position)
+            start, length, data = self.pieces[index]
+            offset = self.position - (self.ends[index] - length)
+            count = min(length - offset, end - self.position)
+            if data is None:
+                self.source.seek(start + offset)
+                block = self.source.read(count)
+                if len(block) != count:
+                    raise AgentError('FILE_CONFLICT', 'File changed while restoring the read version')
+            else:
+                block = data[start + offset:start + offset + count]
+            chunks.append(block)
+            self.position += count
+        return b''.join(chunks)
+
+
+def rebase_replacements(replacements, history):
+    for entry in history:
+        changes = entry['changes']
+        mapped, change_index, delta = [], 0, 0
+        for start, end, new_bytes, index in replacements:
+            while change_index < len(changes) and changes[change_index][1] <= start:
+                left, right, new_size, old_index = changes[change_index]
+                delta += new_size - (right - left)
+                change_index += 1
+            if change_index < len(changes) and changes[change_index][0] < end:
+                raise AgentError('FILE_CONFLICT', 'An intervening edit changed the target range; read the current file again')
+            mapped.append((start + delta, end + delta, new_bytes, index))
+        replacements = mapped
+    return replacements
 
 
 def splice_stream(source, replacements, sink, chunk_size=MAX_STREAM_CHUNK):
@@ -390,7 +530,7 @@ def splice_stream(source, replacements, sink, chunk_size=MAX_STREAM_CHUNK):
     network transfer or buffer (spec 4.3).
     """
     position = 0
-    for start, end, new_bytes in replacements:
+    for start, end, new_bytes, index in replacements:
         source.seek(position)
         remaining = start - position
         while remaining > 0:
@@ -525,7 +665,7 @@ class FileService:
         with acquire_slots(self.root, [str(path) for path in paths]):
             yield
 
-    def token(self, value, path, version):
+    def token(self, value, path, version, allow_stale=False):
         if not isinstance(value, str) or not re.fullmatch(r'[a-f0-9]{32}', value):
             raise AgentError('READ_REQUIRED', 'Read the file with this tool before modifying it')
         try:
@@ -534,7 +674,7 @@ class FileService:
             raise AgentError('READ_REQUIRED', 'Read record is unavailable')
         if token['session'] != self.session or token['path'] != str(path):
             raise AgentError('READ_SCOPE_MISMATCH', 'Read record belongs to a different file or session')
-        if token['version'] != version:
+        if token['version'] != version and not allow_stale:
             raise AgentError('FILE_CONFLICT', 'File changed since it was read; read it again')
         if _now() > token.get('expiresAt', 0):
             # Three idle days killed the credential (spec 4.2); failed and
@@ -546,13 +686,23 @@ class FileService:
         key = hashlib.sha256((self.session + '\0' + str(path)).encode('utf8')).hexdigest()
         return self.reads / ('index-' + key + '.json')
 
-    def save_read(self, path, version, size, ranges, key=None):
+    def edit_history(self, path, version):
+        try:
+            index = read_json(self.read_index(path))
+        except FileNotFoundError:
+            return []
+        except ValueError:
+            raise AgentError('READ_REQUIRED', 'Edit history is unavailable; read the current file again')
+        history = prune_edit_history(index.get('editHistory', []), _now())
+        return history if history and history[-1]['after'] == version else []
+
+    def save_read(self, path, version, size, ranges, key=None, history=None):
         key = key or uuid.uuid4().hex
         now = _now()
         record = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': size,
                   'lastSuccessAt': now, 'expiresAt': now + READ_TOKEN_TTL_SECONDS}
         atomic_json(self.reads / (key + '.json'), record)
-        atomic_json(self.read_index(path), {'readToken': key})
+        atomic_json(self.read_index(path), {'readToken': key, 'editHistory': prune_edit_history(history or [], now)})
         return {'readToken': key, 'version': version, 'size': size, 'complete': covers(ranges, 0, size)}
 
     def grant_read(self, path, version, size, bom_size, start, delivered_end):
@@ -563,21 +713,25 @@ class FileService:
         window alone so dead ranges cannot revive.
         """
         index_path = self.read_index(path)
-        key, previous = None, []
+        key, previous, history = None, [], []
         if index_path.exists():
             # A dangling or corrupt index must not kill the read (contrast
             # token(), which refuses unknown credentials): issue a fresh
             # credential from this window alone, like a first read.
             try:
-                candidate = read_json(index_path)['readToken']
+                index = read_json(index_path)
+                candidate = index['readToken']
                 old = read_json(self.reads / (candidate + '.json'))
                 if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
                         and _now() <= old.get('expiresAt', 0)):
                     key, previous = candidate, old['ranges']
+                    history = index.get('editHistory', [])
+                    if history and history[-1]['after'] != version:
+                        history = []
             except (OSError, ValueError):
                 key, previous = None, []
         ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
-        return self.save_read(path, version, size, ranges, key)
+        return self.save_read(path, version, size, ranges, key, history)
 
     def observe_metadata(self, path):
         """metadataOnly read: the observed version or explicit absence.
@@ -717,17 +871,39 @@ class FileService:
                 if not same_object(info, path):
                     raise AgentError('FILE_CONFLICT', 'File identity changed while observing')
                 version = content_version(info)
-                token = self.token(request.get('readToken'), path, version)
+                token = self.token(request.get('readToken'), path, version, allow_stale=True)
                 replaceable(info)
-                replacements, byte_edits = locate_replacements(stream, pairs, token['ranges'])
+                history = self.edit_history(path, version)
+                chain = []
+                expected = token['version']
+                if expected != version:
+                    for entry in history:
+                        if entry['before'] == expected:
+                            chain.append(entry)
+                            expected = entry['after']
+                    if expected != version:
+                        raise AgentError('FILE_CONFLICT', 'No continuous edit history connects this token to the file; read it again')
+                source = HistoricalReader(stream, info.st_size, chain) if chain else stream
+                try:
+                    replacements, byte_edits = locate_replacements(source, pairs, token['ranges'])
+                except AgentError as error:
+                    if chain and error.code in ('EDIT_MATCH_ERROR', 'READ_REQUIRED'):
+                        raise AgentError('FILE_CONFLICT', 'The old token does not identify an unchanged known target; read the current file again')
+                    raise
+                replacements = rebase_replacements(replacements, chain)
+                byte_edits = [(start, end, len(new_bytes)) for start, end, new_bytes, index in replacements]
+                if chain:
+                    current_key = read_json(self.read_index(path))['readToken']
+                    token = self.token(current_key, path, version)
                 if metadata(os.fstat(stream.fileno())) != metadata(info) or not same_object(info, path):
                     raise AgentError('FILE_CONFLICT', 'File changed while locating replacements')
-            output_size = info.st_size + sum(len(new_bytes) - (end - start) for start, end, new_bytes in replacements)
+            output_size = info.st_size + sum(len(new_bytes) - (end - start) for start, end, new_bytes, index in replacements)
             written_info = self.commit_spliced(path, replacements, info, version, output_size, origin='file-edit')
-            result = {'path': str(path), 'written': True, 'bytesWritten': output_size, 'editsApplied': len(replacements)}
-            return self.renew_after_edit(path, token, byte_edits, output_size, written_info, result)
+            result = {'path': str(path), 'written': True, 'bytesWritten': output_size, 'editsApplied': len(replacements),
+                      'beforeVersion': version, 'editResults': report_edits(pairs, replacements), 'rebased': bool(chain)}
+            return self.renew_after_edit(path, token, byte_edits, output_size, written_info, result, pairs, replacements, history)
 
-    def renew_after_edit(self, path, token, byte_edits, output_size, written_info, result):
+    def renew_after_edit(self, path, token, byte_edits, output_size, written_info, result, pairs, replacements, history):
         """Verify the committed image and renew the read credential.
 
         The write already happened: verification failures never turn the
@@ -742,7 +918,16 @@ class FileService:
                 new_version = content_version(observed_info)
             verify_committed_image(observed_info, written_info)
             ranges = remap_read_ranges(token['ranges'], byte_edits)
-            result.update(self.save_read(path, new_version, output_size, ranges))
+            old_size = sum(4 * ((len(old.encode('utf8')) + 2) // 3) for old, new, replace_all in pairs)
+            if old_size > MAX_EDIT_HISTORY_BYTES:
+                history = []
+            else:
+                history.append({'before': token['version'], 'after': new_version, 'at': _now(),
+                                'oldTexts': [base64.b64encode(old.encode('utf8')).decode('ascii') for old, new, replace_all in pairs],
+                                'changes': [[start, end, len(new_bytes), index] for start, end, new_bytes, index in replacements]})
+                history = prune_edit_history(history, _now())
+            result.update(self.save_read(path, new_version, output_size, ranges, history=history))
+            result['concurrentReplayAvailable'] = bool(history and history[-1]['after'] == new_version)
             result['rereadRequired'] = False
         except (OSError, AgentError) as error:
             result.update(readToken=None, rereadRequired=True, readTokenError=getattr(error, 'code', 'READ_RECORD_UNAVAILABLE'),
