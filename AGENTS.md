@@ -33,6 +33,7 @@
 - `docs/design/interactive-assessment.md`：交互式功能复杂度、延期影响及首版扩展边界评估。
 - `docs/design/binding-lifecycle-tickets.md`：按需指引（#29）与绑定移除（#28）的实施票据、依赖和验收条件。
 - `docs/design/transfer-start-spec.md` / `transfer-start-tickets.md`：大文件快速启动、离线恢复、结果提示与后台驱动规格及实施票据。
+- `docs/design/scoped-edit-spec.md`：已读范围全部替换、同会话不重叠并行编辑、10 分钟变更追踪与资源预算。
 - `docs/adr/`：已确认的远端兼容约束、ZCode 后台 Shell 回传、文件写保护范围，以及非交互任务断线恢复要求。
 - `README.md`：本 fork 的中文入门、setup、日常使用与升级说明；每次离线打包放入包根目录。
 - `README_EN.md`：保留的上游英文旧模式说明。

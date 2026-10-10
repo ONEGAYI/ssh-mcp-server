@@ -440,6 +440,20 @@ def _process_read_entry(root, name, now, summary):
                 return
             expires = record.get('expiresAt')
             if _numeric(expires) and now <= expires:
+                if index.get('editHistory'):
+                    from files import prune_edit_history
+                    from locks import lock_directory, slot_index
+                    slot = lock_directory(root) / ('slot-{:03d}'.format(slot_index(record['path'])))
+                    # Never wait on a writer or replace a newer index with our
+                    # pre-lock snapshot; the next bounded round can retry.
+                    with _try_flock(slot) as held:
+                        if held:
+                            latest = read_json(path)
+                            history = latest.get('editHistory', [])
+                            retained = prune_edit_history(history, now)
+                            if retained != history:
+                                latest['editHistory'] = retained
+                                atomic_json(path, latest)
                 return  # live credential: its index stays
         try:
             path.unlink()
