@@ -2,6 +2,25 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.5.1] - 2026-10-12
+
+新签发的读取凭据缩短为 14 字符，便于 Agent 原样复制。继续接受旧编号，保留原有读后写校验。
+
+### 其他改进
+
+**短读取凭据与旧编号兼容**（PR [#44](https://github.com/ONEGAYI/ssh-mcp-server/pull/44)）
+
+- 新 `readToken` 为 `r_` 加 12 个小写 Base32 随机字符；同版本有效续读复用凭据，成功编辑后换发短凭据
+- 旧 32 位小写十六进制凭据无需批量迁移，续读、编辑、索引与回收继续识别两种格式
+- 新记录完整写入后独占原子发布，碰撞时重新生成，避免覆盖既有凭据或暴露半写记录
+- 完整匹配、会话、路径、文件版本、已读范围、有效期及并行编辑历史校验继续生效；工具说明要求完整原样回填凭据
+
+> **升级注意**：重启共用同一绑定的旧版 MCP 进程。旧执行器不识别新短凭据，混用新旧进程可能使操作失败。
+
+> **随机强度取舍**：新凭据随机空间为 60 位，低于旧 UUID 凭据约 122 位；本次保留的是既有校验，防猜强度有所降低。
+
+> **验证状态**：Node 回归 330 项通过、17 项远端环境门控跳过；WSL Python 八套共 209 项通过，新增 6 项契约测试，Python 3.6 语法检查通过。需求与工程规范两轴独立复核通过。真实 ZCode + GLM 5.3 Flash、Codex 和 CentOS 7 仍待人工验收，Agent 复制准确率改善尚未验证。本版附含 Node 运行时与完整依赖的 Windows x64 离线包。
+
 ## [2.5.0] - 2026-10-10
 
 精确编辑新增已读范围全部替换，同一会话可并行发起同文件中不重叠的修改。保留读后写保护和整批原子提交。
@@ -185,6 +204,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.5.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.3.0...v2.4.0
