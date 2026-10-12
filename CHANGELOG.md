@@ -2,6 +2,26 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.5.2] - 2026-10-12
+
+修复已读取文件后省略 `readToken` 仍被要求先读取的问题。读取范围、版本、会话和有效期保护继续生效。
+
+### Bug 修复
+
+**隐式读取凭据选择**（remote_edit）（PR [#46](https://github.com/ONEGAYI/ssh-mcp-server/pull/46)）
+
+- 省略 `readToken` 时，在文件锁内按当前会话和规范文件路径选择最新读取凭据
+- 分段读取和连续编辑均可省略凭据，仍只允许修改已经读取的范围
+- 显式传入凭据时只使用该值，错误值不会自动回退；其他会话、过期凭据和外部修改仍被拒绝
+
+### 其他改进
+
+- MCP 参数说明、`remote_help`、README 和读写契约补全隐式凭据用法；并行请求需要基于同一已读版本时，显式传入同一凭据
+
+> **升级注意**：使用完整新离线包并重启 MCP 进程。沿用同一绑定配置时无需迁移读取记录。
+
+> **验证状态**：Node 回归 330 项通过、17 项跳过；WSL Python 八套共 215 项通过，新增 6 项远端契约测试。另一台电脑的真实客户端及 CentOS 7 现场仍待人工验收。本版附含 Node 运行时与完整依赖的 Windows x64 离线包。
+
 ## [2.5.1] - 2026-10-12
 
 新签发的读取凭据缩短为 14 字符，便于 Agent 原样复制。继续接受旧编号，保留原有读后写校验。
@@ -204,6 +224,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.5.2]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.0...v2.4.1
