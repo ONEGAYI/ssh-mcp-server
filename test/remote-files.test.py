@@ -26,6 +26,90 @@ class RemoteFilesTest(unittest.TestCase):
     def tearDown(self):
         self.fixture.cleanup()
 
+    def test_edit_uses_latest_session_file_read_token_when_omitted(self):
+        path = self.work / 'implicit.txt'
+        path.write_text('alpha\nbeta\n')
+        read = self.call('file_read', {'path': path.name, 'fromLine': 1, 'toLine': 1})
+        self.assertTrue(read['ok'], read)
+        edited = self.call('file_edit', {'path': str(path),
+                                        'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})
+        self.assertTrue(edited['ok'], edited)
+        self.assertFalse(edited['result']['complete'])
+        # A fresh helper process must select the credential renewed by edit.
+        continued = self.call('file_edit', {'path': path.name,
+                                           'edits': [{'oldText': 'ALPHA', 'newText': 'first'}]})
+        self.assertTrue(continued['ok'], continued)
+        self.assertNotEqual(continued['result']['readToken'], edited['result']['readToken'])
+        self.assertEqual(path.read_text(), 'first\nbeta\n')
+
+    def test_implicit_edit_selects_this_file_after_reading_another_file(self):
+        first = self.work / 'first.txt'
+        second = self.work / 'second.txt'
+        first.write_text('alpha\n')
+        second.write_text('beta\n')
+        for path in (first, second):
+            self.assertTrue(self.call('file_read', {'path': path.name})['ok'])
+        edited = self.call('file_edit', {'path': first.name,
+                                        'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})
+        self.assertTrue(edited['ok'], edited)
+        self.assertEqual(first.read_text(), 'ALPHA\n')
+        self.assertEqual(second.read_text(), 'beta\n')
+
+    def test_implicit_edit_keeps_unread_file_session_and_range_guards(self):
+        path = self.work / 'scoped-implicit.txt'
+        other = self.work / 'unread-implicit.txt'
+        path.write_text('alpha\nbeta\n')
+        other.write_text('gamma\n')
+        self.call('file_read', {'path': path.name, 'fromLine': 1, 'toLine': 1})
+        requests = [
+            ('session-one', {'path': path.name, 'edits': [{'oldText': 'beta', 'newText': 'lost'}]}),
+            ('session-two', {'path': path.name, 'edits': [{'oldText': 'alpha', 'newText': 'lost'}]}),
+            ('session-one', {'path': other.name, 'edits': [{'oldText': 'gamma', 'newText': 'lost'}]}),
+        ]
+        for session, request in requests:
+            with self.subTest(session=session, request=request):
+                rejected = self.call('file_edit', request, session=session)
+                self.assertFalse(rejected['ok'], rejected)
+                self.assertEqual(rejected['error']['code'], 'READ_REQUIRED')
+        self.call('file_read', {'path': other.name, 'metadataOnly': True})
+        metadata_only = self.call('file_edit', requests[-1][1])
+        self.assertEqual(metadata_only['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(path.read_text(), 'alpha\nbeta\n')
+        self.assertEqual(other.read_text(), 'gamma\n')
+
+    def test_implicit_edit_rejects_expired_credentials(self):
+        path = self.work / 'expired-implicit.txt'
+        path.write_text('alpha\n')
+        self.call_at(100, 'file_read', {'path': path.name})
+        rejected = self.call_at(100 + 3 * 86400 + 1, 'file_edit', {'path': path.name,
+                                    'edits': [{'oldText': 'alpha', 'newText': 'lost'}]})
+        self.assertEqual(rejected['error']['code'], 'READ_TOKEN_EXPIRED')
+        self.assertEqual(path.read_text(), 'alpha\n')
+
+    def test_implicit_edit_rejects_external_changes(self):
+        path = self.work / 'changed-implicit.txt'
+        path.write_text('alpha\n')
+        self.call('file_read', {'path': path.name})
+        path.write_text('alpha\nexternal\n')
+        rejected = self.call('file_edit', {'path': path.name,
+                                          'edits': [{'oldText': 'alpha', 'newText': 'lost'}]})
+        self.assertEqual(rejected['error']['code'], 'FILE_CONFLICT')
+        self.assertEqual(path.read_text(), 'alpha\nexternal\n')
+
+    def test_implicit_edit_requires_an_available_read_record(self):
+        path = self.work / 'unavailable-implicit.txt'
+        path.write_text('alpha\n')
+        read = self.call('file_read', {'path': path.name})['result']
+        reads = self.root / 'state' / 'reads'
+        (reads / (read['readToken'] + '.json')).unlink()
+        edit = {'path': path.name, 'edits': [{'oldText': 'alpha', 'newText': 'lost'}]}
+        missing = self.call('file_edit', edit)
+        self.assertEqual(missing['error']['code'], 'READ_REQUIRED')
+        next(reads.glob('index-*.json')).write_text('{')
+        corrupt = self.call('file_edit', edit)
+        self.assertEqual(corrupt['error']['code'], 'READ_REQUIRED')
+        self.assertEqual(path.read_text(), 'alpha\n')
+
     def test_read_tokens_are_short_reused_and_renewed_after_edit(self):
         path = self.work / 'short-token.txt'
         path.write_text('alpha\nbeta\n')
@@ -92,7 +176,7 @@ class RemoteFilesTest(unittest.TestCase):
         other.write_text('beta\n')
         token = self.call('file_read', {'path': path.name})['result']['readToken']
         changed = token[:-1] + ('0' if token[-1] != '0' else '1')
-        for invalid in [token[:-1], token[2:], token.upper(), token + '0', changed, '../' + token]:
+        for invalid in [None, '', token[:-1], token[2:], token.upper(), token + '0', changed, '../' + token]:
             with self.subTest(token=invalid):
                 rejected = self.call('file_edit', {'path': path.name, 'readToken': invalid,
                                                   'edits': [{'oldText': 'alpha', 'newText': 'lost'}]})

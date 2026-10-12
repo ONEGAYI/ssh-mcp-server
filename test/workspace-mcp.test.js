@@ -29,6 +29,10 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     assert.ok(read.inputSchema.properties.metadataOnly, 'remote_read exposes metadataOnly');
     assert.ok(read.inputSchema.properties.expectedVersion, 'remote_read exposes expectedVersion');
     assert.ok(!/16 MiB/.test(read.description), 'remote_read no longer caps file size');
+    const edit = tools.tools.find(tool => tool.name === 'remote_edit');
+    assert.ok(!(edit.inputSchema.required ?? []).includes('readToken'), 'remote_edit permits implicit credentials');
+    assert.match(edit.inputSchema.properties.readToken.description, /Omit.*latest.*file and session/);
+    assert.match(edit.description, /Omit readToken.*latest/);
     // Issue #10: whole-file writes take an explicit overwrite bound to the
     // observed version instead of a read credential.
     const write = tools.tools.find(tool => tool.name === 'remote_write');
@@ -103,6 +107,7 @@ it('workspace MCP serves the full usage guide through remote_help with zero remo
     assert.equal(result.isError, undefined, result.content?.[0]?.text);
     const data = JSON.parse(result.content[0].text);
     assert.equal(typeof data.guide, 'string');
+    assert.match(data.guide, /省略 readToken.*当前会话.*文件.*最新/);
     assert.match(data.guide, /Codex/, 'shared guide covers the Codex host workflow');
     for (const name of ['remote_upload', 'remote_download']) {
       assert.match(tools.tools.find(tool => tool.name === name).description, /Codex/, `${name} describes the current-host waiting workflow`);

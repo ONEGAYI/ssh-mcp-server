@@ -882,7 +882,13 @@ class FileService:
                 if not same_object(info, path):
                     raise AgentError('FILE_CONFLICT', 'File identity changed while observing')
                 version = content_version(info)
-                token = self.token(request.get('readToken'), path, version, allow_stale=True)
+                read_token = request.get('readToken')
+                if 'readToken' not in request:
+                    try:
+                        read_token = read_json(self.read_index(path))['readToken']
+                    except (OSError, ValueError):
+                        raise AgentError('READ_REQUIRED', 'Read record is unavailable; read the file before modifying it')
+                token = self.token(read_token, path, version, allow_stale=True)
                 replaceable(info)
                 history = self.edit_history(path, version)
                 chain = []
