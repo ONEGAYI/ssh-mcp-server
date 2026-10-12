@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from unittest.mock import patch
 
 
 HELPER = Path(__file__).resolve().parents[1] / 'remote' / 'agent.py'
@@ -24,6 +25,114 @@ class RemoteFilesTest(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.cleanup()
+
+    def test_read_tokens_are_short_reused_and_renewed_after_edit(self):
+        path = self.work / 'short-token.txt'
+        path.write_text('alpha\nbeta\n')
+        first = self.call('file_read', {'path': path.name, 'fromLine': 1, 'toLine': 1})['result']
+        self.assertRegex(first['readToken'], r'^r_[0123456789abcdefghjkmnpqrstvwxyz]{12}$')
+        continued = self.call('file_read', {'path': path.name, 'fromLine': 2, 'toLine': 2})['result']
+        self.assertEqual(continued['readToken'], first['readToken'])
+        edited = self.call('file_edit', {'path': path.name, 'readToken': first['readToken'],
+                                        'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})
+        self.assertTrue(edited['ok'], edited)
+        renewed = edited['result']['readToken']
+        self.assertRegex(renewed, r'^r_[0123456789abcdefghjkmnpqrstvwxyz]{12}$')
+        self.assertNotEqual(renewed, first['readToken'])
+        next_edit = self.call('file_edit', {'path': path.name, 'readToken': renewed,
+                                          'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertTrue(next_edit['ok'], next_edit)
+        self.assertEqual(path.read_text(), 'ALPHA\nBETA\n')
+
+    def test_concurrent_read_record_creation_publishes_one_complete_winner(self):
+        sys.path.insert(0, str(HELPER.parent))
+        from common import atomic_json, read_json
+        target = self.root / 'credential.json'
+        gate = Barrier(2)
+
+        def create(owner):
+            gate.wait(timeout=5)
+            try:
+                atomic_json(target, {'owner': owner}, overwrite=False)
+            except FileExistsError:
+                return None
+            return owner
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(create, ['first', 'second']))
+        winners = [owner for owner in outcomes if owner is not None]
+        self.assertEqual(len(winners), 1, outcomes)
+        self.assertEqual(read_json(target), {'owner': winners[0]})
+        self.assertEqual(list(self.root.glob('.pending-*')), [])
+        atomic_json(target, {'owner': 'renewed'})
+        self.assertEqual(read_json(target), {'owner': 'renewed'})
+
+    def test_read_token_collision_retries_without_overwriting_the_first_file_record(self):
+        first = self.work / 'first-token.txt'
+        second = self.work / 'second-token.txt'
+        first.write_text('alpha\n')
+        second.write_text('beta\n')
+        service = self.service()
+        with patch('files.secrets.choice', side_effect=list('a' * 24 + 'b' * 12)):
+            original = service.read({'path': first.name})
+            collision = service.read({'path': second.name})
+        self.assertEqual(original['readToken'], 'r_aaaaaaaaaaaa')
+        self.assertEqual(collision['readToken'], 'r_bbbbbbbbbbbb')
+        service.edit({'path': first.name, 'readToken': original['readToken'],
+                      'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})
+        service.edit({'path': second.name, 'readToken': collision['readToken'],
+                      'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertEqual(first.read_text(), 'ALPHA\n')
+        self.assertEqual(second.read_text(), 'BETA\n')
+
+    def test_short_tokens_require_exact_values_and_keep_file_and_session_guards(self):
+        path = self.work / 'guarded-token.txt'
+        other = self.work / 'other-token.txt'
+        path.write_text('alpha\n')
+        other.write_text('beta\n')
+        token = self.call('file_read', {'path': path.name})['result']['readToken']
+        changed = token[:-1] + ('0' if token[-1] != '0' else '1')
+        for invalid in [token[:-1], token[2:], token.upper(), token + '0', changed, '../' + token]:
+            with self.subTest(token=invalid):
+                rejected = self.call('file_edit', {'path': path.name, 'readToken': invalid,
+                                                  'edits': [{'oldText': 'alpha', 'newText': 'lost'}]})
+                self.assertFalse(rejected['ok'], rejected)
+                self.assertEqual(rejected['error']['code'], 'READ_REQUIRED')
+        foreign = self.call('file_edit', {'path': path.name, 'readToken': token,
+                                         'edits': [{'oldText': 'alpha', 'newText': 'lost'}]}, session='session-two')
+        self.assertEqual(foreign['error']['code'], 'READ_SCOPE_MISMATCH')
+        crossed = self.call('file_edit', {'path': other.name, 'readToken': token,
+                                         'edits': [{'oldText': 'beta', 'newText': 'lost'}]})
+        self.assertEqual(crossed['error']['code'], 'READ_SCOPE_MISMATCH')
+        self.assertEqual(path.read_text(), 'alpha\n')
+        self.assertEqual(other.read_text(), 'beta\n')
+
+    def test_legacy_read_tokens_survive_restart_and_renew_into_short_tokens(self):
+        path = self.work / 'legacy-token.txt'
+        path.write_text('alpha\nbeta\n')
+        first = self.call('file_read', {'path': path.name, 'fromLine': 1, 'toLine': 1})['result']
+        reads = self.root / 'state' / 'reads'
+        legacy = '0123456789abcdef0123456789abcdef'
+        (reads / (first['readToken'] + '.json')).rename(reads / (legacy + '.json'))
+        index_path = next(reads.glob('index-*.json'))
+        index = json.loads(index_path.read_text())
+        index['readToken'] = legacy
+        index_path.write_text(json.dumps(index))
+        # Every CLI call starts a fresh helper process over the same state.
+        continued = self.call('file_read', {'path': path.name, 'fromLine': 2, 'toLine': 2})['result']
+        self.assertEqual(continued['readToken'], legacy)
+        foreign = self.call('file_edit', {'path': path.name, 'readToken': legacy,
+                                         'edits': [{'oldText': 'alpha', 'newText': 'lost'}]}, session='session-two')
+        self.assertEqual(foreign['error']['code'], 'READ_SCOPE_MISMATCH')
+        edited = self.call('file_edit', {'path': path.name, 'readToken': legacy,
+                                        'edits': [{'oldText': 'alpha', 'newText': 'ALPHA'}]})
+        self.assertTrue(edited['ok'], edited)
+        renewed = edited['result']['readToken']
+        self.assertRegex(renewed, r'^r_[0123456789abcdefghjkmnpqrstvwxyz]{12}$')
+        next_edit = self.call('file_edit', {'path': path.name, 'readToken': renewed,
+                                          'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertTrue(next_edit['ok'], next_edit)
+        self.assertEqual(path.read_text(), 'ALPHA\nBETA\n')
 
     def test_replace_all_only_changes_read_matches_and_reports_scope(self):
         path = self.work / 'scoped.txt'

@@ -28,14 +28,17 @@ def _sync_parent_directory(path):
         pass
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, overwrite=True):
     descriptor, temporary = tempfile.mkstemp(prefix='.pending-', dir=str(path.parent))
     try:
         with os.fdopen(descriptor, 'w') as stream:
             json.dump(value, stream, ensure_ascii=True, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, str(path))
+        if overwrite:
+            os.replace(temporary, str(path))
+        else:
+            os.link(temporary, str(path))
         _sync_parent_directory(path)
     finally:
         if os.path.exists(temporary):

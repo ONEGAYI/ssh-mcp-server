@@ -502,6 +502,35 @@ class RemoteReclaimTest(unittest.TestCase):
 
     # --- issue #17: expired read credentials -----------------------------------
 
+    def test_short_and_legacy_read_credentials_and_indexes_expire_together(self):
+        start = 1000000.0
+        (self.work / 'legacy.txt').write_text('legacy\n')
+        (self.work / 'short.txt').write_text('short\n')
+        old_read = self.call('file_read', {'path': 'legacy.txt'}, clock=start)['result']
+        reads = self.state / 'reads'
+        legacy = '0123456789abcdef0123456789abcdef'
+        (reads / (old_read['readToken'] + '.json')).rename(reads / (legacy + '.json'))
+        index_path = next(reads.glob('index-*.json'))
+        index = json.loads(index_path.read_text())
+        index['readToken'] = legacy
+        index_path.write_text(json.dumps(index))
+        new_read = self.call('file_read', {'path': 'short.txt'}, clock=start)['result']
+        short = new_read['readToken']
+        self.assertRegex(short, r'^r_[0123456789abcdefghjkmnpqrstvwxyz]{12}$')
+        active = self.maintenance(clock=start + DAY)['result']
+        self.assertEqual(active['removedReadTokens'], [])
+        self.assertEqual(active['removedReadIndexes'], [])
+        expired = self.maintenance(clock=start + 3 * DAY + 1)['result']
+        self.assertEqual(set(expired['removedReadTokens']), {legacy, short})
+        self.assertEqual(len(expired['removedReadIndexes']), 2)
+        self.assertEqual(list(reads.glob('*.json')), [])
+        for name, token, original in [('legacy.txt', legacy, 'legacy'), ('short.txt', short, 'short')]:
+            denied = self.call('file_edit', {'path': name, 'readToken': token,
+                                            'edits': [{'oldText': original, 'newText': 'lost'}]},
+                               clock=start + 3 * DAY + 2)
+            self.assertEqual(denied['error']['code'], 'READ_REQUIRED')
+            self.assertEqual((self.work / name).read_text(), original + '\n')
+
     def test_expired_read_tokens_and_indexes_are_reclaimed_and_rereading_restores_only_the_new_window(self):
         source = self.work / 'credential.txt'
         source.write_text('alpha window text\n' + 'padding line ' * 20 + '\ntail target line\n')

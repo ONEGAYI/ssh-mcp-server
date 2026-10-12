@@ -410,9 +410,9 @@ def _process_read_entry(root, name, now, summary):
     """Reclaim one expired read credential or its dangling index (issue #17).
 
     The expiry verdict is the same expiresAt the read path itself enforces,
-    so an accelerated test clock moves both in lockstep. Sorted order puts
-    every token file (<32 hex>.json) before its index-... twin, so a token
-    removed here leaves the index dangling for the same round to collect."""
+    so an accelerated test clock moves both in lockstep. An index checks
+    both the referred record's presence and expiry, so either filename
+    order can reclaim expired credentials and their indexes in one round."""
     reads = Path(root) / 'reads'
     path = reads / name
     if name.startswith('index-'):
@@ -425,10 +425,10 @@ def _process_read_entry(root, name, now, summary):
             # skipped, never fatal for the round.
             return
         token_key = index.get('readToken')
-        if not isinstance(token_key, str) or not re.fullmatch(r'[a-f0-9]{32}', token_key):
-            # The key feeds a path join: only a real 32-hex token key ever
-            # materializes into a path (same guard as transferId); anything
-            # else -- including traversal attempts -- is corrupt and skipped.
+        from files import READ_TOKEN_PATTERN
+        if not isinstance(token_key, str) or not READ_TOKEN_PATTERN.fullmatch(token_key):
+            # The key feeds a path join: only an accepted short or legacy
+            # credential can materialize into a path; traversal is refused.
             return
         token_path = reads / (token_key + '.json')
         if token_path.is_file():

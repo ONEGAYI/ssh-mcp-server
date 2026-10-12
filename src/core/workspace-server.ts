@@ -17,7 +17,7 @@ const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 你正在通过 SSH 远端绑定操作 Linux 工程。存在多个绑定时，本指引对每个 \`ssh-workspace-*\` 服务各适用一次：先选定目标绑定再工作，本机路径与远端路径不混用，各绑定的任务互不借用。
 
 - 开始工作先调用 remote_workspace 验证连接与运行时；SessionStart 已注入的根 AGENTS.md 可直接参考，未注入、超限、读取失败及子目录规则用 remote_read 核实。技能目录只提供名称、描述和路径，使用前读取对应 SKILL.md。
-- 文件读写优先使用 remote_* 工具。凭据冲突时重新读取，不用 Shell 绕过工具报出的冲突。
+- 文件读写优先使用 remote_* 工具。readToken 必须从读取或编辑结果原样传回，不自行编造、截短或改写。凭据冲突时重新读取，不用 Shell 绕过工具报出的冲突。
 - remote_edit 的每条 edits 项可设置 replace_all=true，只替换该 readToken 已读范围内的全部完整命中；默认 false 要求全文件唯一匹配。检查 editResults 的 scope、计数与范围，readRanges 不代表全文件已替换。
 - 同一 sessionId 对同一文件的不重叠编辑可并行发出，服务端按文件锁依次提交，并在最近 10 分钟的有界历史内映射旧凭据。重叠、历史失效、不同会话或 Shell/write/upload 修改仍要求重读；整个 edits 批次保持原子性。后续优先使用最新返回的 readToken。
 - 远端命令（构建、测试、目录管理等）通过恢复钩子提供的 job CLI run 入口运行。在 ZCode 中使用原生后台 Shell 的 run_in_background: true；在 Codex 中使用本机命令工具启动 CLI，收到本机等待会话后用会话续读功能跟进输出。本机等待会话与远端 jobId 是不同标识；跨对话恢复按原 jobId 重新 wait。
@@ -64,7 +64,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
   }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify({ guide: WORKSPACE_GUIDE }) }] }));
   const sessionId = z.string().min(1).max(256).describe("Actual original conversation ID supplied by the recovery hook");
   const path = z.string().min(1).describe("Remote POSIX path; relative paths resolve against the configured remote root. Absolute paths outside that root require the binding's unrestricted directory scope");
-  const readToken = z.string().optional().describe("Server-issued token from reads of the current file version");
+  const readToken = z.string().optional().describe("Server-issued read credential for this file and session. Copy the returned value exactly; do not invent, shorten, or normalize it");
   const count = z.number().int().min(1).max(1000).optional();
   const register = (name: string, description: string, schema: z.ZodRawShape,
     action: (input: Record<string, any>) => Promise<unknown>, online = true) => {

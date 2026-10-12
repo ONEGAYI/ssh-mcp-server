@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import time
 import uuid
@@ -32,6 +33,8 @@ MAX_FILE_BYTES = 16 * 1024 * 1024  # inline write request budget (spec 4.3), not
 MAX_STREAM_CHUNK = 256 * 1024
 READ_BUDGET = 65536 - 8192
 READ_TOKEN_TTL_SECONDS = 3 * 24 * 3600
+READ_TOKEN_ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz'
+READ_TOKEN_PATTERN = re.compile(r'(?:[a-f0-9]{32}|r_[' + READ_TOKEN_ALPHABET + r']{12})')
 MAX_EDIT_REPLACEMENTS = 65536
 MAX_REPORTED_EDIT_RANGES = 128
 EDIT_HISTORY_TTL_SECONDS = 600
@@ -666,7 +669,7 @@ class FileService:
             yield
 
     def token(self, value, path, version, allow_stale=False):
-        if not isinstance(value, str) or not re.fullmatch(r'[a-f0-9]{32}', value):
+        if not isinstance(value, str) or not READ_TOKEN_PATTERN.fullmatch(value):
             raise AgentError('READ_REQUIRED', 'Read the file with this tool before modifying it')
         try:
             token = read_json(self.reads / (value + '.json'))
@@ -697,11 +700,19 @@ class FileService:
         return history if history and history[-1]['after'] == version else []
 
     def save_read(self, path, version, size, ranges, key=None, history=None):
-        key = key or uuid.uuid4().hex
         now = _now()
         record = {'session': self.session, 'path': str(path), 'version': version, 'ranges': ranges, 'size': size,
                   'lastSuccessAt': now, 'expiresAt': now + READ_TOKEN_TTL_SECONDS}
-        atomic_json(self.reads / (key + '.json'), record)
+        if key is not None:
+            atomic_json(self.reads / (key + '.json'), record)
+        else:
+            while True:
+                key = 'r_' + ''.join(secrets.choice(READ_TOKEN_ALPHABET) for _ in range(12))
+                try:
+                    atomic_json(self.reads / (key + '.json'), record, overwrite=False)
+                except FileExistsError:
+                    continue
+                break
         atomic_json(self.read_index(path), {'readToken': key, 'editHistory': prune_edit_history(history or [], now)})
         return {'readToken': key, 'version': version, 'size': size, 'complete': covers(ranges, 0, size)}
 
