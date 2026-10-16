@@ -26,7 +26,7 @@
 
 - 上游 `skills/ssh-mcp-helper` 配置向导：面向上游 npm 包与旧客户端接入模式，且 ZCode 宿主会自动发现并注册根级 `skills/` 目录，使其误入插件技能列表（内容于上游仓库与本仓库历史可考）
 
-> **验证状态**：插件清单经 `zcode.cjs plugins validate` 通过；review-loops 两轮审查完成；git 市场添加、插件安装、MCP 与技能注册已实测。持久化新增 3 项契约测试（读取链优先级与损坏报告；脚本保存/查询/拒绝与数组连接库兼容；环境变量覆盖两侧一致），经两轴独立审查修复默认值文件错误分级、数组库兼容与写读一致后，setup 套件 22 项、全量 Node 回归 352 项（335 过 / 0 挂 / 17 跳）通过；工具定义 7 KiB 预算契约保持。setup 技能的依赖构建与远端接入待用户验收，离线包随正式发布提供。
+> **验证状态**：插件清单经 `zcode.cjs plugins validate` 通过；review-loops 三轮审查收口（轮 3 无新问题）；git 市场添加、插件安装、MCP 与技能注册已实测。持久化新增 3 项契约测试（读取链优先级与损坏报告；脚本保存/查询/拒绝与数组连接库兼容；环境变量覆盖两侧一致），经两轴独立审查修复默认值文件错误分级、数组库兼容、协议面测试家目录隔离与写读一致后，setup 套件 22 项、全量 Node 回归 352 项（335 过 / 0 挂 / 17 跳）通过；工具定义 7 KiB 预算契约保持。setup 技能的依赖构建与远端接入待用户验收，离线包随本版 Release 提供。
 
 ## [2.5.2] - 2026-10-12
 
@@ -250,6 +250,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.5.3]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.2...v2.5.3
 [2.5.2]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.4.1...v2.5.0

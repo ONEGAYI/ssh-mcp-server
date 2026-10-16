@@ -16,6 +16,7 @@
 - v2.5.1 将新读取凭据缩短为 14 字符，兼容旧 32 位编号并保留读后写校验（PR #44）；新增 6 项契约测试与两轴独立审查通过，真实客户端复制准确率仍待用户验收。升级须重启共用绑定的旧 MCP 进程；随机空间降为 60 位。规格见 `docs/design/short-read-token-spec.md`。
 - v2.5.2 修复隐式读取凭据选择（PR #46）：remote_edit 省略 readToken 时按当前会话和规范文件路径使用最新凭据，原有范围、版本与有效期校验继续生效；显式错误凭据不自动回退。新增 6 项契约测试，Node 330 项、WSL Python 215 项通过；另一台电脑的真实客户端与 CentOS 7 仍待用户验收。
 - ZCode 插件化已合入 main（PR #49，随 v2.5.3）：仓库根即插件根，根级 `marketplace.json` 作单插件市场，`plugin-skills/setup` 引导 npm 依赖与构建，`.agents/skills/release` 沉淀维护者发布流程；review-loops 两轮审查与官方清单校验通过，git 市场添加、插件安装、MCP 与技能注册已实测。因 ZCode 宿主自动发现根级 `skills/` 目录注册技能，上游 `ssh-mcp-helper` 配置向导已移除（上游仓库可考）。setup 技能另含 `set-default-config` 脚本与 remote_setup 默认配置读取（显式路径 > 已存默认 > 启动参数，写入入口仅在技能脚本，`SSH_MCP_SETUP_DEFAULTS` 两侧一致），新增 3 项契约测试，setup 套件 22 项、全量 Node 352 项通过；依赖构建与远端接入待用户验收。
+- v2.5.3 发布 ZCode 插件化与默认 SSH 配置持久化（PR #49、#50、#51，Release 附 ssh-mcp-2.5.3-offline.zip）：review-loops 三轮审查收口（轮 3 无新问题，含协议面测试家目录隔离与空串环境变量归一）；Node 352 项（335 过 / 0 挂 / 17 跳）、WSL Python 215 项通过；插件渠道真实依赖构建、持久化日常使用与远端接入待用户验收。
 - 保留边界：用户已人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
