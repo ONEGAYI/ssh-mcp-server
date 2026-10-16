@@ -1,0 +1,10 @@
+{
+  "name": "ssh-mcp-server",
+  "version": "2.5.2",
+  "description": "基于 SSH 的远程开发 MCP 服务器：setup 引导接入、受保护文件操作、持久任务与断线恢复",
+  "author": { "name": "ONEGAYI" },
+  "homepage": "https://github.com/ONEGAYI/ssh-mcp-server#readme",
+  "license": "ISC",
+  "skills": "./skills",
+  "mcpServers": "./.mcp.json"
+}

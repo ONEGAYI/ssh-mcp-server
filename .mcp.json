@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ssh-mcp-setup": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${ZCODE_PLUGIN_ROOT}/build/index.js", "--setup"]
+    }
+  }
+}

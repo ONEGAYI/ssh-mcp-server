@@ -1,0 +1,17 @@
+{
+  "name": "ssh-mcp-server",
+  "plugins": [
+    {
+      "name": "ssh-mcp-server",
+      "source": "./",
+      "version": "2.5.2",
+      "description": "SSH-based MCP Server (基于 SSH 的 MCP 服务器)",
+      "displayName": "SSH MCP Server",
+      "displayName_i18n": { "zh-CN": "SSH MCP 服务器" },
+      "description_i18n": {
+        "zh-CN": "基于 SSH 的远程开发 MCP 服务器：setup 引导接入、受保护文件操作、持久任务与断线恢复；安装后运行 setup 技能完成依赖构建"
+      },
+      "category": "developer-tools"
+    }
+  ]
+}
