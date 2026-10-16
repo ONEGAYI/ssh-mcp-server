@@ -590,3 +590,71 @@ it('configure writes no markdown and reclaims legacy generated docs across three
     assert.ok(result.legacyDocs.kept.some(e => e.path.endsWith('CLAUDE.md')), 'non-generated CLAUDE.md is reported as kept');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+it('a saved default library feeds list_connections and configure without asking for the path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-default-config-'));
+  const defaultsPath = join(root, 'setup-defaults.json');
+  try {
+    const auth = join(root, 'ssh.json');
+    const auth2 = join(root, 'ssh2.json');
+    const startup = join(root, 'startup.json');
+    const writeLibrary = (path, names) => writeFile(path, JSON.stringify(Object.fromEntries(
+      names.map(name => [name, { host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture' }]))));
+    await writeLibrary(auth, ['vm']);
+    await writeLibrary(auth2, ['alt']);
+    await writeLibrary(startup, ['startupOnly']);
+    await writeFile(defaultsPath, JSON.stringify({ sshConfigFile: auth }) + '\n');
+    // Omitted sshConfigFile resolves to the saved default, not the startup argument.
+    const listed = await setupFromTool({ action: 'list_connections' }, startup, defaultsPath);
+    assert.equal(listed.status, 'connections_listed');
+    assert.deepEqual(listed.connections, ['vm']);
+    // An explicit library still wins over the saved default.
+    const explicit = await setupFromTool({ action: 'list_connections', sshConfigFile: auth2 }, undefined, defaultsPath);
+    assert.deepEqual(explicit.connections, ['alt']);
+    // configure picks up the saved default without asking for a library path.
+    const configured = await configureFromTool({ localRoot: root, remoteRoot: '/src', remoteStateDir: '/state',
+      localStateDir: join(root, 'state'), connectionName: 'vm' }, undefined, defaultsPath);
+    assert.equal(configured.status, 'configured');
+    assert.equal(JSON.parse(await readFile(configured.profilePath, 'utf8')).sshConfigFile, auth);
+    // A corrupt defaults file is reported instead of silently ignored.
+    await writeFile(defaultsPath, '{ broken');
+    await assert.rejects(setupFromTool({ action: 'list_connections' }, undefined, defaultsPath), { code: 'SETUP_INVALID_CONFIG' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('the setup skill script persists and reports the default library path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-default-script-'));
+  const defaultsPath = join(root, 'setup-defaults.json');
+  const script = fileURLToPath(new URL('../plugin-skills/setup/scripts/set-default-config.mjs', import.meta.url));
+  const run = args => { const result = spawnSync(process.execPath, [script, ...args],
+    { env: { ...process.env, SSH_MCP_SETUP_DEFAULTS: defaultsPath }, encoding: 'utf8' });
+    return { status: result.status, output: JSON.parse(result.stdout.trim()) }; };
+  try {
+    // --show before any default exists reports null without failing.
+    const empty = run(['--show']);
+    assert.equal(empty.status, 0);
+    assert.equal(empty.output.sshConfigFile, null);
+    // Relative paths and missing files are rejected without writing.
+    for (const bad of [['relative.json'], [join(root, 'missing.json')]]) {
+      const rejected = run(bad);
+      assert.equal(rejected.status, 1, JSON.stringify(rejected));
+      assert.equal(rejected.output.ok, false);
+    }
+    const blankLibrary = join(root, 'blank.json');
+    await writeFile(blankLibrary, '{}');
+    assert.equal(run([blankLibrary]).status, 1);
+    await assert.rejects(readFile(defaultsPath), { code: 'ENOENT' });
+    // A valid library persists only its path and --show reads it back.
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ vm: { host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture' } }));
+    const saved = run([auth]);
+    assert.equal(saved.status, 0);
+    assert.equal(saved.output.sshConfigFile, auth);
+    assert.equal(JSON.parse(await readFile(defaultsPath, 'utf8')).sshConfigFile, auth);
+    const shown = run(['--show']);
+    assert.equal(shown.status, 0);
+    assert.equal(shown.output.sshConfigFile, auth);
+    // The script never copies credentials into the defaults file.
+    assert.doesNotMatch(await readFile(defaultsPath, 'utf8'), /fixture|password/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
