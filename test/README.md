@@ -28,7 +28,7 @@ test/
 ├── recovery-hook.test.js          # 恢复钩子注入与离线纪律
 ├── session-context.test.js        # 根规则、技能目录、宿主选择与有界失败
 ├── session-integration.test.js    # 每绑定开关、ZCode/Codex 配置与移除
-├── job-cli.test.js                # job CLI 本地行为
+├── job-cli.test.js                # job CLI 本地行为与传输高级调参
 ├── job-cli-remote.test.js         # job CLI 与远端协议
 ├── task-service.test.js           # 本地任务登记/确认/pendingAcross
 ├── transfer-service.test.js       # 传输事务：断点续传、预算、恢复、pendingAcross

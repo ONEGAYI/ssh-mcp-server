@@ -13,6 +13,7 @@ const entry = fileURLToPath(new URL('../build/index.js', import.meta.url));
 const cli = fileURLToPath(new URL('../build/cli/job.js', import.meta.url));
 const preload = new URL('./fixtures/background-transport.mjs', import.meta.url).href;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+const MiB = 1024 * 1024; // Independent of the implementation: default-sized blocks keep multi-block fault coverage.
 async function fixture(lostRegister = false, lostVerify = false, initFailure = false, lostStart = false, stateFault = '') {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-background-'));
   const profile = join(root, 'workspace.json');
@@ -44,10 +45,10 @@ async function fixture(lostRegister = false, lostVerify = false, initFailure = f
 it('a transient Windows refusal to replace download progress is retried without failing the transfer', { skip: process.platform !== 'win32' }, async () => {
   const f = await fixture(false, false, false, false, 'once');
   try {
-    const data = Buffer.alloc(65536 * 3 + 29, 0x45);
+    const data = Buffer.alloc(MiB * 3 + 29, 0x45);
     await writeFile(join(f.root, 'remote-source.bin'), data);
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     await f.wait(started.transferId);
     assert.equal(await readFile(join(f.root, 'state-faults.log'), 'utf8'), 'EPERM\n');
     assert.deepEqual(await readFile(localPath), data);
@@ -58,10 +59,10 @@ it('a transient Windows refusal to replace download progress is retried without 
 it('a persistent Windows state-file refusal pauses the driver and retains a resumable download', { skip: process.platform !== 'win32' }, async () => {
   const f = await fixture(false, false, false, false, 'persistent');
   try {
-    const data = Buffer.alloc(65536 * 3 + 19, 0x57);
+    const data = Buffer.alloc(MiB * 3 + 19, 0x57);
     await writeFile(join(f.root, 'remote-source.bin'), data);
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     const deadline = Date.now() + 10000;
     let status;
     for (;;) {
@@ -79,7 +80,7 @@ it('a persistent Windows state-file refusal pauses the driver and retains a resu
     assert.ok(status.error.dest.endsWith('record.json'));
     const record = JSON.parse(await readFile(join(f.records, started.transferId, 'record.json'), 'utf8'));
     assert.equal(record.state, 'transferring');
-    assert.ok((await stat(record.tempPath)).size >= 65536, 'persisted receiver data must be kept');
+    assert.ok((await stat(record.tempPath)).size >= MiB, 'persisted receiver data must be kept');
     await assert.rejects(stat(localPath), { code: 'ENOENT' });
     const pausedWait = await new Promise((resolve, reject) => {
       const child = spawn(process.execPath, ['--import', preload, cli, 'transfer', 'wait', '--workspace', f.profile,
@@ -106,10 +107,10 @@ it('a persistent Windows state-file refusal pauses the driver and retains a resu
 it('a remotely committed upload cannot be acknowledged until its paused local result converges', { skip: process.platform !== 'win32' }, async () => {
   const f = await fixture(false, false, false, false, 'complete-denied');
   try {
-    const data = Buffer.alloc(65536 + 17, 0x36);
+    const data = Buffer.alloc(MiB + 17, 0x36);
     const localPath = join(f.root, 'source.bin');
     await writeFile(localPath, data);
-    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin', chunkSize: 65536 });
+    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin' });
     const deadline = Date.now() + 10000;
     let status;
     for (;;) {
@@ -194,9 +195,9 @@ it('explicit cancellation starts the paused driver without waiting for its data-
 for (const fault of ['eio', 'data-denied']) it(`a ${fault} filesystem failure stays terminal and cannot revive through resume`, async () => {
   const f = await fixture(false, false, false, false, fault);
   try {
-    await writeFile(join(f.root, 'remote-source.bin'), Buffer.alloc(65536 + 7, 0x19));
+    await writeFile(join(f.root, 'remote-source.bin'), Buffer.alloc(MiB + 7, 0x19));
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     const deadline = Date.now() + 4000;
     let status;
     for (;;) {
@@ -256,10 +257,10 @@ it('wait and resume return an unknown publication outcome without requesting ack
 it('an upload continues after the MCP exits and a background waiter returns its verified result', async () => {
   const f = await fixture();
   try {
-    const data = Buffer.alloc(65536 * 4 + 31, 0xa7);
+    const data = Buffer.alloc(MiB * 4 + 31, 0xa7);
     const localPath = join(f.root, 'source.bin');
     await writeFile(localPath, data);
-    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin', chunkSize: 65536 });
+    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin' });
     assert.equal(started.state, 'preparing');
     const pending = await f.call('remote_transfer_pending', {});
     assert.equal(pending.transfers[0].transferId, started.transferId);
@@ -274,10 +275,10 @@ it('an upload continues after the MCP exits and a background waiter returns its 
 it('a download reports unknown total size during preparation and commits identical bytes', async () => {
   const f = await fixture();
   try {
-    const data = Buffer.alloc(65536 * 3 + 17, 0x93);
+    const data = Buffer.alloc(MiB * 3 + 17, 0x93);
     await writeFile(join(f.root, 'remote-source.bin'), data);
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     assert.equal(started.totalBytesKnown, false);
     assert.equal(started.state, 'preparing');
     await f.wait(started.transferId);
@@ -294,10 +295,10 @@ it('a download reports unknown total size during preparation and commits identic
 it('a lost registration response resumes the same identifier without a second registration', async () => {
   const f = await fixture(true);
   try {
-    const data = Buffer.alloc(65536 + 7, 0x42);
+    const data = Buffer.alloc(MiB + 7, 0x42);
     const localPath = join(f.root, 'source.bin');
     await writeFile(localPath, data);
-    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin', chunkSize: 65536 });
+    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin' });
     await f.wait(started.transferId);
     assert.deepEqual((await readFile(join(f.root, 'registrations.log'), 'utf8')).trim().split('\n'), [started.transferId]);
     assert.deepEqual(await readFile(join(f.root, 'remote-target.bin')), data);
@@ -308,8 +309,8 @@ it('cancellation is confirmed by the upload driver and never reports the request
   const f = await fixture();
   try {
     const localPath = join(f.root, 'source.bin');
-    await writeFile(localPath, Buffer.alloc(65536 * 8, 0x61));
-    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin', chunkSize: 65536 });
+    await writeFile(localPath, Buffer.alloc(MiB * 8, 0x61));
+    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin' });
     const deadline = Date.now() + 3000;
     while (JSON.parse(await readFile(join(f.records, started.transferId, 'record.json'), 'utf8')).confirmedOffset === 0) {
       assert.ok(Date.now() < deadline); await pause(20);
@@ -329,10 +330,10 @@ it('cancellation is confirmed by the upload driver and never reports the request
 it('a killed download driver is recovered by concurrent waiters with one receiver and the original id', async () => {
   const f = await fixture();
   try {
-    const data = Buffer.alloc(65536 * 8 + 1, 0xc1);
+    const data = Buffer.alloc(MiB * 8 + 1, 0xc1);
     await writeFile(join(f.root, 'remote-source.bin'), data);
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     const directory = join(f.records, started.transferId);
     const deadline = Date.now() + 3000;
     while (JSON.parse(await readFile(join(directory, 'record.json'), 'utf8')).confirmedOffset === 0) {
@@ -354,10 +355,10 @@ it('a killed download driver is recovered by concurrent waiters with one receive
 it('a transport break during download verification stays resumable instead of consuming a failed result', async () => {
   const f = await fixture(false, true);
   try {
-    const data = Buffer.alloc(65536 + 51, 0x37);
+    const data = Buffer.alloc(MiB + 51, 0x37);
     await writeFile(join(f.root, 'remote-source.bin'), data);
     const localPath = join(f.root, 'download.bin');
-    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath, chunkSize: 65536 });
+    const started = await f.call('remote_download', { action: 'start', path: 'source.bin', localPath });
     await f.wait(started.transferId);
     assert.deepEqual(await readFile(localPath), data);
   } finally { await f.close(); }
@@ -366,10 +367,10 @@ it('a transport break during download verification stays resumable instead of co
 it('an upload prepared before remote start can resume the original identifier', async () => {
   const f = await fixture(false, false, false, true);
   try {
-    const data = Buffer.alloc(65536 + 1, 0x57);
+    const data = Buffer.alloc(MiB + 1, 0x57);
     const localPath = join(f.root, 'source.bin');
     await writeFile(localPath, data);
-    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin', chunkSize: 65536 });
+    const started = await f.call('remote_upload', { action: 'start', localPath, path: 'target.bin' });
     await f.wait(started.transferId);
     assert.deepEqual(await readFile(join(f.root, 'remote-target.bin')), data);
   } finally { await f.close(); }

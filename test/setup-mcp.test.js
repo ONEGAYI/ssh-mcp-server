@@ -164,6 +164,8 @@ it('setup MCP accepts bindingName and directoryScope through the protocol surfac
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
     const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
     assert.ok(tool, 'remote_setup is advertised');
+    const definitionBytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
+    assert.ok(definitionBytes <= 7 * 1024, `setup tool definition exceeds 7 KiB: ${definitionBytes}`);
     assert.ok(!tool.description.includes('First-time'), 'setup must read as repeatable, not one-shot');
     assert.ok(tool.description.includes('bindingName'), 'the description points at additional bindings');
     assert.ok(!JSON.stringify(tool.inputSchema).includes('legacy'), 'field docs avoid maintainer jargon');

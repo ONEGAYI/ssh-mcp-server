@@ -89,6 +89,32 @@ it('remote_help explains background transfer start, recovery, acknowledgement an
   } finally { await f.close(); }
 });
 
+it('MCP transfer tools reject retired tuning fields instead of silently using defaults', async () => {
+  const f = await fixture(true);
+  try {
+    const transferId = 'a'.repeat(32);
+    await f.seed(transferId, 'session-own');
+    for (const name of ['remote_upload', 'remote_download']) {
+      for (const [field, value] of [['chunkSize', 65536], ['budgetMs', 1000]]) {
+        const result = await f.client.callTool({ name, arguments: {
+          sessionId: 'session-own', action: 'status', transferId, [field]: value,
+        } });
+        assert.equal(result.isError, true, `${name} must reject ${field}`);
+        assert.match(result.content[0].text, /Input validation error/);
+        assert.ok(result.content[0].text.includes(field), field);
+        assert.match(result.content[0].text, /CLI --chunk-size\/--budget/);
+      }
+    }
+    const tools = (await f.client.listTools()).tools;
+    for (const name of ['remote_upload', 'remote_download']) {
+      const tool = tools.find(entry => entry.name === name);
+      assert.equal(tool.inputSchema.properties.chunkSize, undefined);
+      assert.equal(tool.inputSchema.properties.budgetMs, undefined);
+      assert.equal(tool.inputSchema.additionalProperties, false);
+    }
+  } finally { await f.close(); }
+});
+
 it('local path refusals explain the allowed root without granting temporary-directory access', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-path-guidance-'));
   try {

@@ -37,6 +37,13 @@ async function legacyTransferStart(sessionId, direction, localPath, remotePath, 
   return { error: undefined, data: JSON.parse(stdout.trim()) };
 }
 
+async function legacyTransferResume(sessionId, transferId, budgetMs) {
+  const { stdout } = await execFileAsync(process.execPath, [fileURLToPath(new URL('../build/cli/job.js', import.meta.url)),
+    'transfer', 'resume', '--workspace', profile, '--session', sessionId, '--transfer-id', transferId,
+    '--budget', String(budgetMs)], { timeout: budgetMs + 60000, windowsHide: true });
+  return { error: undefined, data: JSON.parse(stdout.trim()) };
+}
+
 /** Register, start and wait for one shell task on the remote, asserting a
  * clean exit. Issue #20 retired remote_delete/remote_move (ADR 0007), so the
  * cases below clean up through this registered execute task — the shell
@@ -272,7 +279,7 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
     for (let attempt = 0; attempt < 5; attempt++) {
       const step = attempt === 0
         ? await legacyTransferStart(sessionId, 'upload', localPath, remoteName)
-        : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
+        : await legacyTransferResume(sessionId, partial.data.transferId, 1000);
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
       if (partial.data.state !== 'transferring' || partial.data.budgetExhausted !== true) break;
@@ -288,7 +295,7 @@ it('real workspace uploads 200 MiB resumably and resends only unconfirmed data (
     assert.equal(observed.data.confirmedOffset, confirmedBefore);
     assert.equal(observed.data.totalBytes, size);
     // Resume finishes the upload; only the unconfirmed tail is resent.
-    const done = await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, budgetMs: 240000 });
+    const done = await legacyTransferResume(sessionId, partial.data.transferId, 240000);
     assert.equal(done.error, undefined, JSON.stringify(done));
     assert.equal(done.data.state, 'completed');
     assert.equal(done.data.bytesWritten, size);
@@ -343,7 +350,7 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     for (let attempt = 0; attempt < 5; attempt++) {
       const step = attempt === 0
         ? await legacyTransferStart(sessionId, 'download', localPath, remoteName)
-        : await call('remote_download', { action: 'resume', transferId: partial.data.transferId, budgetMs: 1000 });
+        : await legacyTransferResume(sessionId, partial.data.transferId, 1000);
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
       if (partial.data.state !== 'transferring' || partial.data.budgetExhausted !== true) break;
@@ -359,12 +366,11 @@ it('real workspace downloads 200 MiB resumably with matching digests and no half
     assert.equal(observed.data.state, 'transferring');
     assert.equal(observed.data.confirmedOffset, confirmedBefore);
     assert.equal(observed.data.totalBytes, size);
-    // Resume finishes the download in bounded steps, each call staying under
-    // the MCP client's 60 s request timeout; only the unconfirmed tail is
-    // ever refetched, so the summed block count pins the precision.
+    // CLI resumes with a custom budget; only the unconfirmed tail is ever
+    // refetched, so the summed block count pins the precision.
     let done, refetched = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
-      const step = await call('remote_download', { action: 'resume', transferId: partial.data.transferId, budgetMs: 50000 });
+      const step = await legacyTransferResume(sessionId, partial.data.transferId, 50000);
       assert.equal(step.error, undefined, JSON.stringify(step));
       done = step;
       refetched += done.data.blocksFetched ?? 0;
@@ -436,7 +442,7 @@ it('real workspace MCP cancels mid-flight transfers, never rolls back commits an
     for (let attempt = 0; attempt < 6; attempt++) {
       const step = attempt === 0
         ? await legacyTransferStart(sessionId, 'upload', localPath, remoteName, 65536)
-        : await call('remote_upload', { action: 'resume', transferId: partial.data.transferId, chunkSize: 65536, budgetMs: 1000 });
+        : await legacyTransferResume(sessionId, partial.data.transferId, 1000);
       assert.equal(step.error, undefined, JSON.stringify(step));
       partial = step;
       if (partial.data.state === 'transferring' && partial.data.budgetExhausted === true
