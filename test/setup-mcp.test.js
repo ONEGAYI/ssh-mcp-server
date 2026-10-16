@@ -14,6 +14,10 @@ import { TaskService } from '../build/services/task-service.js';
 import * as setupServer from '../build/core/setup-server.js';
 const { configureFromTool, setupFromTool } = setupServer;
 
+// Spawned setup servers must never pick up a default library saved in the
+// real home directory; every protocol test points the variable at a missing file.
+const noSavedDefault = root => ({ ...process.env, SSH_MCP_SETUP_DEFAULTS: join(root, 'no-defaults.json') });
+
 it('setup advertises an explicit read-only connection listing from the startup JSON library', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-list-connections-'));
   const client = new Client({ name: 'connection-list-contract', version: '1' });
@@ -23,7 +27,8 @@ it('setup advertises an explicit read-only connection listing from the startup J
       build: { host: 'other.example', port: 22, username: 'private-user', password: 'list-secret' } });
     await writeFile(auth, content);
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
     assert.ok(tool.inputSchema.properties.action.enum.includes('list_connections'));
     assert.match(tool.description, /list_connections/);
@@ -139,7 +144,8 @@ it('setup reuses a startup SSH config and reveals connection names without crede
     await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'never-show-secret' },
       build: { host: '127.0.0.2', port: 22, username: 'test', password: 'never-show-secret' } }));
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const missing = await client.callTool({ name: 'remote_setup', arguments: {} });
     assert.equal(missing.isError, undefined, JSON.stringify(missing));
     assert.doesNotMatch(JSON.stringify(missing), /never-show-secret/);
@@ -164,7 +170,8 @@ it('setup MCP accepts bindingName and directoryScope through the protocol surfac
     const auth = join(root, 'ssh.json');
     await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'fixture' } }));
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
     assert.ok(tool, 'remote_setup is advertised');
     const definitionBytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
@@ -202,7 +209,8 @@ it('setup MCP asks for missing inputs and prepares project integration without m
   const client = new Client({ name: 'setup-contract', version: '1' });
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     assert.ok((await client.listTools()).tools.some(tool => tool.name === 'remote_setup'));
     const call = async args => {
       const result = await client.callTool({ name: 'remote_setup', arguments: args });
@@ -256,7 +264,8 @@ it('setup refuses a project config directory redirected outside the selected wor
     await writeFile(join(outside, 'config.json'), '{}');
     await symlink(outside, join(project, '.zcode'), process.platform === 'win32' ? 'junction' : 'dir');
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const result = await client.callTool({ name: 'remote_setup', arguments: { localRoot: project, remoteRoot: '/work', remoteStateDir: '/state',
       host: '127.0.0.1', username: 'test', sshAgent: 'pageant' } });
     assert.equal(result.isError, true);
@@ -269,7 +278,8 @@ it('setup accepts host and SSH agent details without requiring a separate SSH co
   const client = new Client({ name: 'inline-contract', version: '1' });
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const result = await client.callTool({ name: 'remote_setup', arguments: { localRoot: root, remoteRoot: '/work', remoteStateDir: '/state',
       host: '127.0.0.1', port: 1, username: 'test', sshAgent: 'pageant' } });
     assert.equal(result.isError, undefined, JSON.stringify(result));
@@ -502,7 +512,8 @@ it('setup MCP exposes inspect and update through the protocol surface', async ()
     const auth = join(root, 'ssh.json');
     await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'test', password: 'protocol-secret' } }));
     await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe' }));
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup', '--config-file', auth], stderr: 'pipe',
+      env: noSavedDefault(root) }));
     const tool = (await client.listTools()).tools.find(entry => entry.name === 'remote_setup');
     assert.ok(tool, 'remote_setup is advertised');
     const properties = Object.keys(tool.inputSchema.properties);
@@ -682,6 +693,13 @@ it('the setup skill script persists and reports the default library path', async
     // The script never copies credentials into the defaults file.
     await writeFile(defaultsPath, JSON.stringify({ sshConfigFile: auth }) + '\n');
     assert.doesNotMatch(await readFile(defaultsPath, 'utf8'), /fixture|password/);
+    // An empty SSH_MCP_SETUP_DEFAULTS counts as unset: both ends fall back to
+    // the home default together instead of the writer failing on an empty path.
+    const unsetEnv = spawnSync(process.execPath, [script, auth], { encoding: 'utf8',
+      env: { ...process.env, SSH_MCP_SETUP_DEFAULTS: '', USERPROFILE: root, HOME: root } });
+    assert.equal(unsetEnv.status, 0, unsetEnv.stdout + unsetEnv.stderr);
+    assert.equal(JSON.parse(unsetEnv.stdout).defaultsPath, join(root, '.ssh-mcp-setup-defaults.json'));
+    assert.equal(JSON.parse(await readFile(join(root, '.ssh-mcp-setup-defaults.json'), 'utf8')).sshConfigFile, auth);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

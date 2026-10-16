@@ -6,7 +6,8 @@ import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
-const defaultsPath = process.env.SSH_MCP_SETUP_DEFAULTS ?? join(homedir(), ".ssh-mcp-setup-defaults.json");
+// Empty counts as unset so both ends fall back to the home default together.
+const defaultsPath = process.env.SSH_MCP_SETUP_DEFAULTS || join(homedir(), ".ssh-mcp-setup-defaults.json");
 const args = process.argv.slice(2);
 const say = value => { console.log(JSON.stringify(value)); };
 const fail = message => { say({ ok: false, error: message }); process.exitCode = 1; };

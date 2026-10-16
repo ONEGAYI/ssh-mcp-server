@@ -255,8 +255,8 @@ function connectionNames(sshConfigFile: string): Promise<string[]> {
 /** Machine-level default library path; kept outside the maintained
  * ~/.ssh-mcp-agent state directory so retention cycles never touch it.
  * The setup skill's set-default-config script is the writing entry;
- * SSH_MCP_SETUP_DEFAULTS keeps both ends on the same file. */
-const setupDefaultsPath = () => process.env.SSH_MCP_SETUP_DEFAULTS ?? join(homedir(), ".ssh-mcp-setup-defaults.json");
+ * SSH_MCP_SETUP_DEFAULTS keeps both ends on the same file (empty counts as unset). */
+const setupDefaultsPath = () => process.env.SSH_MCP_SETUP_DEFAULTS || join(homedir(), ".ssh-mcp-setup-defaults.json");
 
 /** Reads the saved default SSH MCP JSON library path; ENOENT means none. */
 async function readDefaultConfig(defaultsPath: string): Promise<string | undefined> {
