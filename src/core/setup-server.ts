@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, resolve } from "node:path";
 import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
@@ -251,11 +252,38 @@ function connectionNames(sshConfigFile: string): Promise<string[]> {
   });
 }
 
-async function listConnectionsFromTool(input: SetupInput, defaultSshConfigFile?: string) {
-  const sshConfigFile = input.sshConfigFile ?? defaultSshConfigFile;
+/** Machine-level default library path; kept outside the maintained
+ * ~/.ssh-mcp-agent state directory so retention cycles never touch it.
+ * The setup skill's set-default-config script is the writing entry;
+ * SSH_MCP_SETUP_DEFAULTS keeps both ends on the same file (empty counts as unset). */
+const setupDefaultsPath = () => process.env.SSH_MCP_SETUP_DEFAULTS || join(homedir(), ".ssh-mcp-setup-defaults.json");
+
+/** Reads the saved default SSH MCP JSON library path; ENOENT means none. */
+async function readDefaultConfig(defaultsPath: string): Promise<string | undefined> {
+  let text: string;
+  try { text = await readFile(defaultsPath, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new RemoteAgentError("SETUP_INVALID_CONFIG", `Could not read the default SSH config file ${defaultsPath} (${(error as NodeJS.ErrnoException).code ?? error}); fix the file access or delete that file`);
+  }
+  try {
+    const value = (JSON.parse(text) as { sshConfigFile?: unknown })?.sshConfigFile;
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || !isAbsolute(value)) {
+      throw new RemoteAgentError("SETUP_INVALID_CONFIG", `The saved default sshConfigFile in ${defaultsPath} is not an absolute path; fix or delete that file`);
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof RemoteAgentError) throw error;
+    throw new RemoteAgentError("SETUP_INVALID_CONFIG", `The default SSH config file ${defaultsPath} is not valid JSON; fix or delete that file`);
+  }
+}
+
+async function listConnectionsFromTool(input: SetupInput, defaultSshConfigFile?: string, defaultsPath?: string) {
+  const sshConfigFile = input.sshConfigFile ?? (defaultsPath ? await readDefaultConfig(defaultsPath) : undefined) ?? defaultSshConfigFile;
   if (!sshConfigFile) return {
     status: "needs_input", connections: [],
-    questions: [{ fields: ["sshConfigFile"], question: "请提供已登记服务器的 SSH MCP JSON 配置文件绝对路径；或为 setup 启动参数指定 --config-file。" }],
+    questions: [{ fields: ["sshConfigFile"], question: "请提供已登记服务器的 SSH MCP JSON 配置文件绝对路径；或用 setup 技能的 set-default-config 脚本持久化默认路径，此后不再重复提供。" }],
     instructions: "Ask only for the SSH MCP JSON configuration path, then call remote_setup action='list_connections' again with sshConfigFile. Do not search ~/.ssh or infer an OpenSSH config path: that is a different configuration format. No files were written and no SSH connection was made.",
   };
   return {
@@ -264,19 +292,21 @@ async function listConnectionsFromTool(input: SetupInput, defaultSshConfigFile?:
   };
 }
 /** Single entry the MCP tool calls; dispatches on the optional action field. */
-export async function setupFromTool(input: SetupInput, defaultSshConfigFile?: string) {
+export async function setupFromTool(input: SetupInput, defaultSshConfigFile?: string, defaultsPath: string = setupDefaultsPath()) {
   const action = input.action ?? "configure";
-  if (action === "list_connections") return listConnectionsFromTool(input, defaultSshConfigFile);
+  if (action === "list_connections") return listConnectionsFromTool(input, defaultSshConfigFile, defaultsPath);
   if (action === "inspect") return inspectFromTool(input);
   if (action === "update") return updateFromTool(input);
   if (action === "remove") return removeFromTool(input);
-  return configureFromTool(input, defaultSshConfigFile);
+  return configureFromTool(input, defaultSshConfigFile, defaultsPath);
 }
 
-export async function configureFromTool(input: SetupInput, defaultSshConfigFile?: string) {
-  // Explicit per-call SSH settings override the setup service's preset library.
-  if (!input.sshConfigFile && !hasExplicitSsh(input) && defaultSshConfigFile) {
-    input = { ...input, sshConfigFile: defaultSshConfigFile };
+export async function configureFromTool(input: SetupInput, defaultSshConfigFile?: string, defaultsPath?: string) {
+  // Explicit per-call SSH settings win; then the saved machine default; the
+  // setup service's startup library is only the last fallback.
+  if (!input.sshConfigFile && !hasExplicitSsh(input)) {
+    const fallback = (defaultsPath ? await readDefaultConfig(defaultsPath) : undefined) ?? defaultSshConfigFile;
+    if (fallback) input = { ...input, sshConfigFile: fallback };
   }
   const questions: Array<{ fields: string[]; question: string }> = [];
   checkBindingName(input);
@@ -359,7 +389,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "Use remote_setup for binding configuration, not remote commands. Call without arguments to discover missing inputs; ask the user and reuse confirmed values. list_connections reads JSON connection names from --config-file or sshConfigFile; never search ~/.ssh or request passwords/private-key contents. inspect precedes update/remove; remove requires explicit user request. Use the generated workspace MCP for daily work; keep client hook trust enabled.",
+    instructions: "Use remote_setup for binding configuration, not remote commands. Call without arguments to discover missing inputs; ask the user and reuse confirmed values. list_connections reads JSON connection names from sshConfigFile, the saved machine default, or --config-file; never search ~/.ssh or request passwords/private-key contents. inspect precedes update/remove; remove requires explicit user request. Use the generated workspace MCP for daily work; keep client hook trust enabled.",
   });
   server.registerTool("remote_setup", { description: "Configure/manage one project SSH binding without SSH access. Missing fields return questions; ask the user, never guess credentials or paths. list_connections lists JSON-library names without workspace paths. inspect returns sanitized config and revision; update/remove require it. update accepts only policy, directoryScope, pythonPath, clients and sessionStart. remove needs explicit user request and no unacknowledged tasks/transfers; external SSH config and remote state stay intact. A new target needs a new bindingName.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async input => {

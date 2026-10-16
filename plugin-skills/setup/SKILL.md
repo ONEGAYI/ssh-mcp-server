@@ -33,7 +33,24 @@ description: 安装或升级 ssh-mcp-server 插件的 npm 依赖并完成构建�
 
 > 请调用 remote_setup，询问缺少的 SSH 和目录信息，帮我初始化这个项目的远端开发工作区。
 
-之后的连接配置、项目绑定与日常使用见插件内的 `README.md` 与 `docs/design/usage.md`。
+若用户尚未持久化默认 SSH 配置且提供了配置文件路径，按"SSH 配置默认值持久化"一节顺带询问是否保存。之后的连接配置、项目绑定与日常使用见插件内的 `README.md` 与 `docs/design/usage.md`。
+
+## SSH 配置默认值持久化
+
+为避免每个新项目接入时重复提供 SSH MCP JSON 配置路径，用本技能自带的脚本保存本机默认值（保存在 `~/.ssh-mcp-setup-defaults.json`）：
+
+```bash
+node "<本技能目录>/scripts/set-default-config.mjs" "D:/Private/ssh-config.json"   # 保存默认
+node "<本技能目录>/scripts/set-default-config.mjs" --show                        # 查询当前默认
+```
+
+- **保存**：脚本先验证该 JSON 能解析出至少一个连接，再只把**路径**写入默认值文件（凭据、密码与私钥内容永远不写入）；验证失败时退出码非 0 且不写文件。
+- **生效**：此后 `remote_setup`（list_connections 与 configure）省略 `sshConfigFile` 时自动使用该默认，取值顺序为"显式传入路径 > 已保存默认 > `--config-file` 启动参数"。默认值文件损坏时 `remote_setup` 会报 `SETUP_INVALID_CONFIG`，修复或删除该文件即可。
+- **边界**：仅在用户提供路径并希望免重复时执行保存；已配置绑定的 profile 不受默认值影响，不要修改既有绑定记录。`SSH_MCP_SETUP_DEFAULTS` 环境变量可在脚本与 MCP 两侧覆盖默认值文件的保存与读取位置。
+
+新项目接入时可直接说：
+
+> 用默认 SSH 配置，调用 remote_setup 完成这个项目的绑定。
 
 ## 升级说明
 

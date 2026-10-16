@@ -4,7 +4,7 @@
 
 ## [2.5.3] - 2026-10-17
 
-本仓库可直接作为 ZCode 插件安装：仓库根即插件根，git 市场安装即得完整源码，安装后由插件 setup 技能引导完成 npm 依赖安装与构建。
+本仓库可直接作为 ZCode 插件安装：仓库根即插件根，git 市场安装即得完整源码，安装后由插件 setup 技能引导完成 npm 依赖安装与构建；并新增本机默认 SSH 配置持久化，保存一次连接库路径后每个新项目接入不再重复提供。
 
 ### 新功能
 
@@ -16,11 +16,17 @@
 - `.agents/skills/release` 技能（维护者向）：版本四处同步、CHANGELOG、离线包与 Release 核对
 - `package-lock.json` 入库，保证插件安装缓存内构建可复现
 
+**默认 SSH 配置持久化**
+
+- `plugin-skills/setup/scripts/set-default-config.mjs`：校验 SSH MCP JSON 连接库后仅保存其**路径**到 `~/.ssh-mcp-setup-defaults.json`（凭据永远留在连接库内），支持 `--show` 查询；`SSH_MCP_SETUP_DEFAULTS` 环境变量可覆盖保存位置
+- `remote_setup`（list_connections 与 configure）省略 `sshConfigFile` 时自动使用已保存默认，取值顺序：显式传入路径 > 已保存默认 > `--config-file` 启动参数；默认值文件损坏时报 `SETUP_INVALID_CONFIG` 并指明修复方式
+- 插件工具定义与对外接口保持不变（工具上下文零增长），写入入口仅在 setup 技能脚本
+
 ### 移除
 
 - 上游 `skills/ssh-mcp-helper` 配置向导：面向上游 npm 包与旧客户端接入模式，且 ZCode 宿主会自动发现并注册根级 `skills/` 目录，使其误入插件技能列表（内容于上游仓库与本仓库历史可考）
 
-> **验证状态**：插件清单经 `zcode.cjs plugins validate` 通过；review-loops 两轮审查完成；git 市场添加、插件安装、MCP 与技能注册已实测。setup 技能的依赖构建与远端接入待用户验收；离线包随正式发布提供。
+> **验证状态**：插件清单经 `zcode.cjs plugins validate` 通过；review-loops 两轮审查完成；git 市场添加、插件安装、MCP 与技能注册已实测。持久化新增 3 项契约测试（读取链优先级与损坏报告；脚本保存/查询/拒绝与数组连接库兼容；环境变量覆盖两侧一致），经两轴独立审查修复默认值文件错误分级、数组库兼容与写读一致后，setup 套件 22 项、全量 Node 回归 352 项（335 过 / 0 挂 / 17 跳）通过；工具定义 7 KiB 预算契约保持。setup 技能的依赖构建与远端接入待用户验收，离线包随正式发布提供。
 
 ## [2.5.2] - 2026-10-12
 
