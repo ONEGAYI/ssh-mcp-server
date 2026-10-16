@@ -5,6 +5,6 @@
   "author": { "name": "ONEGAYI" },
   "homepage": "https://github.com/ONEGAYI/ssh-mcp-server#readme",
   "license": "ISC",
-  "skills": "./skills",
+  "skills": "./plugin-skills",
   "mcpServers": "./.mcp.json"
 }
