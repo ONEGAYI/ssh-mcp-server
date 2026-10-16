@@ -44,6 +44,7 @@ const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 - remote_edit 的 editResults 计数与字节范围按 beforeVersion 解释；检查 rebased 和 concurrentReplayAvailable。并行历史上限为 10 分钟、128 次提交和 4 MiB，超限需重读；编辑保留 BOM、权限与 CRLF。
 - remote_workspace 的 includeStorage 返回小于 4 KiB 的两端空间摘要，包含占用、预留、上限、资源数量及最近维护记录；不可达端标记 unknown。
 - 旧传输登记的 resume 仍同步驱动，默认软预算 55 秒；通过当前宿主的后台 CLI 等待，预算不代表 MCP 等待超时或整个传输的时限。
+- MCP 上传、下载使用默认分块大小与驱动预算；需要自定义时用 CLI transfer start 的 --chunk-size / --budget，或 transfer resume 的 --budget。旧 MCP 调用若仍传 chunkSize 或 budgetMs 会被拒绝，不会静默改用默认值。
 `;
 
 export async function runWorkspaceServer(profile: string): Promise<void> {
@@ -72,9 +73,9 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
   const path = z.string().min(1).describe("Remote POSIX path, relative to remoteRoot; outside-root access requires unrestricted scope.");
   const readToken = z.string().optional().describe("Omit for the latest credential for this file and session; copy explicit tokens verbatim. Invalid explicit credentials never fall back.");
   const count = z.number().int().min(1).max(1000).optional();
-  const register = (name: string, description: string, schema: z.ZodRawShape,
+  const register = (name: string, description: string, schema: z.ZodRawShape | z.ZodObject,
     action: (input: Record<string, any>) => Promise<unknown>, online = true) => {
-    server.registerTool(name, { description, inputSchema: schema }, async input => {
+    server.registerTool(name, { description, inputSchema: schema }, async (input: Record<string, any>) => {
       try {
         if (online) await maintenance.maybeMaintain().catch(() => undefined);
         let result = await action(input);
@@ -108,8 +109,9 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
     ["remote_list", "file_list", "List immediate entries with stable query-scoped pagination."],
     ["remote_find", "file_find", "Recursive path glob against basename or relative path. Defaults: hidden included, gitignore ignored, .git excluded. Budget-stopped pages give a reason and nextCursor; no edit coverage. Details: remote_help."],
     ["remote_search", "file_search", "Literal case-sensitive UTF-8 content search. Defaults: hidden included, gitignore ignored, .git excluded. Partial pages give a reason and nextCursor; binary/undecodable files count as skippedFiles. No edit coverage. Details: remote_help."],
-  ]) register(name, description, { sessionId, path: path.optional(), pattern: z.string().optional(), filePattern: z.string().optional(), limit: count, cursor: z.string().optional(),
-    includeHidden: z.boolean().optional(), respectGitignore: z.boolean().optional() }, input => files.call(action, input.sessionId, input));
+  ]) register(name, description, { sessionId, path: path.optional(), pattern: z.string().optional(),
+    ...(name === "remote_search" ? { filePattern: z.string().optional() } : {}), limit: count, cursor: z.string().optional(),
+    ...(name !== "remote_list" ? { includeHidden: z.boolean().optional(), respectGitignore: z.boolean().optional() } : {}) }, input => files.call(action, input.sessionId, input));
   register("remote_edit", "Apply atomic exact replacements. Omit readToken for the latest file/session credential; invalid explicit tokens never fall back. Default requires a unique whole-file match; replace_all affects only non-overlapping token-covered matches. Same-session disjoint edits may rebase; conflicts require rereading. rereadRequired=true means committed: reread, do not replay. Details: remote_help.",
     { sessionId, path, readToken, edits: z.array(z.object({ oldText: z.string().min(1), newText: z.string(),
       replace_all: z.boolean().default(false).describe("Replace all non-overlapping matches wholly within this token's read ranges; false requires a unique whole-file match") })).min(1).max(100) }, input => files.call("file_edit", input.sessionId, input));
@@ -120,16 +122,15 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       // gate stays with the remote helper (remote/files.py) as the authority.
       text: z.string().max(64 * 1024 * 1024).optional(), data: z.string().max(64 * 1024 * 1024).optional() }, input => files.call("file_write", input.sessionId, input));
   register("remote_upload", "Guarded resumable upload. start returns preparing and transferId, not completion. Wait with ssh-mcp-job transfer wait using the ZCode/Codex recovery hook; see remote_help for recovery. Lost ID: remote_transfer_pending. Local source stays in localRoot/allowedLocalPaths. Replacement requires overwrite=true and metadataOnly expectedVersion. Inspect terminal results before nextAction/ack; status never consumes them.",
-    { sessionId,
+    z.strictObject({ sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
       localPath: z.string().optional().describe("Local source file (start only)"),
       path: path.optional().describe("Remote target path (start only)"),
       create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent; must pair with expectedVersion"),
       expectedVersion: z.string().optional().describe("Version from a metadataOnly read; required with overwrite"),
-      chunkSize: z.number().int().min(65536).max(8388608).optional().describe("Chunk size between 64 KiB and 8 MiB; default 1 MiB"),
-      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Soft driving budget for legacy synchronous resume or the first background round; not a MCP wait timeout or a wall-clock guarantee"),
-    }, async input => {
+    }, { error: issue => issue.code === "unrecognized_keys"
+      ? `Unsupported MCP transfer arguments: ${issue.keys.join(", ")}; use CLI --chunk-size/--budget for advanced tuning.` : undefined }), async input => {
       if (input.action === "cancel" || input.action === "ack") {
         if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
         return input.action === "cancel"
@@ -139,23 +140,22 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "start") {
         if (!input.localPath || !input.path) throw new RemoteAgentError("INVALID_REQUEST", "start requires localPath and path");
         return transfers.start(input.sessionId, "upload", input as { localPath: string; path: string;
-          create?: boolean; overwrite?: boolean; expectedVersion?: string; chunkSize?: number; budgetMs?: number });
+          create?: boolean; overwrite?: boolean; expectedVersion?: string });
       }
       if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
-      return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
+      return transfers.resume(input.sessionId, input.transferId);
     }, false);
   register("remote_download", "Guarded resumable download. start returns preparing and transferId, not completion. Wait with ssh-mcp-job transfer wait using the ZCode/Codex recovery hook; see remote_help for recovery. Lost ID: remote_transfer_pending. Local destination stays in localRoot/allowedLocalPaths. Replacement requires overwrite=true and the observed local expectedVersion. Inspect terminal results before nextAction/ack; no readToken is granted.",
-    { sessionId,
+    z.strictObject({ sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
       path: path.optional().describe("Remote source path (start only)"),
       localPath: z.string().optional().describe("Local destination inside the workspace or allowed roots (start only)"),
       create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent for the local target; must pair with expectedVersion"),
       expectedVersion: z.string().optional().describe("Version reported for the existing local target; required with overwrite"),
-      chunkSize: z.number().int().min(65536).max(8388608).optional().describe("Chunk size between 64 KiB and 8 MiB; default 1 MiB"),
-      budgetMs: z.number().int().min(1000).max(600000).optional().describe("Soft driving budget for legacy synchronous resume or the first background round; not a MCP wait timeout or a wall-clock guarantee"),
-    }, async input => {
+    }, { error: issue => issue.code === "unrecognized_keys"
+      ? `Unsupported MCP transfer arguments: ${issue.keys.join(", ")}; use CLI --chunk-size/--budget for advanced tuning.` : undefined }), async input => {
       if (input.action === "cancel" || input.action === "ack") {
         if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
         return input.action === "cancel"
@@ -165,11 +165,11 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "start") {
         if (!input.path || !input.localPath) throw new RemoteAgentError("INVALID_REQUEST", "start requires path and localPath");
         return transfers.start(input.sessionId, "download", input as { path: string; localPath: string;
-          create?: boolean; overwrite?: boolean; expectedVersion?: string; chunkSize?: number; budgetMs?: number });
+          create?: boolean; overwrite?: boolean; expectedVersion?: string });
       }
       if (!input.transferId) throw new RemoteAgentError("INVALID_REQUEST", input.action + " requires the transferId returned by start");
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
-      return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
+      return transfers.resume(input.sessionId, input.transferId);
     }, false);
   register("remote_transfer_pending", "List this session's unacknowledged transfers offline; recover lost transferId here. Entries are registration snapshots, not remote progress. Use nextOffset to continue.",
     { sessionId, offset: z.number().int().nonnegative().default(0) }, async input => {

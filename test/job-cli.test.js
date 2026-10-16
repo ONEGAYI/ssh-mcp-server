@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadWorkspaceConfig } from '../build/config/workspace.js';
 
 const jobCli = fileURLToPath(new URL('../build/cli/job.js', import.meta.url));
@@ -69,6 +69,38 @@ it('lists this session pending transfers offline and validates transfer options'
       const missing = invoke('transfer', sub);
       assert.notEqual(missing.status, 0, sub);
       assert.match(missing.stdout + missing.stderr, /transfer-id/, sub);
+    }
+  } finally {
+    const child = relative(tmpdir(), root);
+    assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('CLI transfer start preserves custom chunk size and driving budget for both directions', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ssh-mcp-cli-tuning-'));
+  try {
+    const profile = writeProfile(root);
+    const preload = join(root, 'preload.mjs');
+    const serviceUrl = new URL('../build/services/transfer-service.js', import.meta.url).href;
+    writeFileSync(preload, `import { TransferService } from ${JSON.stringify(serviceUrl)};
+TransferService.prototype.upload = TransferService.prototype.download = async function (sessionId, request) {
+  return { state: 'completed', sessionId, request };
+};`);
+    const local = join(root, 'file.bin');
+    for (const direction of ['upload', 'download']) {
+      const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href,
+        jobCli, 'transfer', 'start', '--workspace', profile, '--session', 'session-one',
+        '--direction', direction, '--local', local, '--remote', '/work/file.bin',
+        '--chunk-size', '131072', '--budget', '2000'], { encoding: 'utf8', timeout: 5000 });
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error ?? ''}`);
+      const body = JSON.parse(result.stdout);
+      assert.equal(body.kind, 'transfer-result');
+      assert.equal(body.sessionId, 'session-one');
+      assert.equal(body.request.chunkSize, 131072);
+      assert.equal(body.request.budgetMs, 2000);
+      assert.equal(body.request.localPath, local);
+      assert.equal(body.request.path, '/work/file.bin');
     }
   } finally {
     const child = relative(tmpdir(), root);

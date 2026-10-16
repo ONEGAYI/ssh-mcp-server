@@ -10,6 +10,8 @@ MCP 的 `remote_upload` / `remote_download` 先在本机登记并返回 `prepari
 
 用恢复钩子提供的真实会话标识，执行 `ssh-mcp-job transfer wait --transfer-id {{原传输编号}} --workspace {{配置文件}} --session {{真实会话标识}}`，挂接完成通知。ZCode 使用原生后台 Shell；Codex 使用命令会话持续读取结果。CLI 的同步 `transfer start` 仍可使用，也应遵循当前宿主的后台等待流程。
 
+MCP 上传、下载使用默认分块大小和驱动预算。需要自定义时，使用 CLI `transfer start` 的 `--chunk-size {{字节数}}` / `--budget {{毫秒数}}`，或 `transfer resume` 的 `--budget {{毫秒数}}`。MCP 不再接收 `chunkSize` / `budgetMs`，旧调用仍传这些参数时会提示改用 CLI。
+
 启动超时或编号丢失时，调用 `remote_transfer_pending`（无需 SSH），或 CLI `transfer pending` 找回原编号；不要重复创建传输。结果处理完成后按返回的 `nextAction` 执行 `ack`。`pending` 表示尚未确认结果，已经完成的传输也会列出。
 
 本机路径须位于工作区或 SSH 配置的 `allowedLocalPaths` 内。工作区外的临时包应移入工作区暂存目录，或配置明确的允许根目录。Windows Git Bash 的 GNU tar 归档路径用 `/c/...` 等 MSYS 路径，或加 `--force-local`，避免把盘符冒号识别成远端主机前缀。

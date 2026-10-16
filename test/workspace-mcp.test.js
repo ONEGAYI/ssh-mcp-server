@@ -19,6 +19,10 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     // Always-loaded definitions stay compact; detailed workflows live in remote_help.
     const definitionBytes = Buffer.byteLength(JSON.stringify(tools.tools), 'utf8');
     assert.ok(definitionBytes <= 16 * 1024, `workspace tool definitions exceed 16 KiB: ${definitionBytes}`);
+    const fields = name => Object.keys(tools.tools.find(tool => tool.name === name).inputSchema.properties).sort();
+    assert.deepEqual(fields('remote_list'), ['cursor', 'limit', 'path', 'pattern', 'sessionId']);
+    assert.deepEqual(fields('remote_find'), ['cursor', 'includeHidden', 'limit', 'path', 'pattern', 'respectGitignore', 'sessionId']);
+    assert.deepEqual(fields('remote_search'), ['cursor', 'filePattern', 'includeHidden', 'limit', 'path', 'pattern', 'respectGitignore', 'sessionId']);
     for (const name of ['remote_read', 'remote_edit', 'remote_write', 'remote_upload', 'remote_download', 'remote_pending', 'remote_wait']) {
       assert.ok(tools.tools.some(tool => tool.name === name), name);
     }
