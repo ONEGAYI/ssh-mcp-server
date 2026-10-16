@@ -15,7 +15,7 @@
 - v2.5.0 包含已读范围 `replace_all` 与同会话不重叠并行编辑（PR #42）；本机回归与两轴独立审查通过，真实 ZCode / Codex 与 CentOS 7 仍待用户验收。规格见 `docs/design/scoped-edit-spec.md`。
 - v2.5.1 将新读取凭据缩短为 14 字符，兼容旧 32 位编号并保留读后写校验（PR #44）；新增 6 项契约测试与两轴独立审查通过，真实客户端复制准确率仍待用户验收。升级须重启共用绑定的旧 MCP 进程；随机空间降为 60 位。规格见 `docs/design/short-read-token-spec.md`。
 - v2.5.2 修复隐式读取凭据选择（PR #46）：remote_edit 省略 readToken 时按当前会话和规范文件路径使用最新凭据，原有范围、版本与有效期校验继续生效；显式错误凭据不自动回退。新增 6 项契约测试，Node 330 项、WSL Python 215 项通过；另一台电脑的真实客户端与 CentOS 7 仍待用户验收。
-- ZCode 插件化进行中（分支 `feat/zcode-plugin-setup`，未推送）：仓库根即插件根，根级 `marketplace.json` 作单插件市场，`plugin-skills/setup` 引导 npm 依赖与构建，`.agents/skills/release` 沉淀维护者发布流程；官方清单校验通过，`source: "./"` 根引用的市场安装与技能实测待用户验收。
+- ZCode 插件化进行中（分支 `feat/zcode-plugin-setup`，未推送）：仓库根即插件根，根级 `marketplace.json` 作单插件市场，`plugin-skills/setup` 引导 npm 依赖与构建，`.agents/skills/release` 沉淀维护者发布流程；官方清单校验通过（`zcode.cjs plugins validate`，退出码 0），`source: "./"` 根引用的市场安装与技能实测待用户验收。
 - 保留边界：用户已人工验收通过（2026-09-14，覆盖 v2.0.0 全部功能）；审查记档项在 issues #23–#26 跟踪；远端 Windows 适配在 #4 跟踪；无 root 与旧 glibc 约束不变。
 - 需求、术语和调查记录统一放在 `docs/design/`；已确认且难以逆转的架构决策放在 `docs/adr/`，按需创建。
 - 未确认的建议必须标明待定；客户端支持、远端环境未经实测不得写成既成事实。
