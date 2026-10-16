@@ -4,7 +4,7 @@
     {
       "name": "ssh-mcp-server",
       "source": "./",
-      "version": "2.5.2",
+      "version": "2.5.3",
       "description": "SSH-based MCP Server (基于 SSH 的 MCP 服务器)",
       "displayName": "SSH MCP Server",
       "displayName_i18n": { "zh-CN": "SSH MCP 服务器" },

@@ -2,6 +2,26 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.5.3] - 2026-10-17
+
+本仓库可直接作为 ZCode 插件安装：仓库根即插件根，git 市场安装即得完整源码，安装后由插件 setup 技能引导完成 npm 依赖安装与构建。
+
+### 新功能
+
+**ZCode 插件化**（PR [#49](https://github.com/ONEGAYI/ssh-mcp-server/pull/49)）
+
+- 根级 `.zcode-plugin/plugin.json` 与 `marketplace.json`：本仓库可作为单插件市场以 git URL 添加
+- `.mcp.json` 声明 `ssh-mcp-setup` stdio MCP，插件安装并构建后即可用
+- `plugin-skills/setup` 技能：定位插件根、`npm install`、`npm run build` 与版本冒烟验证
+- `.agents/skills/release` 技能（维护者向）：版本四处同步、CHANGELOG、离线包与 Release 核对
+- `package-lock.json` 入库，保证插件安装缓存内构建可复现
+
+### 移除
+
+- 上游 `skills/ssh-mcp-helper` 配置向导：面向上游 npm 包与旧客户端接入模式，且 ZCode 宿主会自动发现并注册根级 `skills/` 目录，使其误入插件技能列表（内容于上游仓库与本仓库历史可考）
+
+> **验证状态**：插件清单经 `zcode.cjs plugins validate` 通过；review-loops 两轮审查完成；git 市场添加、插件安装、MCP 与技能注册已实测。setup 技能的依赖构建与远端接入待用户验收；离线包随正式发布提供。
+
 ## [2.5.2] - 2026-10-12
 
 修复已读取文件后省略 `readToken` 仍被要求先读取的问题。读取范围、版本、会话和有效期保护继续生效。
