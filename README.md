@@ -140,7 +140,9 @@ Agent 会先调用工具获取缺项，再向你询问：
 
 重新打开指定的本机项目（如果新工具尚未出现），并确认 ZCode 提示的**首次项目钩子信任**。随后让 Agent 调用 `remote_workspace` 验证 SSH、Python 和远端目录，再读取远端规则。
 
-setup 服务负责首次接入；日常文件和任务操作使用它生成的项目 MCP。
+setup 服务负责绑定的创建与维护；日常文件和任务操作使用它生成的项目 MCP。
+
+完成绑定并确认工作区工具可用后，可在宿主的 MCP 配置中停用 setup 服务，减少常驻工具上下文。需要新增绑定、查看或更新配置、移除绑定时再启用；保留已生成的项目 MCP 和恢复钩子。
 
 **会话规则与技能注入**：已有绑定先 `inspect`，再带 `revision` 执行 `update`，传入 `sessionStart: { enabled: true }` 即开启远端 `AGENTS.md` 和 `.agents/skills` 目录注入；ZCode 还读取远端 `.zcode/skills`。技能只注入名称、描述和路径，使用时再读 `SKILL.md`。同一个开关可随时关闭，下一次 `SessionStart` 生效，已注入内容不会从旧对话撤回。每绑定独立设置；增加 Codex 接入时同次更新 `clients: ["zcode", "codex"]`。Codex 需完成项目与钩子信任；ZCode 按用户已确认可用的 3.14.x 项目钩子验收。预算、失败和版本边界见 [会话注入说明](docs/design/session-start-context.md)。
 

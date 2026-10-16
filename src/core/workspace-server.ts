@@ -38,6 +38,12 @@ const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 - sha256 在传输未 completed 前是预期的源文件摘要；confirmedOffset 小于 totalBytes 时不能据此声称接收文件已经通过整文件校验。
 - 本机源/目标必须位于 localRoot 或 SSH 配置 allowedLocalPaths 内。工作区外临时包可放入工作区暂存目录，或配置明确的允许根目录；不默认允许整个临时目录。
 - Windows Git Bash 使用 GNU tar 打包时，归档路径用 /c/... 等 MSYS 路径，或加 --force-local；C: 可能被识别为远端主机前缀。该规则针对 GNU tar。
+按需细节：
+- remote_read 文本单页约 56 KiB；行读取检查 lineStart、lineEnd 和 lineEndComplete，超长行用 nextOffset 续读；续读携带 expectedVersion，文件变化时拒绝继续。metadataOnly 只观察版本，不授予已读范围。
+- remote_find / remote_search 默认每页扫描 512 MiB、10 秒，结果页 64 KiB；策略可调整这些预算。分页检查停止原因和 nextCursor，不把预算停止当作搜索完成。
+- remote_edit 的 editResults 计数与字节范围按 beforeVersion 解释；检查 rebased 和 concurrentReplayAvailable。并行历史上限为 10 分钟、128 次提交和 4 MiB，超限需重读；编辑保留 BOM、权限与 CRLF。
+- remote_workspace 的 includeStorage 返回小于 4 KiB 的两端空间摘要，包含占用、预留、上限、资源数量及最近维护记录；不可达端标记 unknown。
+- 旧传输登记的 resume 仍同步驱动，默认软预算 55 秒；通过当前宿主的后台 CLI 等待，预算不代表 MCP 等待超时或整个传输的时限。
 `;
 
 export async function runWorkspaceServer(profile: string): Promise<void> {
@@ -58,13 +64,13 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
   // maintenance round, no remote call, no sessionId. Since #31, configure no
   // longer writes the markdown copy it used to generate.
   server.registerTool("remote_help", {
-    description: "Full usage guide for this remote-workspace binding: workflow order, guarded file tools, background jobs through the recovery hook, session identity, recovery and acknowledgement rules. Static text served locally with no remote access; call it whenever the workflow rules are unclear, including while SSH is down.",
+    description: "Binding usage guide: files, command tasks, transfers and recovery. Read when workflow rules are unclear. Local-only, including while SSH is down.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify({ guide: WORKSPACE_GUIDE }) }] }));
   const sessionId = z.string().min(1).max(256).describe("Actual original conversation ID supplied by the recovery hook");
-  const path = z.string().min(1).describe("Remote POSIX path; relative paths resolve against the configured remote root. Absolute paths outside that root require the binding's unrestricted directory scope");
-  const readToken = z.string().optional().describe("Omit to use the latest read credential for this file and session. If supplied, copy the returned value exactly; invalid explicit credentials never fall back to the latest one");
+  const path = z.string().min(1).describe("Remote POSIX path, relative to remoteRoot; outside-root access requires unrestricted scope.");
+  const readToken = z.string().optional().describe("Omit for the latest credential for this file and session; copy explicit tokens verbatim. Invalid explicit credentials never fall back.");
   const count = z.number().int().min(1).max(1000).optional();
   const register = (name: string, description: string, schema: z.ZodRawShape,
     action: (input: Record<string, any>) => Promise<unknown>, online = true) => {
@@ -89,31 +95,31 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       }
     });
   };
-  register("remote_workspace", "Inspect remote workspace capabilities, directory scope, and rule-file locations. Read rules using remote_read before development. Pass includeStorage=true to get, instead of the capabilities, a bounded (< 4 KiB) space summary of both ends: usedBytes/reservedBytes/limitBytes, category usage (state + registered temps incl. sibling files next to targets), resource counts, and the last maintenance round's time and counters. An unreachable remote end reports status=unknown instead of numbers; maintenance never involves the model.",
+  register("remote_workspace", "Inspect remote runtime, file boundaries and rule locations; read applicable rules before development. includeStorage returns a bounded two-end space summary instead; unreachable remote usage is unknown.",
     { sessionId, includeStorage: z.boolean().optional().describe("Opt in to the bounded two-end storage summary; defaults to false with zero extra work") },
     async input => {
       if (input.includeStorage) return buildStorageReport(runtime.config, files, input.sessionId);
       return files.call("file_workspace", input.sessionId);
     });
-  register("remote_read", "Read UTF-8 text by lines or byte cursor, or base64 binary, streamed from any file size; text delivery stays within ~56 KiB. Line reads return lineStart/lineEnd/lineEndComplete and overlong lines chunk with nextOffset continuation. Only returned ranges authorize later modifications. metadataOnly=true returns just the observed version (or exists=false) without content and without granting read coverage, for overwrite prechecks.",
+  register("remote_read", "Read paged UTF-8 lines/bytes or base64. Only delivered ranges authorize edits. metadataOnly returns version/existence without edit coverage. Follow continuation fields; pass expectedVersion to reject changed files. Details: remote_help.",
     { sessionId, path, fromLine: z.number().int().positive().optional(), toLine: z.number().int().positive().optional(), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().min(1).max(1048576).optional(), encoding: z.enum(["utf8", "base64"]).optional(), metadataOnly: z.boolean().optional(), expectedVersion: z.string().optional().describe("Version the cursor was issued under; refuse with FILE_CONFLICT if the file changed since") },
     input => files.call("file_read", input.sessionId, input));
   for (const [name, action, description] of [
     ["remote_list", "file_list", "List immediate entries with stable query-scoped pagination."],
-    ["remote_find", "file_find", "Find paths recursively using glob patterns matched against the basename or the relative path; returns type and size. Enumeration uses rg --files when available, otherwise the built-in Python walk; grep is never used for filenames. Defaults include hidden files and skip .gitignore filtering; .git is always excluded; pass includeHidden=false or respectGitignore=true to change. Results share the search budget (512 MiB / 10 s per page, 64 KiB pages); budget-stopped pages report a reason and nextCursor to resume. Does not authorize writes."],
-    ["remote_search", "file_search", "Literal case-sensitive UTF-8 search; picks the fastest available remote backend (ripgrep > GNU grep > built-in chunk scan) and reports it. Defaults include hidden files and skip .gitignore filtering; .git is always excluded; pass includeHidden=false or respectGitignore=true to change. No file-size cutoff: budget 512 MiB scanned / 10 s per page, 64 KiB results per page; partial pages carry a reason and nextCursor to resume without rescanning completed files. Binary/undecodable files are counted in skippedFiles. Does not authorize writes."],
+    ["remote_find", "file_find", "Recursive path glob against basename or relative path. Defaults: hidden included, gitignore ignored, .git excluded. Budget-stopped pages give a reason and nextCursor; no edit coverage. Details: remote_help."],
+    ["remote_search", "file_search", "Literal case-sensitive UTF-8 content search. Defaults: hidden included, gitignore ignored, .git excluded. Partial pages give a reason and nextCursor; binary/undecodable files count as skippedFiles. No edit coverage. Details: remote_help."],
   ]) register(name, description, { sessionId, path: path.optional(), pattern: z.string().optional(), filePattern: z.string().optional(), limit: count, cursor: z.string().optional(),
     includeHidden: z.boolean().optional(), respectGitignore: z.boolean().optional() }, input => files.call(action, input.sessionId, input));
-  register("remote_edit", "Apply exact replacements on files of any size. Omit readToken to use the latest credential for this file and session with the same range, version and expiry checks; invalid explicit credentials never fall back. Each edit defaults to a unique whole-file match in the token's read version. Per-edit replace_all=true replaces only non-overlapping matches wholly inside this token's delivered ranges, never unread matches. Mixed modes commit atomically. editResults reports counts and bounded byte ranges in beforeVersion; readRanges scope never means the whole file was replaced. Same-session disjoint calls may share an old token: bounded history (10 minutes, 128 commits, 4 MiB) maps their original ranges under the file lock. Overlaps, missing history, other-session or external/write/upload changes refuse with FILE_CONFLICT. Check rebased and concurrentReplayAvailable; prefer the newest returned token. Preserve BOM, permissions and CRLF; unread gaps remain protected. If rereadRequired=true the edit was committed but token renewal failed; read before continuing and do not repeat the edit blindly.",
+  register("remote_edit", "Apply atomic exact replacements. Omit readToken for the latest file/session credential; invalid explicit tokens never fall back. Default requires a unique whole-file match; replace_all affects only non-overlapping token-covered matches. Same-session disjoint edits may rebase; conflicts require rereading. rereadRequired=true means committed: reread, do not replay. Details: remote_help.",
     { sessionId, path, readToken, edits: z.array(z.object({ oldText: z.string().min(1), newText: z.string(),
       replace_all: z.boolean().default(false).describe("Replace all non-overlapping matches wholly within this token's read ranges; false requires a unique whole-file match") })).min(1).max(100) }, input => files.call("file_edit", input.sessionId, input));
-  register("remote_write", "Create only if absent (the default; existing targets refuse with FILE_CONFLICT, and create=true makes it explicit). Replacing an existing file requires overwrite=true plus the expectedVersion observed via a metadataOnly remote_read; no full prior read is needed and readToken is not accepted. Supply exactly one of text or base64 data; inline content is bounded by the request budget, larger content goes through uploads.",
+  register("remote_write", "Create an absent file, or replace with overwrite=true and metadataOnly expectedVersion; readToken is not accepted. Supply exactly one of UTF-8 text or base64 data. Inline content is request-bounded; use uploads for large content.",
     { sessionId, path, create: z.boolean().optional(), overwrite: z.boolean().optional().describe("Explicit whole-file replacement intent; must pair with expectedVersion"), expectedVersion: z.string().optional().describe("Version from a metadataOnly read of the current target; required with overwrite"),
       // Coarse schema-level guard (character count) so oversized strings are
       // rejected before entering the request pipeline; the exact 16 MiB byte
       // gate stays with the remote helper (remote/files.py) as the authority.
       text: z.string().max(64 * 1024 * 1024).optional(), data: z.string().max(64 * 1024 * 1024).optional() }, input => files.call("file_write", input.sessionId, input));
-  register("remote_upload", "Upload a guarded local file through a resumable verified binary transfer. action=start durably registers locally and quickly returns preparing plus transferId before hashing or SSH; an independent local process drives the transfer. Attach ssh-mcp-job transfer wait using the current client's waiting workflow (ZCode native background Shell or Codex command-session continuation) for completion delivery. Recover a lost identifier with remote_transfer_pending. action=status returns a local driver snapshot for new transfers; action=resume reattaches an interrupted driver. A paused transfer keeps its data and original identifier: resolve the local state-file access error, then resume after retryAfter; paused is not acknowledgeable. resumeAttempted only reports whether a new driver was dispatched; failed returns a stored terminal result without retrying. Legacy registrations keep synchronous resume with a soft budget (default 55 s), so use the background CLI for them. Cancellation may return cancelling until the driver confirms its outcome; completed publication is never rolled back. Inspect terminal results then execute nextAction/ack; status never consumes them. Sources must be within localRoot or allowedLocalPaths. Replacement requires overwrite=true and the metadataOnly expectedVersion.",
+  register("remote_upload", "Guarded resumable upload. start returns preparing and transferId, not completion. Wait with ssh-mcp-job transfer wait using the ZCode/Codex recovery hook; see remote_help for recovery. Lost ID: remote_transfer_pending. Local source stays in localRoot/allowedLocalPaths. Replacement requires overwrite=true and metadataOnly expectedVersion. Inspect terminal results before nextAction/ack; status never consumes them.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -139,7 +145,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
     }, false);
-  register("remote_download", "Download a guarded remote file through a resumable verified binary transfer. action=start quickly returns a durable transferId and preparing before SSH or whole-file hashing; totalBytesKnown=false until source registration. An independent local process verifies chunks and SHA-256 before local atomic publication. Attach ssh-mcp-job transfer wait using the current client's waiting workflow (ZCode native background Shell or Codex command-session continuation) for completion delivery; remote_transfer_pending recovers lost identifiers. status returns a local driver snapshot for new transfers and resume reattaches an interrupted driver; paused keeps data and the original identifier: resolve local state-file access, then resume after retryAfter; paused cannot be acknowledged. resumeAttempted reports whether a new driver was dispatched; failed is a stored terminal snapshot without retry. legacy registrations retain synchronous resume with a soft budget. Cancellation is a request until the driver confirms a terminal outcome and never rolls back a proven commit. Inspect results then execute nextAction/ack; unknown outcomes cannot be acknowledged. Local targets stay inside localRoot or allowedLocalPaths. Replacement requires overwrite=true and the observed local expectedVersion; downloading grants no readToken.",
+  register("remote_download", "Guarded resumable download. start returns preparing and transferId, not completion. Wait with ssh-mcp-job transfer wait using the ZCode/Codex recovery hook; see remote_help for recovery. Lost ID: remote_transfer_pending. Local destination stays in localRoot/allowedLocalPaths. Replacement requires overwrite=true and the observed local expectedVersion. Inspect terminal results before nextAction/ack; no readToken is granted.",
     { sessionId,
       action: z.enum(["start", "status", "resume", "cancel", "ack"]).default("start").describe("Transfer operation; start also registers, resume continues an existing transferId"),
       transferId: z.string().optional().describe("Durable transfer identifier returned by a previous start"),
@@ -165,7 +171,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
       if (input.action === "status") return transfers.status(input.sessionId, input.transferId);
       return transfers.resume(input.sessionId, input.transferId, input.budgetMs);
     }, false);
-  register("remote_transfer_pending", "List this conversation's unacknowledged uploads and downloads from local durable registrations. No SSH or online maintenance. Use this after a lost start response to recover transferId; entries are registration snapshots, not live remote status. Query nextOffset for more.",
+  register("remote_transfer_pending", "List this session's unacknowledged transfers offline; recover lost transferId here. Entries are registration snapshots, not remote progress. Use nextOffset to continue.",
     { sessionId, offset: z.number().int().nonnegative().default(0) }, async input => {
       const pending = await transfers.pending(input.sessionId);
       return { transfers: pending.slice(input.offset, input.offset + 50),
@@ -188,7 +194,7 @@ export async function runWorkspaceServer(profile: string): Promise<void> {
   register("remote_status", "Observe an owned task without restarting it.", job, async input => { await own(input); return runtime.tasks.status(input.jobId); });
   register("remote_output", "Read task stdout/stderr as separate base64 chunks with byte cursors, or tail=true for the end of each log.", { ...job, stdoutOffset: z.number().int().nonnegative().optional(), stderrOffset: z.number().int().nonnegative().optional(), tail: z.boolean().optional(), maxBytes: z.number().int().min(1).max(16000).default(16000) }, async input => { await own(input); return runtime.remote.call("output", input); });
   register("remote_wait", "Short bounded observation only. Use native background Shell + ssh-mcp-job wait for automatic completion delivery.", { ...job, waitTimeoutMs: z.number().int().min(0).max(10000).default(1000) }, async input => { await own(input); return runtime.tasks.wait(input.jobId, { waitTimeoutMs: input.waitTimeoutMs }); });
-  register("remote_cancel", "Cancel a command task by jobId, not a file transfer. For upload/download use remote_upload or remote_download action=cancel with transferId; ack does not cancel. A request is not proof of termination: check the resulting state.", job, async input => { await own(input); return runtime.tasks.cancel(input.jobId); });
+  register("remote_cancel", "Request command-task cancellation by jobId; verify state. Transfers use upload/download action=cancel with transferId. ack never cancels.", job, async input => { await own(input); return runtime.tasks.cancel(input.jobId); });
   register("remote_ack", "Acknowledge a terminal result only after inspecting and handling it. Duplicate acknowledgements are safe.", job, async input => { await own(input); await runtime.tasks.acknowledge(input.jobId, input.sessionId); return { acknowledged: true, jobId: input.jobId }; });
   let closing = false;
   const close = async () => { if (closing) return; closing = true; runtime.close(); await server.close(); };

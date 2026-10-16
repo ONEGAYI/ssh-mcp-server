@@ -16,6 +16,9 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', join(directory, 'workspace.json')], stderr: 'pipe' }));
     const tools = await client.listTools();
+    // Always-loaded definitions stay compact; detailed workflows live in remote_help.
+    const definitionBytes = Buffer.byteLength(JSON.stringify(tools.tools), 'utf8');
+    assert.ok(definitionBytes <= 16 * 1024, `workspace tool definitions exceed 16 KiB: ${definitionBytes}`);
     for (const name of ['remote_read', 'remote_edit', 'remote_write', 'remote_upload', 'remote_download', 'remote_pending', 'remote_wait']) {
       assert.ok(tools.tools.some(tool => tool.name === name), name);
     }
