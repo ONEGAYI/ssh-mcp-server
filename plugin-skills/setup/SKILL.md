@@ -19,7 +19,7 @@ description: 安装或升级 ssh-mcp-server 插件的 npm 依赖并完成构建�
 
 ## 步骤
 
-1. **定位插件根**：本技能文件位于 `<插件根>/skills/setup/SKILL.md`，向上两级即插件根。确认该目录下存在 `package.json` 与 `.zcode-plugin/plugin.json`。插件安装缓存在 `~/.zcode/cli/plugins/cache/<市场名>/ssh-mcp-server/<版本>/`，每个版本是独立目录。
+1. **定位插件根**：本技能文件位于 `<插件根>/plugin-skills/setup/SKILL.md`，向上两级即插件根。确认该目录下存在 `package.json` 与 `.zcode-plugin/plugin.json`。插件安装后通常位于 `~/.zcode/cli/plugins/cache/<市场名>/ssh-mcp-server/<版本>/`，每个版本是独立目录；以实际安装路径为准。
 
 2. **安装依赖**：在插件根执行 `npm install`。仓库带 `package-lock.json`，按锁定版本安装。网络失败时如实报告错误并停止，不更换源、不重试超过一次。
 

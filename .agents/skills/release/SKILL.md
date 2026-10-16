@@ -32,7 +32,7 @@ description: 准备并发布 ssh-mcp-server 仓库的新版本：版本号同步
 1. `npm run build`
 2. `node scripts/package-offline.mjs --output <仓库外目录>/ssh-mcp-<版本>-offline`（输出目录必须不存在，脚本不覆盖既有目录）
 3. 将离线目录压缩为同名 zip
-4. 抽查：用包内 `runtime/node` 分别以 `build/index.js` 与 `--setup` 启动，完成 MCP 握手并报告本版版本号；zip 可完整解压
+4. 抽查：用包内 `runtime/node`（Windows 为 `runtime/node.exe`）分别以 `build/index.js` 与 `--setup` 启动，完成 MCP 握手并报告本版版本号；zip 可完整解压
 
 ## 发布
 
