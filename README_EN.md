@@ -53,6 +53,8 @@ NPM: [https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server](https://www.npmj
 
 If you are using an AI coding assistant that supports skills (such as Claude Code), you can use the built-in **ssh-mcp-helper** skill to complete the installation and configuration interactively — no need to manually edit JSON files.
 
+*(Note: this fork has removed the ssh-mcp-helper skill; use the setup flow described in [README.md](README.md) instead.)*
+
 **How to use:**
 
 1. Install the skill from this repository's `skills/` directory
