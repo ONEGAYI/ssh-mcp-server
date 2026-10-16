@@ -254,8 +254,9 @@ function connectionNames(sshConfigFile: string): Promise<string[]> {
 
 /** Machine-level default library path; kept outside the maintained
  * ~/.ssh-mcp-agent state directory so retention cycles never touch it.
- * The setup skill's set-default-config script is the writing entry. */
-const setupDefaultsPath = () => join(homedir(), ".ssh-mcp-setup-defaults.json");
+ * The setup skill's set-default-config script is the writing entry;
+ * SSH_MCP_SETUP_DEFAULTS keeps both ends on the same file. */
+const setupDefaultsPath = () => process.env.SSH_MCP_SETUP_DEFAULTS ?? join(homedir(), ".ssh-mcp-setup-defaults.json");
 
 /** Reads the saved default SSH MCP JSON library path; ENOENT means none. */
 async function readDefaultConfig(defaultsPath: string): Promise<string | undefined> {
@@ -263,7 +264,7 @@ async function readDefaultConfig(defaultsPath: string): Promise<string | undefin
   try { text = await readFile(defaultsPath, "utf8"); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
+    throw new RemoteAgentError("SETUP_INVALID_CONFIG", `Could not read the default SSH config file ${defaultsPath} (${(error as NodeJS.ErrnoException).code ?? error}); fix the file access or delete that file`);
   }
   try {
     const value = (JSON.parse(text) as { sshConfigFile?: unknown })?.sshConfigFile;
@@ -388,7 +389,7 @@ export async function configureFromTool(input: SetupInput, defaultSshConfigFile?
 
 export async function runSetupServer(defaultSshConfigFile?: string): Promise<void> {
   const server = new McpServer({ ...SERVER_CONFIG, name: "ssh-mcp-setup" }, {
-    instructions: "Use remote_setup for binding configuration, not remote commands. Call without arguments to discover missing inputs; ask the user and reuse confirmed values. list_connections reads JSON connection names from --config-file or sshConfigFile; never search ~/.ssh or request passwords/private-key contents. inspect precedes update/remove; remove requires explicit user request. Use the generated workspace MCP for daily work; keep client hook trust enabled.",
+    instructions: "Use remote_setup for binding configuration, not remote commands. Call without arguments to discover missing inputs; ask the user and reuse confirmed values. list_connections reads JSON connection names from sshConfigFile, the saved machine default, or --config-file; never search ~/.ssh or request passwords/private-key contents. inspect precedes update/remove; remove requires explicit user request. Use the generated workspace MCP for daily work; keep client hook trust enabled.",
   });
   server.registerTool("remote_setup", { description: "Configure/manage one project SSH binding without SSH access. Missing fields return questions; ask the user, never guess credentials or paths. list_connections lists JSON-library names without workspace paths. inspect returns sanitized config and revision; update/remove require it. update accepts only policy, directoryScope, pythonPath, clients and sessionStart. remove needs explicit user request and no unacknowledged tasks/transfers; external SSH config and remote state stay intact. A new target needs a new bindingName.",
     inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } }, async input => {

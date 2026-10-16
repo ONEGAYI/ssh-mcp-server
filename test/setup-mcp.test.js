@@ -42,7 +42,10 @@ it('setup advertises an explicit read-only connection listing from the startup J
 it('connection listing asks only for a missing JSON path and accepts an explicit library without configuring a binding', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-list-path-'));
   try {
-    const missing = await setupFromTool({ action: 'list_connections' });
+    // Third argument isolates this call from any default saved in the real
+    // home directory: a saved default must not flip this assertion on a
+    // machine that actively uses the persistence feature.
+    const missing = await setupFromTool({ action: 'list_connections' }, undefined, join(root, 'no-defaults.json'));
     assert.equal(missing.status, 'needs_input');
     assert.deepEqual(missing.questions.map(q => q.fields), [['sshConfigFile']]);
     assert.deepEqual(missing.connections, []);
@@ -619,6 +622,11 @@ it('a saved default library feeds list_connections and configure without asking 
     // A corrupt defaults file is reported instead of silently ignored.
     await writeFile(defaultsPath, '{ broken');
     await assert.rejects(setupFromTool({ action: 'list_connections' }, undefined, defaultsPath), { code: 'SETUP_INVALID_CONFIG' });
+    // An unreadable defaults location reports the file instead of a generic failure.
+    await rm(defaultsPath);
+    await mkdir(defaultsPath);
+    await assert.rejects(setupFromTool({ action: 'list_connections' }, undefined, defaultsPath),
+      error => error.code === 'SETUP_INVALID_CONFIG' && /Could not read the default/.test(error.message));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -643,6 +651,11 @@ it('the setup skill script persists and reports the default library path', async
     const blankLibrary = join(root, 'blank.json');
     await writeFile(blankLibrary, '{}');
     assert.equal(run([blankLibrary]).status, 1);
+    // Entries are validated like the MCP side: junk values or extra arguments are rejected.
+    const junkLibrary = join(root, 'junk.json');
+    await writeFile(junkLibrary, JSON.stringify({ notconn: 'just-a-string' }));
+    assert.equal(run([junkLibrary]).status, 1);
+    assert.equal(run([join(root, 'any.json'), 'extra']).status, 1);
     await assert.rejects(readFile(defaultsPath), { code: 'ENOENT' });
     // A valid library persists only its path and --show reads it back.
     const auth = join(root, 'ssh.json');
@@ -650,11 +663,42 @@ it('the setup skill script persists and reports the default library path', async
     const saved = run([auth]);
     assert.equal(saved.status, 0);
     assert.equal(saved.output.sshConfigFile, auth);
+    assert.deepEqual(saved.output.connections, ['vm']);
     assert.equal(JSON.parse(await readFile(defaultsPath, 'utf8')).sshConfigFile, auth);
+    // Upstream's array library format is accepted with its connection names.
+    const arrayLibrary = join(root, 'array-ssh.json');
+    await writeFile(arrayLibrary, JSON.stringify([{ name: 'dev', host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture' }]));
+    const arraySaved = run([arrayLibrary]);
+    assert.equal(arraySaved.status, 0, JSON.stringify(arraySaved));
+    assert.deepEqual(arraySaved.output.connections, ['dev']);
     const shown = run(['--show']);
     assert.equal(shown.status, 0);
-    assert.equal(shown.output.sshConfigFile, auth);
+    assert.equal(shown.output.sshConfigFile, arrayLibrary);
+    // A null JSON body degrades to "no default" instead of crashing --show.
+    await writeFile(defaultsPath, 'null');
+    const nullShown = run(['--show']);
+    assert.equal(nullShown.status, 0);
+    assert.equal(nullShown.output.sshConfigFile, null);
     // The script never copies credentials into the defaults file.
+    await writeFile(defaultsPath, JSON.stringify({ sshConfigFile: auth }) + '\n');
     assert.doesNotMatch(await readFile(defaultsPath, 'utf8'), /fixture|password/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('SSH_MCP_SETUP_DEFAULTS overrides where the MCP resolves the saved default', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-default-env-'));
+  const defaultsPath = join(root, 'env-defaults.json');
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ vm: { host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture' } }));
+    await writeFile(defaultsPath, JSON.stringify({ sshConfigFile: auth }) + '\n');
+    process.env.SSH_MCP_SETUP_DEFAULTS = defaultsPath;
+    try {
+      // Single-argument calls resolve the defaults path through the same
+      // environment variable the writer script honours.
+      const listed = await setupFromTool({ action: 'list_connections' });
+      assert.equal(listed.status, 'connections_listed');
+      assert.deepEqual(listed.connections, ['vm']);
+    } finally { delete process.env.SSH_MCP_SETUP_DEFAULTS; }
   } finally { await rm(root, { recursive: true, force: true }); }
 });

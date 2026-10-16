@@ -32,7 +32,7 @@
 
 setup 服务还支持 `--config-file <本机 SSH JSON 路径>` 启动参数，把已有连接库预存给 setup（模板见 [examples/mcp-setup-config.json](../../examples/mcp-setup-config.json) / [examples/zcode-setup-config.json](../../examples/zcode-setup-config.json)）。预存后 `remote_setup({})` 会在缺项响应中列出可用连接名，Agent 只需向用户确认连接名；凭据始终留在本机文件，不进入对话。单次调用只要出现任一显式 SSH 字段（host/用户名/端口/私钥/agent），本次就整体改用显式信息，不与预存库做字段级合并。
 
-只列服务器时，调用 `remote_setup({"action":"list_connections"})`，只返回连接名和后续指引，不要求 `localRoot`、远端目录，也不创建绑定或连接 SSH。可用 `sshConfigFile` 指定另一个 JSON 连接库；随后 configure 须复用同一路径与选定连接名。未提供启动库或调用路径时，只询问 JSON 文件绝对路径，不去 `.ssh` 猜配置位置。SSH MCP JSON 与 OpenSSH `.ssh/config` 是两种配置格式。
+只列服务器时，调用 `remote_setup({"action":"list_connections"})`，只返回连接名和后续指引，不要求 `localRoot`、远端目录，也不创建绑定或连接 SSH。可用 `sshConfigFile` 指定另一个 JSON 连接库；随后 configure 须复用同一路径与选定连接名。未提供启动库或调用路径时，先取本机已保存默认（`~/.ssh-mcp-setup-defaults.json`，由插件 setup 技能的 `set-default-config` 脚本写入，取值顺序为显式路径 > 已存默认 > 启动参数），都没有才询问 JSON 文件绝对路径，不去 `.ssh` 猜配置位置。SSH MCP JSON 与 OpenSSH `.ssh/config` 是两种配置格式。
 
 已知客户端限制（ZCode 3.11.2 实测）：完整配置导入会把 `args` 数组中含空格的元素按空格拆分成多个参数，破坏带空格的文件路径。预存连接文件请放在无空格路径；已有带空格路径的文件可用同盘硬链接建一个无空格名称（`New-Item -ItemType HardLink`），内容改动自动同步、凭据不重复存放。
 
