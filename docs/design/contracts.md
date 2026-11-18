@@ -60,7 +60,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 `remote_workspace` 增加可选参数 `includeStorage`（缺省 false，默认调用零额外开销、响应不含任何统计；不新增独立 MCP 工具）。开启时响应**仅**为两端空间汇总（不返回 capabilities），序列化后不超过 4 KiB：
 
-- **两端各报**：`storage.local` / `storage.remote` 下 `stateBytes / tempBytes / reservedBytes / usedBytes(=三者之和) / limitBytes / resourceCount / reservationCount / maintenance{lastCompletedAt, lastRunAt, 计数}`。计量与额度检查同一口径（`ledger.usage`，见「状态与临时数据的空间额度」节）：状态目录递归扫描（排除账本自身目录）+ 已登记临时资源（含目标同目录的编辑/下载/续传临时文件）+ 未消费预留；提交注销登记后正式目标移出计量；预留与已写占用不双重计数。远端统计为一次有界状态目录遍历加账本读取，不做全盘 `du`。`maintenance` 的时间戳两端统一为**毫秒**：远端 helper 内部时钟为秒（`time.time()`），由本机组装层（storage-report）透传时按数量级判定归一（小于 1e11 的正数视为秒 ×1000，0 保持 0），helper 本身不改；本机 `lastRunAt` 与远端同语义——最近一次实际执行的维护轮，无论该轮成败。
+- **两端各报**：`storage.local` / `storage.remote` 下 `stateBytes / tempBytes / reservedBytes / usedBytes(=三者之和) / limitBytes / resourceCount / reservationCount / maintenance{lastCompletedAt, lastRunAt, 计数}`。计量与额度检查同一口径（`ledger.usage`，见「状态与临时数据的空间额度」节）：状态目录递归扫描（排除账本自身目录）+ 已登记临时资源（含目标同目录的编辑/下载/续传临时文件）+ 未消费预留；提交注销登记后正式目标移出计量；预留与已写占用不双重计数。远端统计为一次有界状态目录遍历加账本读取，不做全盘 `du`。`maintenance` 的时间戳两端统一为**毫秒**：远端 helper 内部时钟为秒（`time.time()`），由本机组装层（storage-report）透传时按数量级判定归一（小于 1e11 的正数视为秒 ×1000，0 保持 0），helper 本身不改。
 - **清理摘要**：`maintenance` 报最近一轮维护的持久化时间与计数（远端自 #16 的 maintenance.json 补记 lastSummary 计数，#17 起覆盖五段：removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered；本机自 maintenance.json 的 lastLocalSummary 聚合为 removedTasks/removedTransfers/reclaimedResources/itemsConsidered 计数）。计数只描述最近一轮，预算中断的轮次在下一轮续扫，不隐含跨轮总计；从未运行过的时间与计数为 0，不猜数。本机维护记录内部保存的逐条 id 清单不会进入响应——汇总只输出聚合计数。
 - **断线语义**：远端不可达、远端统计失败或可达 helper 未返回 storage 节（升级窗口）时，`storage.remote` 为 `{status:"unknown", reason}`，不出现任何数字字段（不写零）；本机部分仍正常返回。`reason` 截断至 200 字符。
 - **4 KiB 预算与裁剪规则**：固定 schema 正常远小于预算；兜底裁剪按序省略 maintenance 计数明细、再省略 resource/reservation 计数，仅剩 usedBytes/limitBytes（或 unknown 端仅 status），保证最终不超过 4096 字节。
@@ -265,6 +265,10 @@ MCP 提供查询、列举、读日志、短时等待和取消能力。若另行�
 - **回收后拒绝**：记录删除后旧标识不再落入任何创建分支——`task_start` 报 `REQUEST_EXPIRED_OR_UNKNOWN`，传输各动作经 `_load_record` 同码拒绝；登记后执行协议（#7）保证这一点，#16 的验收即覆盖"回收后重放被拒"。legacy（v1）任务记录仅在 v2 协议激活后删除：未激活工作区的 v1 记录只清日志不删记录，避免升级窗口内旧请求经 legacy start 重跑；#20 起该门槛覆盖全部删除分支（终态与 unknown 形态一致），且激活排空判活与 status 同源——死 worker 的 v1 记录进 unknown 阶段（迁移观察时间起算 30 天）后不再阻塞切换，激活后按原时间回收，删除后 legacy start 重放按 `PROTOCOL_UPGRADE_REQUIRED` 拒绝。
 - **不做**：prepared 任务登记（规格未设期限，不回收）。账本遗留登记/无主临时文件核实回收、readToken/helper 版本回收已随 #17 实施，空间用量汇总已随 #19 实施（见「文件接口」节）。
 - **unknown 记录**：远端 unknown.json 与本机 rejected/unstarted 登记遵循上述期限；结果未知的任务或传输先查询原操作，不自动重跑或再次覆盖；到期停止自动恢复并删除结果详情、诊断与恢复记录，提示记录已过期、需人工核对实际结果；删除后旧请求仍拒绝。该期限不代表操作已失败或停止，不删除正式文件。
+
+本机扫描和远端调用独立计算维护间隔。远端失败后，在线维护调用距上次远端尝试至少 5 分钟才重试；本机扫描仍按自己的间隔运行。空间汇总的本机维护时间与计数来自同一轮已保存的本机扫描，不受仅远端重试、失败或跳过影响。
+
+旧式同步上传的本机镜像没有独立终态字段。同编号的 `ack.json` 记有已确认终态时，镜像按确认期限回收，而不按中断传输期限回收。
 
 ### 状态与临时数据的空间额度（2026-09-13 票据 #8 部分实施；#16 接入日志额度与每操作重读）
 

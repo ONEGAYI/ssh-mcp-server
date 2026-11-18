@@ -88,7 +88,7 @@ it('remote maintenance timestamps land in the same millisecond magnitude as the 
     const now = Date.now();
     await mkdir(fixture.identityDir, { recursive: true });
     await writeFile(join(fixture.identityDir, 'maintenance.json'), JSON.stringify({ schemaVersion: 1,
-      lastCompletedAt: now - 3600000, lastRunAt: now - 3500000,
+      lastCompletedAt: now - 3500000, lastRunAt: now - 3600000,
       lastLocalSummary: { removedTasks: [], removedTransfers: [], reclaimedResources: [], itemsConsidered: 0 } }));
     // The remote helper reports seconds (reclaim.py's clock is time.time()).
     const nowSeconds = Math.floor(now / 1000);
@@ -101,7 +101,7 @@ it('remote maintenance timestamps land in the same millisecond magnitude as the 
     const remote = report.storage.remote;
     // The local end reports its own lastRunAt alongside lastCompletedAt.
     assert.equal(typeof local.maintenance.lastRunAt, 'number');
-    assert.ok(local.maintenance.lastRunAt > 0 && local.maintenance.lastRunAt <= Date.now());
+    assert.equal(local.maintenance.lastRunAt, now - 3600000);
     // The remote seconds are normalized to milliseconds: same magnitude as
     // the local figures, no 1000x skew between the two ends.
     assert.equal(remote.maintenance.lastCompletedAt, nowSeconds * 1000);

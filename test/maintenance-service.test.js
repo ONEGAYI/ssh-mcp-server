@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
+import { buildStorageReport } from '../build/services/storage-report.js';
 
 const MODULE_URL = new URL('../build/services/maintenance.js', import.meta.url).href;
 let MaintenanceService;
@@ -226,6 +227,34 @@ it('expires stalled upload mirror records by their recorded TTL like downloads (
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+it('retains a legacy upload mirror from terminal acknowledgement, not its interruption TTL', async () => {
+  const fixture = await buildFixture();
+  try {
+    const now = Date.now();
+    const source = join(fixture.root, 'source.txt');
+    await writeFile(source, 'original upload');
+    const save = async (id, state, daysAgo) => writeTransfer(fixture.identityDir, id, {
+      schemaVersion: 1, transferId: id, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', localPath: source, remotePath: '/work/target.txt',
+      expiresAt: now - 35 * DAY,
+    }, { 'ack.json': { schemaVersion: 1, transferId: id, state,
+      acknowledgedAt: new Date(now - daysAgo * DAY).toISOString() } });
+    const recent = 'a'.repeat(32);
+    const old = 'b'.repeat(32);
+    const nonterminal = 'c'.repeat(32);
+    const retained = await save(recent, 'completed', 10);
+    const expired = await save(old, 'cancelled', 31);
+    const unconfirmed = await save(nonterminal, 'transferring', 10);
+
+    const result = await new MaintenanceService(fixture.config, recordingRemote()).maybeMaintain();
+    assert.deepEqual(result.local.removedTransfers, [old, nonterminal]);
+    assert.ok(await stat(retained));
+    await assert.rejects(stat(expired), { code: 'ENOENT' });
+    await assert.rejects(stat(unconfirmed), { code: 'ENOENT' });
+    assert.equal(await readFile(source, 'utf8'), 'original upload');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 it('unknown download records are non-terminal: they expire by their TTL, not the terminal retention (review R2)', async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();
@@ -385,8 +414,11 @@ it('a half-written lock file is cleaned up so the next attempt is not permanentl
   }
 });
 
-it('backs off the remote round for five minutes after a failure while local reclamation continues (review R12)', async () => {
-  const fixture = await buildFixture();
+it('throttles local reclamation independently of the five-minute remote retry', async t => {
+  const fixture = await buildFixture({ maintenance: { intervalMs: 60_000 } });
+  const start = Date.now();
+  let now = start;
+  t.mock.method(Date, 'now', () => now);
   let failing = true;
   const remote = recordingRemote((action) => {
     if (failing) { const error = new Error('connection down'); error.retriable = true; throw error; }
@@ -394,35 +426,54 @@ it('backs off the remote round for five minutes after a failure while local recl
   });
   try {
     const service = new MaintenanceService(fixture.config, remote);
+    const localMaintenance = async () => (await buildStorageReport(fixture.config,
+      { call: async () => { throw new Error('connection down'); } }, 'maint-test')).storage.local.maintenance;
+    const expiredTask = jobId => writeTask(fixture.identityDir, jobId, {
+      'record.json': { schemaVersion: 1, jobId, workspaceId: 'maint-test' },
+      'ack.json': { jobId, acknowledgedAt: new Date(start - 40 * DAY).toISOString() },
+    });
+    await expiredTask('job-before-failure');
     const first = await service.maybeMaintain();
     assert.equal(first.remoteError, 'connection down');
     assert.equal(remote.calls.length, 1);
-    // A task that expires during the offline window.
-    await writeTask(fixture.identityDir, 'job-backoff', {
-      'record.json': { schemaVersion: 1, jobId: 'job-backoff', workspaceId: 'maint-test' },
-      'ack.json': { jobId: 'job-backoff', acknowledgedAt: new Date(Date.now() - 40 * DAY).toISOString() },
-    });
-    // Immediate retrigger: the remote round is skipped for the backoff
-    // window (no per-tool-call 30 s connection timeout stacking)...
-    const second = await service.maybeMaintain();
-    assert.equal(remote.calls.length, 1, 'the backoff window must not retry the remote round');
+    const initialState = await readMaintenanceState(fixture.identityDir);
+    const initialReport = await localMaintenance();
+    const queued = await expiredTask('job-backoff');
+    now += 1_000;
+
+    // A second service simulates a later MCP/CLI process using the same state.
+    const second = await new MaintenanceService(fixture.config, remote).maybeMaintain();
     assert.equal(second.remoteSkipped, 'backoff');
-    assert.equal(second.remoteError, undefined);
-    // ...while local reclamation keeps running normally.
-    assert.deepEqual(second.local.removedTasks, ['job-backoff']);
-    assert.equal(await stat(join(fixture.identityDir, 'tasks', 'job-backoff')).then(() => true, () => false), false);
-    // No completion was recorded for the skipped round: the catch-up duty stands.
-    assert.equal((await readMaintenanceState(fixture.identityDir)).lastCompletedAt, 0);
-    // Once the backoff window lapses, the remote round retries (offline
-    // reconnect semantics preserved) and completes.
-    failing = false;
-    const state = await readMaintenanceState(fixture.identityDir);
-    state.lastRemoteAttemptAt = Date.now() - 6 * 60_000;
-    await writeFile(join(fixture.identityDir, 'maintenance.json'), JSON.stringify(state));
+    assert.equal(second.local, undefined, 'a trigger inside both intervals must not scan again');
+    assert.equal(remote.calls.length, 1);
+    assert.ok(await stat(queued), 'eligible work stays queued until the local interval opens');
+    assert.deepEqual(await readMaintenanceState(fixture.identityDir), initialState, 'a throttled trigger does not write state');
+
+    assert.equal(initialReport.lastRunAt, start);
+    assert.equal(initialReport.lastCompletedAt, start, 'remote failure does not hide local completion');
+    assert.equal(initialReport.removedTasks, 1, 'the local count is from its displayed run');
+
+    now = start + 4 * 60_000 + 50_000;
     const third = await service.maybeMaintain();
-    assert.equal(remote.calls.length, 2);
-    assert.equal(third.remoteError, undefined);
-    assert.ok((await readMaintenanceState(fixture.identityDir)).lastCompletedAt > 0);
+    assert.equal(third.remoteSkipped, 'backoff');
+    assert.equal(remote.calls.length, 1);
+    assert.deepEqual(third.local.removedTasks, ['job-backoff']);
+    await assert.rejects(stat(queued), { code: 'ENOENT' });
+    const localOnlyReport = await localMaintenance();
+    assert.equal(localOnlyReport.lastRunAt, now);
+    assert.equal(localOnlyReport.lastCompletedAt, now);
+    assert.equal(localOnlyReport.removedTasks, 1);
+
+    const nextLocal = await expiredTask('job-after-local-sweep');
+    now = start + 5 * 60_000;
+    failing = false;
+    const fourth = await service.maybeMaintain();
+    assert.equal(remote.calls.length, 2, 'retry as soon as the remote backoff ends');
+    assert.equal(fourth.remoteError, undefined);
+    assert.equal(fourth.local, undefined, 'remote retry does not force another local scan');
+    assert.equal(fourth.lastCompletedAt, now);
+    assert.ok(await stat(nextLocal));
+    assert.deepEqual(await localMaintenance(), localOnlyReport, 'remote-only success cannot replace local timestamps or counts');
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 

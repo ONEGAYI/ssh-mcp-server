@@ -1,8 +1,8 @@
 /**
  * Hourly online maintenance for one workspace (issue #16, spec 7.2 / ADR 0010).
  *
- * Every MCP tool call and job CLI run triggers maybeMaintain(); a persisted
- * timestamp throttles actual rounds to policy.maintenance.intervalMs (default
+ * Every MCP tool call and job CLI run triggers maybeMaintain(); persisted
+ * timestamps throttle each end to policy.maintenance.intervalMs (default
  * one hour). Because the timestamp survives process exits, an offline gap
  * (MCP closed, SSH down) is simply caught up by the first trigger after
  * reconnecting -- no daemon, no remote cron.
@@ -17,8 +17,9 @@
  *      reclaimed the same verified way (issue #17);
  *   2. one remote `maintenance` helper call carrying the freshly loaded
  *      policy (loadPolicy re-reads the profile every round). Only a
- *      successful remote round advances lastCompletedAt, so a failed
- *      attempt retries on the next trigger. The remote round itself also
+ *      successful remote round advances lastCompletedAt. Failed attempts
+ *      retry after five minutes without repeating a recent local sweep.
+ *      The remote round itself also
  *      reclaims expired read credentials, stale helper images and verified
  *      crash-leftover temps (issue #17).
  *
@@ -43,17 +44,16 @@ const REMOTE_FAILURE_BACKOFF_MS = 300_000;
 
 interface MaintenanceState {
   schemaVersion: 1;
+  /** Last successful remote round; legacy records used a joint timestamp. */
   lastCompletedAt: number;
-  /** The last round that actually ran, success or failure (the local twin of
-   * the remote lastRunAt; review R3 -- both ends feed the storage report). */
+  /** Start of the latest local sweep, even if it died before saving counts. */
   lastRunAt?: number;
   /** The last remote attempt; the failure backoff window is measured from
    * here (review R12). Cleared implicitly on success: a completed round
    * throttles by lastCompletedAt instead. */
   lastRemoteAttemptAt?: number;
-  lastLocalSummary?: LocalSummary;
+  lastLocalSummary?: LocalSummary & { startedAt?: number; completedAt?: number };
   lastRemoteSummary?: unknown;
-  lastRemoteError?: string;
 }
 
 export interface LocalSummary {
@@ -68,8 +68,7 @@ export interface MaintenanceOutcome {
   local?: LocalSummary;
   remote?: unknown;
   remoteError?: string;
-  /** The remote round was skipped by the failure backoff window (review R12);
-   * local reclamation still ran and lastCompletedAt stays unset. */
+  /** The failure backoff delayed the remote round, irrespective of local cadence. */
   remoteSkipped?: "backoff";
   lastCompletedAt?: number;
 }
@@ -207,23 +206,25 @@ export class MaintenanceService {
     try { record = JSON.parse(await readFile(join(directory, "record.json"), "utf8")); }
     catch (error) { if (isMissing(error)) return false; throw error; }
     if (record.background && await transferDriverRunning(this.config.identity, transferId)) return false;
-    const state = typeof record.state === "string" ? record.state : "prepared";
-    if (TERMINAL_TRANSFER_STATES.has(state)) {
-      let terminalAt = 0;
+    const terminal = typeof record.state === "string" && TERMINAL_TRANSFER_STATES.has(record.state);
+    const legacyUpload = record.direction === "upload" && record.state === undefined;
+    if (terminal || legacyUpload) {
+      let ack: Record<string, unknown> | undefined;
       try {
-        const ack = JSON.parse(await readFile(join(directory, "ack.json"), "utf8"));
-        terminalAt = typeof ack.acknowledgedAt === "string" ? Date.parse(ack.acknowledgedAt)
-          : typeof record.completedAt === "number" ? record.completedAt : 0;
-        if (now - terminalAt >= retention.confirmedResultMs) {
-          await rm(directory, { recursive: true, force: true });
-          return true;
-        }
-        return false;
+        ack = JSON.parse(await readFile(join(directory, "ack.json"), "utf8"));
       } catch (error) {
         if (!isMissing(error)) throw error;
-        // No ack: unconfirmed retention from completion.
+      }
+      // Legacy synchronous uploads store their terminal state only in the ack.
+      const legacyConfirmed = ack?.transferId === transferId
+        && typeof ack.state === "string" && TERMINAL_TRANSFER_STATES.has(ack.state);
+      if (terminal || legacyConfirmed) {
         const completedAt = typeof record.completedAt === "number" ? record.completedAt : 0;
-        if (now - completedAt >= retention.unconfirmedResultMs) {
+        const terminalAt = ack !== undefined && typeof ack.acknowledgedAt === "string"
+          ? Date.parse(ack.acknowledgedAt)
+          : terminal ? completedAt : undefined;
+        const retentionMs = ack === undefined ? retention.unconfirmedResultMs : retention.confirmedResultMs;
+        if (terminalAt !== undefined && now - terminalAt >= retentionMs) {
           await rm(directory, { recursive: true, force: true });
           return true;
         }
@@ -345,27 +346,47 @@ export class MaintenanceService {
     return summary;
   }
 
+  private schedule(state: MaintenanceState, intervalMs: number): { local: boolean; remote: "run" | "backoff" | null } {
+    const now = Date.now();
+    const local = now - (state.lastLocalSummary?.completedAt ?? state.lastCompletedAt) >= intervalMs;
+    const remote = !this.remote || now - state.lastCompletedAt < intervalMs ? null
+      : typeof state.lastRemoteAttemptAt === "number" && now - state.lastRemoteAttemptAt < REMOTE_FAILURE_BACKOFF_MS
+        ? "backoff" : "run";
+    return { local, remote };
+  }
+
   /** Entry point for every tool call / CLI run. Cheap when throttled. */
   async maybeMaintain(): Promise<MaintenanceOutcome> {
     const policy = await loadPolicy(this.config.profilePath);
+    const { intervalMs, timeBudgetMs, maxItemsPerRun } = policy.maintenance;
     const state = await this.readState();
-    if (Date.now() - state.lastCompletedAt < policy.maintenance.intervalMs) {
-      return { skipped: "interval" };
+    const plan = this.schedule(state, intervalMs);
+    if (!plan.local && plan.remote !== "run") {
+      return plan.remote === "backoff" ? { skipped: "interval", remoteSkipped: "backoff" } : { skipped: "interval" };
     }
     const lock = await this.acquireLock();
     if ("busy" in lock) return { skipped: "busy" };
     try {
       // Double-check under the lock: a concurrent round may have completed.
       const fresh = await this.readState();
-      if (Date.now() - fresh.lastCompletedAt < policy.maintenance.intervalMs) {
-        return { skipped: "interval" };
+      const plan = this.schedule(fresh, intervalMs);
+      const outcome: MaintenanceOutcome = {};
+      if (plan.local) {
+        const startedAt = Date.now();
+        fresh.lastRunAt = startedAt;
+        await this.writeState(fresh);
+        const local = await this.reclaimLocal(policy, Date.now() + timeBudgetMs);
+        const completedAt = Date.now();
+        fresh.lastLocalSummary = { ...local, startedAt, completedAt };
+        outcome.local = local;
+        if (!this.remote) outcome.lastCompletedAt = completedAt;
       }
-      // A real round is running now, success or failure: stamp it durably
-      // before anything can fail (review R3, the twin of the remote lastRunAt).
-      const round = { ...fresh, schemaVersion: 1 as const, lastRunAt: Date.now() };
-      await this.writeState(round);
-      const deadline = Date.now() + policy.maintenance.timeBudgetMs;
-      const local = await this.reclaimLocal(policy, deadline);
+      if (!this.remote || plan.remote !== "run") {
+        if (plan.local) await this.writeState(fresh);
+        else outcome.skipped = "interval";
+        if (plan.remote === "backoff") outcome.remoteSkipped = "backoff";
+        return outcome;
+      }
       const retentionMs = {
         confirmedTaskLogMs: policy.retention.confirmedTaskLogMs,
         confirmedResultMs: policy.retention.confirmedResultMs,
@@ -373,41 +394,24 @@ export class MaintenanceService {
         unknownRecordMs: policy.retention.unknownRecordMs,
         interruptedTransferDataMs: policy.retention.interruptedTransferDataMs,
       };
-      let remote: unknown;
-      let remoteError: string | undefined;
-      let remoteSkipped: "backoff" | undefined;
-      if (this.remote) {
-        // Consecutive-failure backoff (review R12): within the window after a
-        // failed attempt the remote round is skipped entirely -- local
-        // reclamation above still ran. Once the window lapses, the next
-        // trigger retries for real (offline reconnect catch-up is preserved).
-        if (typeof round.lastRemoteAttemptAt === "number"
-          && Date.now() - round.lastRemoteAttemptAt < REMOTE_FAILURE_BACKOFF_MS) {
-          remoteSkipped = "backoff";
-        } else {
-          // Persist the attempt moment before the call: a hard failure during
-          // the exchange must still open the backoff window.
-          await this.writeState({ ...round, lastRemoteAttemptAt: Date.now() });
-          try {
-            remote = await this.remote.call("maintenance", { retentionMs,
-              maxItemsPerRun: policy.maintenance.maxItemsPerRun, timeBudgetMs: policy.maintenance.timeBudgetMs },
-              // The remote round may legally spend the whole configured budget
-              // (up to 3.6e6 ms); the 30 s command default would kill every
-              // large-budget round at the client (review R6).
-              { timeoutMs: Math.max(60_000, policy.maintenance.timeBudgetMs + 15_000) });
-          } catch (error) {
-            remoteError = (error as Error).message;
-          }
-        }
+      // Commit local counts with their own timestamps before any SSH delay.
+      // Record the remote attempt too so a process exit still opens backoff.
+      fresh.lastRemoteAttemptAt = Date.now();
+      await this.writeState(fresh);
+      try {
+        outcome.remote = await this.remote.call("maintenance", { retentionMs, maxItemsPerRun, timeBudgetMs },
+          // Allow the full remote budget rather than the default 30 s (review R6).
+          { timeoutMs: Math.max(60_000, timeBudgetMs + 15_000) });
+      } catch (error) {
+        outcome.remoteError = (error as Error).message;
+        return outcome;
       }
-      if (remoteError === undefined && remoteSkipped === undefined) {
-        const completed: MaintenanceState = { schemaVersion: 1, lastCompletedAt: Date.now(),
-          lastRunAt: round.lastRunAt, lastLocalSummary: local, lastRemoteSummary: remote };
-        await this.writeState(completed);
-        return { local, remote, lastCompletedAt: completed.lastCompletedAt };
-      }
-      if (remoteSkipped === "backoff") return { local, remoteSkipped };
-      return { local, remoteError };
+      delete fresh.lastRemoteAttemptAt;
+      fresh.lastCompletedAt = Date.now();
+      fresh.lastRemoteSummary = outcome.remote;
+      await this.writeState(fresh);
+      outcome.lastCompletedAt = fresh.lastCompletedAt;
+      return outcome;
     } finally {
       await unlink(this.lockPath).catch(() => undefined);
       await lock.handle.close();
