@@ -1,7 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WorkspaceConfig } from "../config/workspace.js";
-import { loadPolicy } from "../config/policy.js";
+import { loadPolicy, searchScanBudgetSchema } from "../config/policy.js";
 import { RemoteAgentClient, RemoteAgentError } from "./remote-agent-client.js";
 
 export class FileService {
@@ -15,15 +15,14 @@ export class FileService {
       allowedRemotePaths: connection.allowedRemotePaths ?? [] };
     if (action !== "file_find" && action !== "file_search") return this.remote.call(action, scoped);
 
-    const { search: { scanBudgetBytes, timeBudgetMs } } = await loadPolicy(this.config.profilePath);
     // Older profiles stored positive integers without the discovery helper's
     // bounds. Reject unsupported values for discovery, not for the binding.
-    if (scanBudgetBytes < 64 * 1024 || scanBudgetBytes > 2 * 1024 ** 3) {
-      throw new RemoteAgentError("INVALID_CONFIG", "policy.search.scanBudgetBytes must be between 65536 and 2147483648");
+    const budget = searchScanBudgetSchema.safeParse((await loadPolicy(this.config.profilePath)).search);
+    if (!budget.success) {
+      const [issue] = budget.error.issues;
+      throw new RemoteAgentError("INVALID_CONFIG", `policy.search.${issue.path.join(".")}: ${issue.message}`);
     }
-    if (timeBudgetMs < 1_000 || timeBudgetMs > 60_000) {
-      throw new RemoteAgentError("INVALID_CONFIG", "policy.search.timeBudgetMs must be between 1000 and 60000");
-    }
+    const { scanBudgetBytes, timeBudgetMs } = budget.data;
     // Leave room for the helper's up-to-10 s backend drain and 2 s process
     // wait. An explicit connection cap still takes priority.
     const timeoutMs = timeBudgetMs + 15_000;

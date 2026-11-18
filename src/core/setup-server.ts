@@ -9,7 +9,7 @@ import { CommandLineParser } from "../cli/command-line-parser.js";
 import { RemoteAgentError } from "../services/remote-agent-client.js";
 import { setupWorkspaceIntegration, removeWorkspaceBinding, revisionOf, writeAtomic } from "../services/workspace-setup.js";
 import { bindingNamePattern, profileSchema, clientsSchema, sessionStartSchema, sessionStartDefaults } from "../config/workspace.js";
-import { policySectionSchema, resolvePolicy, StoredPolicy } from "../config/policy.js";
+import { policyPatchSchema, policySectionSchema, resolvePolicy, StoredPolicy } from "../config/policy.js";
 import { SERVER_CONFIG } from "../config/server.js";
 
 const optionalPath = z.string().min(1).optional();
@@ -64,7 +64,7 @@ function firstIssue(error: z.ZodError): string {
 
 function parsePolicyPatch(value: StoredPolicy | undefined): StoredPolicy | undefined {
   if (value === undefined) return undefined;
-  const candidate = policySectionSchema.safeParse(value);
+  const candidate = policyPatchSchema.safeParse(value);
   if (!candidate.success) throw new RemoteAgentError("SETUP_INVALID_POLICY", `Invalid policy section: ${firstIssue(candidate.error)}`);
   return candidate.data;
 }

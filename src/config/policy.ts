@@ -53,13 +53,24 @@ export const policyDefaults = {
   maintenance: { intervalMs: 3600000, maxItemsPerRun: 100, timeBudgetMs: 2000 },
 };
 
-/** Stored and update-patch form: every leaf optional, unknown keys rejected so typos fail loudly. */
+/** Stored form: keep older profiles readable so unsupported discovery budgets can be repaired. */
 export const policySectionSchema = z.object({
   limits: z.object(storedLeaves.limits).partial().strict().optional(),
   retention: z.object(storedLeaves.retention).partial().strict().optional(),
   search: z.object(storedLeaves.search).partial().strict().optional(),
   maintenance: z.object(storedLeaves.maintenance).partial().strict().optional(),
 }).strict();
+
+/** Bounds shared by new setup writes and discovery execution. */
+export const searchScanBudgetSchema = z.object({
+  scanBudgetBytes: positiveInt.min(64 * 1024).max(2 * 1024 ** 3),
+  timeBudgetMs: positiveInt.min(1_000).max(60_000),
+});
+
+/** Only explicitly supplied leaves are validated against the current execution bounds. */
+export const policyPatchSchema = policySectionSchema.extend({
+  search: z.object({ ...storedLeaves.search, ...searchScanBudgetSchema.shape }).partial().strict().optional(),
+});
 
 const resolvedPolicySchema = z.object({
   limits: z.object({

@@ -52,7 +52,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留已由票据 #8 接入本机下载链路（读 `limits.localWorkspaceBytes`），#16 起本机 SpaceLedger 每次额度检查经 loadPolicy 重读该值（保存的 policy 变更下一操作生效）；远端额度经 `<状态根>/ledger/policy.json` 每次操作重读；远端维护期限由本机维护轮次随请求传入（见「生命周期与回收」），远端 policy.json 的 retentionMs/maintenance 节可作本地缺省覆盖。
 
-搜索和查找每页读取本机 profile 的 `policy.search.scanBudgetBytes`、`timeBudgetMs`，分别接受 64 KiB–2 GiB、1000–60000 ms。不新增 MCP 参数；其他 search 策略字段仍只有存储，不改变工具默认行为。此前已保存的正整数若超出此范围，搜索和查找在调用时返回 `INVALID_CONFIG`，不影响绑定加载与其他工具。未设显式 `commandTimeoutMs` 时，SSH 交换时限取默认 30 秒与「时间预算加 15 秒余量」中的较大值。
+搜索和查找每页读取本机 profile 的 `policy.search.scanBudgetBytes`、`timeBudgetMs`，分别接受 64 KiB–2 GiB、1000–60000 ms。setup 的 configure/update 对显式提供的值使用同一范围，超出时返回 `SETUP_INVALID_POLICY`，不写入。旧 profile 的越界值仍可 inspect、逐项 update 修正；修正前搜索和查找返回 `INVALID_CONFIG`，不影响绑定加载与其他工具。不新增 MCP 参数；其他 search 策略字段仍只有存储，不改变工具默认行为。未设显式 `commandTimeoutMs` 时，SSH 交换时限取默认 30 秒与「时间预算加 15 秒余量」中的较大值。
 
 其余边界沿用 [ADR 0011](../adr/0011-binding-reconfiguration.md)：更换服务器或状态目录通过新建绑定处理，不做自动迁移。
 
