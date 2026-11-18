@@ -673,13 +673,23 @@ class FileService:
             raise AgentError('READ_REQUIRED', 'Read the file with this tool before modifying it')
         try:
             token = read_json(self.reads / (value + '.json'))
-        except OSError:
+        except (OSError, ValueError):
             raise AgentError('READ_REQUIRED', 'Read record is unavailable')
+        if not isinstance(token, dict):
+            raise AgentError('READ_REQUIRED', 'Read record is damaged; read the file again')
+        expires_at, ranges, size = token.get('expiresAt'), token.get('ranges'), token.get('size')
+        if not (all(isinstance(token.get(field), str) for field in ('session', 'path', 'version'))
+                and type(expires_at) in (int, float) and 0 <= expires_at < float('inf')
+                and type(size) is int and size >= 0 and isinstance(ranges, list)
+                and all(isinstance(item, list) and len(item) == 2
+                        and type(item[0]) is int and type(item[1]) is int
+                        and 0 <= item[0] <= item[1] <= size for item in ranges)):
+            raise AgentError('READ_REQUIRED', 'Read record is damaged; read the file again')
         if token['session'] != self.session or token['path'] != str(path):
             raise AgentError('READ_SCOPE_MISMATCH', 'Read record belongs to a different file or session')
         if token['version'] != version and not allow_stale:
             raise AgentError('FILE_CONFLICT', 'File changed since it was read; read it again')
-        if _now() > token.get('expiresAt', 0):
+        if _now() > expires_at:
             # Three idle days killed the credential (spec 4.2); failed and
             # query-only calls never renewed it. Expired ranges stay dead.
             raise AgentError('READ_TOKEN_EXPIRED', 'Read credential expired after three idle days; read the file again')
@@ -731,16 +741,15 @@ class FileService:
             # credential from this window alone, like a first read.
             try:
                 index = read_json(index_path)
-                candidate = index['readToken']
-                old = read_json(self.reads / (candidate + '.json'))
-                if (old['session'] == self.session and old['path'] == str(path) and old['version'] == version
-                        and _now() <= old.get('expiresAt', 0)):
-                    key, previous = candidate, old['ranges']
-                    history = index.get('editHistory', [])
-                    if history and history[-1]['after'] != version:
-                        history = []
-            except (OSError, ValueError):
-                key, previous = None, []
+                candidate = index.get('readToken') if isinstance(index, dict) else None
+                old = self.token(candidate, path, version)
+            except (OSError, ValueError, AgentError):
+                pass  # The old credential cannot contribute any read coverage.
+            else:
+                key, previous = candidate, old['ranges']
+                history = index.get('editHistory', [])
+                if history and history[-1]['after'] != version:
+                    history = []
         ranges = merge_ranges(previous + [[0, bom_size], [start, delivered_end]])
         return self.save_read(path, version, size, ranges, key, history)
 

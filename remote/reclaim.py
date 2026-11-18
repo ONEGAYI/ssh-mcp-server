@@ -59,6 +59,7 @@ DEFAULT_RETENTION_MS = {
 DEFAULT_MAX_ITEMS = 100
 DEFAULT_TIME_BUDGET_MS = 2000
 LAZY_THROTTLE_SECONDS = 60
+CURSOR_CHECKPOINT_ITEMS = 16
 TRANSFER_TERMINAL = frozenset(('completed', 'failed', 'cancelled', 'interrupted'))
 TASK_TERMINAL = frozenset(('exited', 'cancelled', 'interrupted'))
 HELPER_DIGEST = re.compile(r'[0-9a-f]{64}')
@@ -167,16 +168,11 @@ def _resolve_options(root, request):
     options = {}
     for key, default, low, high in (('maxItemsPerRun', DEFAULT_MAX_ITEMS, 1, 100000),
                                     ('timeBudgetMs', DEFAULT_TIME_BUDGET_MS, 1, 3600000)):
-        chosen = default
-        if key in policy_maintenance and _valid_period_ms(policy_maintenance[key]):
-            chosen = policy_maintenance[key]
-        if key in request:
-            value = request.get(key)
-            if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
-                raise AgentError('INVALID_REQUEST',
-                                 '{} must be an integer between {} and {}'.format(key, low, high))
-            chosen = value
-        options[key] = chosen
+        value = request.get(key, policy_maintenance.get(key, default))
+        if type(value) is not int or not low <= value <= high:
+            raise AgentError('INVALID_REQUEST',
+                             '{} must be an integer between {} and {}'.format(key, low, high))
+        options[key] = value
     return options
 
 
@@ -628,7 +624,7 @@ def _ledger_resource_ids(root):
 
 def _run_cursor_section(root, state, cursor_key, names, process,
                         items, options, deadline):
-    """One budgeted, cursor-persisted pass; returns (items, exhausted)."""
+    """Advance one section; checkpoint every 16 entries across the round."""
     cursor = state.get(cursor_key)
     for name in names:
         if cursor is not None and name <= cursor:
@@ -646,19 +642,18 @@ def _run_cursor_section(root, state, cursor_key, names, process,
             pass
         items += 1
         state[cursor_key] = name
-        _save_maintenance_state(root, state)
+        if items % CURSOR_CHECKPOINT_ITEMS == 0:
+            _save_maintenance_state(root, state)
     state[cursor_key] = None
-    _save_maintenance_state(root, state)
     return items, False
 
 
-def _run_round(root, request):
-    """One bounded round; the caller already holds the maintenance lock."""
+def _run_round(root, request, state, lazy=False):
+    """One bounded round with a state snapshot loaded under the caller's lock."""
     periods = _resolve_periods(root, request)
     options = _resolve_options(root, request)
     now = _now()
     deadline = time.monotonic() + options['timeBudgetMs'] / 1000.0
-    state = _load_maintenance_state(root)
     summary = {'removedJobs': [], 'purgedLogs': [], 'markedUnknown': [],
                'removedTransfers': [], 'removedReadTokens': [],
                'removedReadIndexes': [], 'removedHelpers': [],
@@ -702,6 +697,8 @@ def _run_round(root, request):
     state['lastRunAt'] = now
     if not exhausted:
         state['lastCompletedAt'] = now
+    if lazy:
+        state['lastLazyAt'] = _now()
     # The persisted round summary keeps counters only (#19): the in-memory
     # summary's per-item name lists must never grow the state file. All five
     # sections feed it -- the storage report must see credential, helper and
@@ -727,7 +724,7 @@ def run_maintenance(root, request):
     with _try_flock(_maintenance_lock(root)) as held:
         if not held:
             return {'skipped': 'busy', 'reason': 'Another process is maintaining this workspace'}
-        return _run_round(root, request)
+        return _run_round(root, request, _load_maintenance_state(root))
 
 
 def last_round_summary(root):
@@ -752,6 +749,12 @@ def last_round_summary(root):
     return view
 
 
+def _lazy_recent(state):
+    last = state['lastLazyAt']
+    now = _now()
+    return _numeric(last) and now - LAZY_THROTTLE_SECONDS < last <= now
+
+
 def lazy_attempt(root):
     """Throttled opportunistic round attached to query actions.
 
@@ -761,16 +764,14 @@ def lazy_attempt(root):
     the query's own result must never depend on cleanup."""
     try:
         state = _load_maintenance_state(root)
-        if _now() - state.get('lastLazyAt', 0) < LAZY_THROTTLE_SECONDS:
+        if _lazy_recent(state):
             return
         with _try_flock(_maintenance_lock(root)) as held:
             if not held:
                 return
             state = _load_maintenance_state(root)
-            if _now() - state.get('lastLazyAt', 0) < LAZY_THROTTLE_SECONDS:
+            if _lazy_recent(state):
                 return
-            _run_round(root, {})
-            state['lastLazyAt'] = _now()
-            _save_maintenance_state(root, state)
+            _run_round(root, {}, state, lazy=True)
     except Exception:
         return

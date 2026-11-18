@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 HELPER = Path(__file__).resolve().parents[1] / 'remote' / 'agent.py'
@@ -464,6 +465,59 @@ class RemoteReclaimTest(unittest.TestCase):
         state = json.loads((self.state / 'maintenance.json').read_text())
         self.assertTrue(state['lastCompletedAt'] > 0)
 
+    def test_maintenance_checkpoints_progress_without_fsync_per_entry(self):
+        sys.path.insert(0, str(HELPER.parent))
+        import reclaim
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        for i in range(101):
+            (reads / ('{:032x}.json'.format(i))).write_text(json.dumps({'expiresAt': 1}))
+        with patch.object(reclaim.os, 'fsync', wraps=os.fsync) as synced:
+            first = reclaim.run_maintenance(self.state, {})
+        self.assertEqual(first['itemsConsidered'], 100)
+        self.assertFalse(first['completed'])
+        self.assertLessEqual(synced.call_count, 16)
+        saved = json.loads((self.state / 'maintenance.json').read_text())
+        self.assertEqual(saved['readsCursor'], '{:032x}.json'.format(99))
+        second = reclaim.run_maintenance(self.state, {})
+        self.assertTrue(second['completed'])
+        self.assertEqual(second['itemsConsidered'], 1)
+        self.assertEqual(list(reads.iterdir()), [])
+
+    def test_maintenance_resume_after_checkpoint_does_not_rescan_the_entire_batch(self):
+        sys.path.insert(0, str(HELPER.parent))
+        import reclaim
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        for i in range(32):
+            (reads / ('{:032x}.json'.format(i))).write_text('{}')
+        def interrupt(root, name, now, summary):
+            if name == '{:032x}.json'.format(23):
+                raise RuntimeError('interrupted')
+        with patch.object(reclaim, '_process_read_entry', side_effect=interrupt):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                reclaim.run_maintenance(self.state, {})
+        resumed = self.maintenance()['result']
+        # The completed checkpoint is retained; an interrupted checkpoint
+        # can be replayed from its start instead of losing work or skipping it.
+        self.assertEqual(resumed['itemsConsidered'], 16)
+        self.assertTrue(resumed['completed'])
+
+    def test_maintenance_validates_effective_policy_budgets_like_request_budgets(self):
+        ledger = self.state / 'ledger'
+        ledger.mkdir(parents=True)
+        policy = ledger / 'policy.json'
+        for key, bad in [('maxItemsPerRun', 0), ('maxItemsPerRun', 1.5),
+                         ('maxItemsPerRun', True), ('timeBudgetMs', 3600001)]:
+            with self.subTest(key=key, value=bad):
+                policy.write_text(json.dumps({'maintenance': {key: bad}}))
+                result = self.maintenance()
+                self.assertFalse(result['ok'], result)
+                self.assertEqual(result['error']['code'], 'INVALID_REQUEST')
+                self.assertIn(key, result['error']['message'])
+                valid_override = self.maintenance(**{key: 100})
+                self.assertTrue(valid_override['ok'], valid_override)
+
     def test_maintenance_is_serialized_by_its_lock(self):
         locks = self.state / 'locks'
         locks.mkdir(parents=True)
@@ -484,6 +538,31 @@ class RemoteReclaimTest(unittest.TestCase):
         self.assertTrue(observed['ok'], observed)
         self.assertTrue((self.job_dir(job_id) / 'purged.json').is_file())
         self.assertFalse((self.job_dir(job_id) / 'stdout').exists())
+
+    def test_lazy_maintenance_replaces_corrupt_throttle_and_keeps_its_cursor_and_summary(self):
+        reads = self.state / 'reads'
+        reads.mkdir(parents=True)
+        first, second = [reads / (c * 32 + '.json') for c in ('a', 'b')]
+        for token in (first, second):
+            token.write_text(json.dumps({'expiresAt': 1}))
+        ledger = self.state / 'ledger'
+        ledger.mkdir()
+        (ledger / 'policy.json').write_text(json.dumps({'maintenance': {'maxItemsPerRun': 1}}))
+        state_path = self.state / 'maintenance.json'
+        state_path.write_text(json.dumps({'lastLazyAt': 'bad-clock'}))
+        now = 100000.0
+        self.assertTrue(self.call('file_list', {}, clock=now)['ok'])
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        saved = json.loads(state_path.read_text())
+        self.assertEqual(saved['readsCursor'], first.name)
+        self.assertEqual(saved['lastRunAt'], now)
+        self.assertEqual(saved['lastLazyAt'], now)
+        self.assertEqual(saved['lastSummary']['removedReadTokens'], 1)
+        self.assertTrue(self.call('file_list', {}, clock=now + 59)['ok'])
+        self.assertTrue(second.exists())
+        self.assertTrue(self.call('file_list', {}, clock=now + 60)['ok'])
+        self.assertFalse(second.exists())
 
     # --- task log quota --------------------------------------------------------
 
