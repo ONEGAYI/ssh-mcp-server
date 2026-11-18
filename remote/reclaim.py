@@ -170,8 +170,10 @@ def _resolve_options(root, request):
                                     ('timeBudgetMs', DEFAULT_TIME_BUDGET_MS, 1, 3600000)):
         value = request.get(key, policy_maintenance.get(key, default))
         if type(value) is not int or not low <= value <= high:
-            raise AgentError('INVALID_REQUEST',
-                             '{} must be an integer between {} and {}'.format(key, low, high))
+            if key in request:
+                raise AgentError('INVALID_REQUEST',
+                                 '{} must be an integer between {} and {}'.format(key, low, high))
+            value = default  # Invalid persisted overrides must not stop lazy cleanup.
         options[key] = value
     return options
 

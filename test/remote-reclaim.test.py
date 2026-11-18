@@ -503,18 +503,26 @@ class RemoteReclaimTest(unittest.TestCase):
         self.assertEqual(resumed['itemsConsidered'], 16)
         self.assertTrue(resumed['completed'])
 
-    def test_maintenance_validates_effective_policy_budgets_like_request_budgets(self):
+    def test_maintenance_ignores_invalid_policy_budgets_but_rejects_invalid_request_budgets(self):
         ledger = self.state / 'ledger'
         ledger.mkdir(parents=True)
         policy = ledger / 'policy.json'
+        reads = self.state / 'reads'
+        reads.mkdir()
+        for i in range(3):
+            (reads / ('{:032x}.json'.format(i))).write_text('{}')
         for key, bad in [('maxItemsPerRun', 0), ('maxItemsPerRun', 1.5),
-                         ('maxItemsPerRun', True), ('timeBudgetMs', 3600001)]:
+                         ('maxItemsPerRun', True), ('timeBudgetMs', 3600001),
+                         ('timeBudgetMs', 'bad')]:
             with self.subTest(key=key, value=bad):
                 policy.write_text(json.dumps({'maintenance': {key: bad}}))
-                result = self.maintenance()
-                self.assertFalse(result['ok'], result)
-                self.assertEqual(result['error']['code'], 'INVALID_REQUEST')
-                self.assertIn(key, result['error']['message'])
+                fallback = self.maintenance()
+                self.assertTrue(fallback['ok'], fallback)
+                self.assertEqual(fallback['result']['itemsConsidered'], 3)
+                rejected = self.maintenance(**{key: bad})
+                self.assertFalse(rejected['ok'], rejected)
+                self.assertEqual(rejected['error']['code'], 'INVALID_REQUEST')
+                self.assertIn(key, rejected['error']['message'])
                 valid_override = self.maintenance(**{key: 100})
                 self.assertTrue(valid_override['ok'], valid_override)
 
@@ -547,7 +555,8 @@ class RemoteReclaimTest(unittest.TestCase):
             token.write_text(json.dumps({'expiresAt': 1}))
         ledger = self.state / 'ledger'
         ledger.mkdir()
-        (ledger / 'policy.json').write_text(json.dumps({'maintenance': {'maxItemsPerRun': 1}}))
+        (ledger / 'policy.json').write_text(json.dumps(
+            {'maintenance': {'maxItemsPerRun': 1, 'timeBudgetMs': 'bad'}}))
         state_path = self.state / 'maintenance.json'
         state_path.write_text(json.dumps({'lastLazyAt': 'bad-clock'}))
         now = 100000.0
