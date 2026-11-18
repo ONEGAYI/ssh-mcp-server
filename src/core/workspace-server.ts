@@ -40,7 +40,7 @@ const WORKSPACE_GUIDE = `# SSH 远端工作区使用指引
 - Windows Git Bash 使用 GNU tar 打包时，归档路径用 /c/... 等 MSYS 路径，或加 --force-local；C: 可能被识别为远端主机前缀。该规则针对 GNU tar。
 按需细节：
 - remote_read 文本单页约 56 KiB；行读取检查 lineStart、lineEnd 和 lineEndComplete，超长行用 nextOffset 续读；续读携带 expectedVersion，文件变化时拒绝继续。metadataOnly 只观察版本，不授予已读范围。
-- remote_find / remote_search 默认每页扫描 512 MiB、10 秒，结果页 64 KiB；策略可调整这些预算。分页检查停止原因和 nextCursor，不把预算停止当作搜索完成。
+- remote_find / remote_search 默认扫描预算 512 MiB、10 秒，工作区 policy.search 的 scanBudgetBytes / timeBudgetMs 可调整这两项；结果页上限仍为 64 KiB。预算变更后从第一页重新查询。分页检查停止原因和 nextCursor，不把预算停止当作搜索完成。
 - remote_edit 的 editResults 计数与字节范围按 beforeVersion 解释；检查 rebased 和 concurrentReplayAvailable。并行历史上限为 10 分钟、128 次提交和 4 MiB，超限需重读；编辑保留 BOM、权限与 CRLF。
 - remote_workspace 的 includeStorage 返回小于 4 KiB 的两端空间摘要，包含占用、预留、上限、资源数量及最近维护记录；不可达端标记 unknown。
 - 旧传输登记的 resume 仍同步驱动，默认软预算 55 秒；通过当前宿主的后台 CLI 等待，预算不代表 MCP 等待超时或整个传输的时限。

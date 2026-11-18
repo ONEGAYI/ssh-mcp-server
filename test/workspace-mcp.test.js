@@ -66,6 +66,80 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
   }
 });
 
+it('workspace search and find use the current profile budgets without adding MCP arguments', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-discovery-budget-'));
+  const client = new Client({ name: 'contract-test', version: '1' });
+  try {
+    const profile = { workspaceId: 'discovery-budget', connectionName: 'offline',
+      sshConfigFile: './ssh.json', remoteRoot: '/work', remoteStateDir: '/state', localStateDir: './state' };
+    const profilePath = join(directory, 'workspace.json');
+    const sshPath = join(directory, 'ssh.json');
+    const ssh = { offline: { host: '127.0.0.1', port: 1, username: 'fixture', password: 'fixture-only' } };
+    await writeFile(sshPath, JSON.stringify(ssh));
+    await writeFile(profilePath, JSON.stringify(profile));
+    const preload = join(directory, 'preload.mjs');
+    const remoteUrl = new URL('../build/services/remote-agent-client.js', import.meta.url).href;
+    await writeFile(preload, `import { RemoteAgentClient } from ${JSON.stringify(remoteUrl)};
+RemoteAgentClient.prototype.call = async (action, request, options) => ({ action, request, options });`);
+    const connect = client => client.connect(new StdioClientTransport({ command: process.execPath,
+      args: ['--import', pathToFileURL(preload).href, fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profilePath], stderr: 'pipe' }));
+    const call = (name, active = client) => active.callTool({ name, arguments: { sessionId: 'owner', pattern: 'needle' } });
+    const read = result => {
+      assert.equal(result.isError, undefined, result.content[0].text);
+      return JSON.parse(result.content[0].text);
+    };
+    await connect(client);
+
+    const defaults = read(await call('remote_search'));
+    assert.equal(defaults.request.scanBudgetBytes, 536870912);
+    assert.equal(defaults.request.scanBudgetMs, 10000);
+    assert.equal(defaults.options, undefined);
+
+    profile.policy = { search: { scanBudgetBytes: 1048576, timeBudgetMs: 32123 } };
+    await writeFile(profilePath, JSON.stringify(profile));
+    for (const [tool, action] of [['remote_search', 'file_search'], ['remote_find', 'file_find']]) {
+      const result = read(await call(tool));
+      assert.equal(result.action, action);
+      assert.equal(result.request.scanBudgetBytes, 1048576);
+      assert.equal(result.request.scanBudgetMs, 32123);
+      assert.equal(result.options.timeoutMs, 47123);
+    }
+    const list = read(await call('remote_list'));
+    assert.equal(list.request.scanBudgetMs, undefined);
+    assert.equal(list.options, undefined);
+
+    // An explicit SSH timeout stays an upper bound, even for a longer scan.
+    ssh.offline.commandTimeoutMs = 30000;
+    await writeFile(sshPath, JSON.stringify(ssh));
+    const capped = new Client({ name: 'capped-contract-test', version: '1' });
+    try {
+      await connect(capped);
+      const result = read(await call('remote_search', capped));
+      assert.equal(result.request.scanBudgetMs, 32123);
+      assert.equal(result.options, undefined);
+    } finally { await capped.close(); }
+
+    // Older profiles could store a positive value outside the helper range.
+    // Report it on discovery rather than invalidating the whole binding.
+    profile.policy.search.scanBudgetBytes = 1024;
+    await writeFile(profilePath, JSON.stringify(profile));
+    const invalidBytes = await call('remote_find');
+    assert.equal(invalidBytes.isError, true);
+    assert.match(invalidBytes.content[0].text, /INVALID_CONFIG.*policy\.search\.scanBudgetBytes/);
+    profile.policy.search = { timeBudgetMs: 60001 };
+    await writeFile(profilePath, JSON.stringify(profile));
+    const invalidTime = await call('remote_search');
+    assert.equal(invalidTime.isError, true);
+    assert.match(invalidTime.content[0].text, /INVALID_CONFIG.*policy\.search\.timeBudgetMs/);
+    assert.equal(read(await call('remote_list')).action, 'file_list');
+  } finally {
+    await client.close();
+    const child = relative(tmpdir(), directory);
+    assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 async function ackFixture(t, jobs, { foreign = [], preloadSetup = '', beforeExchange = '' } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-ack-'));
   const client = new Client({ name: 'contract-test', version: '1' });

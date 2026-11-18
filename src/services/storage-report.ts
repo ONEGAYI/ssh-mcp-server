@@ -55,7 +55,8 @@ interface LocalMaintenanceState {
   schemaVersion?: number;
   lastCompletedAt?: unknown;
   lastRunAt?: unknown;
-  lastLocalSummary?: { removedTasks?: unknown; removedTransfers?: unknown; reclaimedResources?: unknown; itemsConsidered?: unknown };
+  lastLocalSummary?: { startedAt?: unknown; completedAt?: unknown; removedTasks?: unknown; removedTransfers?: unknown;
+    reclaimedResources?: unknown; itemsConsidered?: unknown };
 }
 
 function counter(value: unknown): number {
@@ -100,9 +101,15 @@ async function readLocalMaintenance(identityDirectory: string): Promise<Maintena
   }
   const summary = typeof state.lastLocalSummary === "object" && state.lastLocalSummary !== null
     ? state.lastLocalSummary : {};
+  const lastCompletedAt = typeof summary.completedAt === "number" ? summary.completedAt
+    : typeof state.lastCompletedAt === "number" ? state.lastCompletedAt : 0;
+  // In legacy state, a later failed invocation could overwrite lastRunAt
+  // without replacing the counts. A start later than completion is not paired.
+  const lastRunAt = typeof summary.startedAt === "number" ? summary.startedAt
+    : typeof state.lastRunAt === "number" && state.lastRunAt <= lastCompletedAt ? state.lastRunAt : 0;
   return {
-    lastCompletedAt: typeof state.lastCompletedAt === "number" ? state.lastCompletedAt : 0,
-    lastRunAt: typeof state.lastRunAt === "number" ? state.lastRunAt : 0,
+    lastCompletedAt,
+    lastRunAt,
     removedTasks: Array.isArray(summary.removedTasks) ? summary.removedTasks.length : counter(summary.removedTasks),
     removedTransfers: Array.isArray(summary.removedTransfers) ? summary.removedTransfers.length : counter(summary.removedTransfers),
     reclaimedResources: Array.isArray(summary.reclaimedResources) ? summary.reclaimedResources.length : counter(summary.reclaimedResources),

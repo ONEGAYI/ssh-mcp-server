@@ -50,7 +50,9 @@ action='update' 必须携带 inspect 返回的 revision（乐观并发）：缺 
 
 policy 配置节 schema 与规格默认值：limits（本机/远端每工作区各 10737418240 字节）、retention（确认任务日志 3 天；确认结果、未确认结果、unknown 记录各 30 天；中断传输临时数据 3 天；readToken 3 天）、search（respectGitignore=false、includeHidden=true、扫描预算 536870912 字节、时间预算 10000 ms、每页 65536 字节）、maintenance（间隔 3600000 ms、每轮 100 项、时间预算 2000 ms）。profile 中未写的叶子按默认值生效，不物化进文件。
 
-生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留已由票据 #8 接入本机下载链路（读 `limits.localWorkspaceBytes`），#16 起本机 SpaceLedger 每次额度检查经 loadPolicy 重读该值（保存的 policy 变更下一操作生效）；远端额度经 `<状态根>/ledger/policy.json` 每次操作重读；远端维护期限由本机维护轮次随请求传入（见「生命周期与回收」），远端 policy.json 的 retentionMs/maintenance 节可作本地缺省覆盖。搜索预算执行方仍属后续票据，接入前相应叶子仅完成存储、校验与重读，不得表述为已强制执行。
+生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留已由票据 #8 接入本机下载链路（读 `limits.localWorkspaceBytes`），#16 起本机 SpaceLedger 每次额度检查经 loadPolicy 重读该值（保存的 policy 变更下一操作生效）；远端额度经 `<状态根>/ledger/policy.json` 每次操作重读；远端维护期限由本机维护轮次随请求传入（见「生命周期与回收」），远端 policy.json 的 retentionMs/maintenance 节可作本地缺省覆盖。
+
+搜索和查找每页读取本机 profile 的 `policy.search.scanBudgetBytes`、`timeBudgetMs`，分别接受 64 KiB–2 GiB、1000–60000 ms。setup 的 configure/update 对显式提供的值使用同一范围，超出时返回 `SETUP_INVALID_POLICY`，不写入。旧 profile 的越界值仍可 inspect、逐项 update 修正；修正前搜索和查找返回 `INVALID_CONFIG`，不影响绑定加载与其他工具。不新增 MCP 参数；其他 search 策略字段仍只有存储，不改变工具默认行为。未设显式 `commandTimeoutMs` 时，SSH 交换时限取默认 30 秒与「时间预算加 15 秒余量」中的较大值。
 
 其余边界沿用 [ADR 0011](../adr/0011-binding-reconfiguration.md)：更换服务器或状态目录通过新建绑定处理，不做自动迁移。
 
@@ -60,7 +62,7 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 
 `remote_workspace` 增加可选参数 `includeStorage`（缺省 false，默认调用零额外开销、响应不含任何统计；不新增独立 MCP 工具）。开启时响应**仅**为两端空间汇总（不返回 capabilities），序列化后不超过 4 KiB：
 
-- **两端各报**：`storage.local` / `storage.remote` 下 `stateBytes / tempBytes / reservedBytes / usedBytes(=三者之和) / limitBytes / resourceCount / reservationCount / maintenance{lastCompletedAt, lastRunAt, 计数}`。计量与额度检查同一口径（`ledger.usage`，见「状态与临时数据的空间额度」节）：状态目录递归扫描（排除账本自身目录）+ 已登记临时资源（含目标同目录的编辑/下载/续传临时文件）+ 未消费预留；提交注销登记后正式目标移出计量；预留与已写占用不双重计数。远端统计为一次有界状态目录遍历加账本读取，不做全盘 `du`。`maintenance` 的时间戳两端统一为**毫秒**：远端 helper 内部时钟为秒（`time.time()`），由本机组装层（storage-report）透传时按数量级判定归一（小于 1e11 的正数视为秒 ×1000，0 保持 0），helper 本身不改；本机 `lastRunAt` 与远端同语义——最近一次实际执行的维护轮，无论该轮成败。
+- **两端各报**：`storage.local` / `storage.remote` 下 `stateBytes / tempBytes / reservedBytes / usedBytes(=三者之和) / limitBytes / resourceCount / reservationCount / maintenance{lastCompletedAt, lastRunAt, 计数}`。计量与额度检查同一口径（`ledger.usage`，见「状态与临时数据的空间额度」节）：状态目录递归扫描（排除账本自身目录）+ 已登记临时资源（含目标同目录的编辑/下载/续传临时文件）+ 未消费预留；提交注销登记后正式目标移出计量；预留与已写占用不双重计数。远端统计为一次有界状态目录遍历加账本读取，不做全盘 `du`。`maintenance` 的时间戳两端统一为**毫秒**：远端 helper 内部时钟为秒（`time.time()`），由本机组装层（storage-report）透传时按数量级判定归一（小于 1e11 的正数视为秒 ×1000，0 保持 0），helper 本身不改。
 - **清理摘要**：`maintenance` 报最近一轮维护的持久化时间与计数（远端自 #16 的 maintenance.json 补记 lastSummary 计数，#17 起覆盖五段：removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered；本机自 maintenance.json 的 lastLocalSummary 聚合为 removedTasks/removedTransfers/reclaimedResources/itemsConsidered 计数）。计数只描述最近一轮，预算中断的轮次在下一轮续扫，不隐含跨轮总计；从未运行过的时间与计数为 0，不猜数。本机维护记录内部保存的逐条 id 清单不会进入响应——汇总只输出聚合计数。
 - **断线语义**：远端不可达、远端统计失败或可达 helper 未返回 storage 节（升级窗口）时，`storage.remote` 为 `{status:"unknown", reason}`，不出现任何数字字段（不写零）；本机部分仍正常返回。`reason` 截断至 200 字符。
 - **4 KiB 预算与裁剪规则**：固定 schema 正常远小于预算；兜底裁剪按序省略 maintenance 计数明细、再省略 resource/reservation 计数，仅剩 usedBytes/limitBytes（或 unknown 端仅 status），保证最终不超过 4096 字节。
@@ -132,14 +134,14 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 - **结果不依赖后端**：rg 只提供文件条目；目录、符号链接等条目由 Python 骨架遍历（同一筛选规则、跳过普通文件）补齐，两路归并为一条全局按路径排序的流并去重。rg 崩溃或无法启动时本页回退纯 Python 遍历（不能冒充空树），`engine` 如实报本页实际使用的 `ripgrep-files` 或 `python-walk`。骨架遍历惰性产出（每目录排序的 k 路归并），预算中断留下的必然是真排序前缀。
 - **glob 契约保持**：模式继续按 basename 或相对路径 `fnmatch` 匹配，条目仍为 `{path, type, size}`，顺序仍为全局路径排序；`file_list` 既有行为不变（非递归、摘要游标、无 engine 字段）。
 - **过滤对齐 search**：`includeHidden` 默认 true、`respectGitignore` 默认 false，语义与 `remote_search` 完全同一（层级 .gitignore、被忽略父目录不能复活子文件、嵌套否定）；`.git` 内部始终排除，显式指定 `.git` 内路径拒绝 `PATH_NOT_ALLOWED`。
-- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），`scanBudgetSeconds` 约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举阶段（含 rg `--files` 读取）耗尽同样返回 partial 与重启游标，不冒充 HELPER_ERROR；**续页在"跳过已返回候选"阶段就耗尽时间预算（游标零推进，重试必在同一位置再超时）时返回明确的 `SCAN_TIME_LIMIT` 错误**，指引缩小目录而非同游标 partial；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
+- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），时间预算约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举阶段（含 rg `--files` 读取）耗尽同样返回 partial 与重启游标，不冒充 HELPER_ERROR；**续页在"跳过已返回候选"阶段就耗尽时间预算（游标零推进，重试必在同一位置再超时）时返回明确的 `SCAN_TIME_LIMIT` 错误**，指引缩小目录而非同游标 partial；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
 - **游标**：绑定工作区、会话、根路径、模式、隐藏/忽略开关与预算参数；查询变化返回 `STALE_CURSOR`。目录枚举是尽力快照（规格 5.2），翻页期间目录增删不触发检测，需要新查询。
 
 **未实测边界**：上述行为已在 WSL（假 rg 枚举后端 + 真实 Python 遍历）自动化验证；CentOS 7 VM 无 rg，仅实测 `python-walk` 路径。真实 ripgrep 二进制的 `--files` 输出顺序与旗标行为未经自动化覆盖（实现按路径排序后消费，不依赖其输出顺序）；内网离线现场已随 v2.0.0 于 2026-09-14 通过用户验收。
 
 ### 搜索分页与预算（2026-09-13 已实施，票据 #11）
 
-- 每页序列化结果上限 64 KiB（`limit` 条数与字节预算任一满即停，`reason=RESULT_LIMIT`）；默认扫描预算 512 MiB / 10 秒（`reason=SCAN_BYTE_LIMIT` / `SCAN_TIME_LIMIT`；请求可用 `scanBudgetBytes`（64 KiB–2 GiB）、`scanBudgetSeconds`（1–60）钳制内覆盖，该两参数参与游标绑定；#18 policy 合入后改由配置提供）。预算按读取字节记账，单页最多超出一个读取块，小预算也能逐页推进。**无单文件大小排除，200 MiB 网表可搜索**。
+- 每页序列化结果上限 64 KiB（`limit` 条数与字节预算任一满即停，`reason=RESULT_LIMIT`）；默认扫描预算 512 MiB / 10 秒（`reason=SCAN_BYTE_LIMIT` / `SCAN_TIME_LIMIT`）。MCP 从工作区配置传送 `scanBudgetBytes` 和 `scanBudgetMs` 给远端 helper；helper 继续接受整秒字段 `scanBudgetSeconds`，等值毫秒保持既有游标身份，改变预算则返回 `STALE_CURSOR`。时间预算从候选文件列表建成并核对游标后起算，扫描字节按读取数据记账，单页最多超出一个读取块。**无单文件大小排除，200 MiB 网表可搜索**。
 - 预算或页满耗尽返回 `truncated=true`、`reason` 与 `nextCursor`，不冒充"没有匹配"；无匹配且扫完返回 `truncated=false, matches=[]`。
 - 游标（base64 JSON）绑定查询串、文件名过滤、隐藏/ignore 开关、预算参数与**候选文件列表摘要**：列表变化（目录增删文件）→ `STALE_CURSOR`，需新查询；续扫文件版本（stat 元数据哈希）变化 → `CURSOR_CONFLICT`。已扫完的文件不再重扫（按候选列表位置跳过）；当前文件按字节/行位置续扫，回退锚点保证不丢已见未留的命中，行号过滤保证不重复。跨文件目录是尽力枚举，不承诺快照。
 - 喂给扫描进程的输入流带背压（selectors 事件驱动读写，单行输出缓冲有界）；超时后强杀子进程时游标回退到最后一个已喂块，不越过被丢弃的输出。
@@ -257,22 +259,28 @@ MCP 提供查询、列举、读日志、短时等待和取消能力。若另行�
 按 [ADR 0010](../adr/0010-state-cleanup-lifecycle.md) 与规格 7.1/7.2 实施两级触发与四类期限，#17 在同一轮次内追加凭据、helper 与遗留临时三类：
 
 - **触发**：懒清理挂在查询类 helper 动作上（status/output/transfer_status/file_read/file_list/file_find/file_search，在查询动作的结果计算完成后、响应发回前同步顺带执行，清理失败不影响查询结果本身），60 秒节流；由于 SSH exec 通道按进程交付输出，首个 60 秒节流窗口内的查询响应可能附带该延迟，至多占用一轮维护预算（默认 2 秒），窗口之后的查询不触发清理、无额外延迟；每小时在线维护由本机驱动——工作区 MCP 每个工具调用与 job CLI 每次运行触发 `maybeMaintain`（`pending` 保持离线安全查询不触发），按 `policy.maintenance.intervalMs`（默认 1 小时）节流，`ssh-mcp-job maintain` 可显式执行一轮。`lastCompletedAt` 持久化在本机 identity 目录：进程退出或 SSH 断连期间的到期数据在下一次触发（重连后首个操作）补做清理，无远端守护进程或 cron。
-- **互斥与预算**：远端一轮持有 `<状态根>/locks/maintenance` flock（非阻塞，拿不到返回 `skipped:busy`），逐项持久化游标（jobs/transfers/reads/helpers/资源登记各自的名字序游标，预算中断下轮续扫，扫到头重置），每轮项数与时长双预算（默认 100 项 / 2 秒，`policy.maintenance` 可配，五段共享同一预算）；每轮结束把聚合计数（removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered，#19 补记、#17 扩至五段）持久化进 maintenance.json 的 `lastSummary`，供空间汇总读取——逐条名字清单不落盘。本机一轮同样有双预算，`maintenance.lock`（记录持有 pid，仅核实死亡才夺回）跨进程互斥。删除任务目录持该任务锁、删除传输目录持其传输槽锁（与 #15 取消同款"无在途块"证据），拿不到锁的条目本轮跳过；资源登记的回收逐项持账本锁（maintenance 锁 → 账本锁方向，符合槽锁先于账本锁的锁序）。
+- **互斥与预算**：远端一轮持有 `<状态根>/locks/maintenance` flock（非阻塞，拿不到返回 `skipped:busy`），维护各段的名字序游标（jobs/transfers/reads/helpers/资源登记，扫到头重置）。每处理 16 项保存一次游标，正常结束或预算用尽时保存本轮进度。异常退出时，最近检查点之后未保存的游标推进最多涉及 16 项；已扫完的段照常重置游标，下一轮可从头扫描。懒清理的节流时间戳与本轮游标和计数一并保存。各轮受项数与时长双预算约束（默认 100 项 / 2 秒，`policy.maintenance` 可配，五段共享同一预算）；每轮结束把聚合计数（removedJobs/purgedLogs/markedUnknown/removedTransfers/removedReadTokens/removedReadIndexes/removedHelpers/reclaimedResources/unknownResources/itemsConsidered，#19 补记、#17 扩至五段）持久化进 maintenance.json 的 `lastSummary`，供空间汇总读取——逐条名字清单不落盘。本机一轮同样有双预算，按下文「状态与临时数据的空间额度」所述的本机状态锁跨进程互斥。删除任务目录持该任务锁、删除传输目录持其传输槽锁（与 #15 取消同款"无在途块"证据），拿不到锁的条目本轮跳过；资源登记的回收逐项持账本锁（maintenance 锁 → 账本锁方向，符合槽锁先于账本锁的锁序）。
+- **远端维护预算参数**：`maxItemsPerRun`（1–100000 项）和 `timeBudgetMs`（1–3600000 毫秒）按「请求 > 远端 `ledger/policy.json` 的 `maintenance` 节 > 默认值」选值，只接受范围内的整数。请求参数不合法时拒绝该请求；远端配置中的不合法值不参与覆盖，缺少合法覆盖时使用默认值。
 - **期限**（全部可经请求覆盖 > 远端 policy.json 的 retentionMs 节 > 规格默认；加速时钟 `SSH_MCP_TEST_CLOCK` 用于期限判定）：已确认任务日志自 ack 起 3 天（删 stdout/stderr/launcher.log 并写 purged.json，dedup 记录保留）；已确认任务/传输结果记录自 ack 起 30 天（整目录回收）；已结束未确认结果自 completedAt 起 30 天（整目录回收，含日志）；unknown 形态任务（starting 卡死/worker 消失的观察结论）自**首次观察**起 30 天——首次维护写入 `unknown.json` 仅记一次，查询与核实失败不续期；中断传输数据自最后实际进展（无进展则注册时刻）起 3 天。
-- **读取凭据回收（#17）**：`<状态根>/reads/` 下过期（`now > expiresAt`，与读取路径 `READ_TOKEN_EXPIRED` 判定同时钟、同语义——晚到的成功操作不复活已过期记录）的 `<readToken>.json` 凭据记录被物理删除，支持新短编号和原 32 位编号（时间戳字段缺失或类型非法属不可判定，保守跳过保留，损坏绝不触发删除）。指向已删或已过期凭据的 `index-*.json` 会话路径索引同轮回收：索引同时检查记录是否存在及是否过期，不依赖凭据与索引的名字顺序；grant_read 对悬空索引本就按首读处理。回收后旧凭据编辑按 `READ_REQUIRED`（记录不可用）拒绝；重读所需片段签发只覆盖新窗口的新凭据，旧已读范围不复活。
+- **读取凭据回收（#17）**：`<状态根>/reads/` 下过期（`now > expiresAt`，与读取路径 `READ_TOKEN_EXPIRED` 判定同时钟、同语义——晚到的成功操作不复活已过期记录）的 `<readToken>.json` 凭据记录被物理删除，支持新短编号和原 32 位编号（时间戳字段缺失或类型非法属不可判定，保守跳过保留，损坏绝不触发删除）。指向已删或已过期凭据的 `index-*.json` 会话路径索引同轮回收：索引同时检查记录是否存在及是否过期，不依赖凭据与索引的名字顺序；grant_read 对悬空索引本就按首读处理。凭据记录丢失或结构损坏时，编辑按 `READ_REQUIRED` 拒绝，不改用其他凭据；重读所需片段签发只覆盖新窗口的新凭据，旧已读范围不复活。
 - **helper 镜像回收（#17）**：远端 helpers/ 按「当前运行版本 + 活动依赖」保留——正在执行维护的 helper 自身所在镜像目录即当前版本；活动依赖以 /proc 命令行证据核实：运行中任务 worker（以 `<镜像>/agent.py --root … _worker` 形式 spawn）、并发 helper 调用与镜像安装进程（目标路径作为 argv）都会出现在 cmdline 中。两者之外的 64-hex 镜像目录在维护轮删除；非 64-hex 命名的目录不是本服务镜像，永不触碰。已知边界：升级窗口内仍在运行的旧版本客户端进程若此刻恰无在途调用，其镜像可能被回收，该进程后续调用将报 `HELPER_EXECUTION_FAILED`，重启进程即自愈（安装幂等重装）；按 #7/#20 的升级纪律应先停旧客户端再切换。
 - **遗留临时资源回收（#17）**：维护轮遍历两端资源账本，逐项三重核实——归属（账本登记本身）、占用（持有进程 PID+boot 启动身份；PID 重用不冒充、年龄不参与判定）、对象身份（路径现存对象与登记的 dev:ino 匹配）。持有者存活 → 保留；持有者已死且身份匹配 → 删文件并注销登记；文件已不存在或名字处已是别的对象 → 仅注销登记（外来文件不删）；持有身份从未锚定或对象身份从未附加 → 未知占用，登记与文件原样保留（登记只含路径/身份/归属/占用证据/字节量等最小管理字段，不含任何结果正文，字节量继续计入额度）。无账本归属的文件（哪怕叫 `.ssh-mcp-*`）永不触碰。
 - **回收后拒绝**：记录删除后旧标识不再落入任何创建分支——`task_start` 报 `REQUEST_EXPIRED_OR_UNKNOWN`，传输各动作经 `_load_record` 同码拒绝；登记后执行协议（#7）保证这一点，#16 的验收即覆盖"回收后重放被拒"。legacy（v1）任务记录仅在 v2 协议激活后删除：未激活工作区的 v1 记录只清日志不删记录，避免升级窗口内旧请求经 legacy start 重跑；#20 起该门槛覆盖全部删除分支（终态与 unknown 形态一致），且激活排空判活与 status 同源——死 worker 的 v1 记录进 unknown 阶段（迁移观察时间起算 30 天）后不再阻塞切换，激活后按原时间回收，删除后 legacy start 重放按 `PROTOCOL_UPGRADE_REQUIRED` 拒绝。
 - **不做**：prepared 任务登记（规格未设期限，不回收）。账本遗留登记/无主临时文件核实回收、readToken/helper 版本回收已随 #17 实施，空间用量汇总已随 #19 实施（见「文件接口」节）。
 - **unknown 记录**：远端 unknown.json 与本机 rejected/unstarted 登记遵循上述期限；结果未知的任务或传输先查询原操作，不自动重跑或再次覆盖；到期停止自动恢复并删除结果详情、诊断与恢复记录，提示记录已过期、需人工核对实际结果；删除后旧请求仍拒绝。该期限不代表操作已失败或停止，不删除正式文件。
 
+本机扫描和远端调用独立计算维护间隔。远端失败后，在线维护调用距上次远端尝试至少 5 分钟才重试；本机扫描仍按自己的间隔运行。空间汇总的本机维护时间与计数来自同一轮已保存的本机扫描，不受仅远端重试、失败或跳过影响。
+
+旧式同步上传的本机镜像没有独立终态字段。同编号的 `ack.json` 记有已确认终态时，镜像按确认期限回收，而不按中断传输期限回收。缺少确认文件仍用原中断期限；确认文件损坏、无法解析时保留该镜像，其余记录照常回收。
+
 ### 状态与临时数据的空间额度（2026-09-13 票据 #8 部分实施；#16 接入日志额度与每操作重读）
 
 2026-09-13 票据 #8 已实施两端跨进程空间账本（WSL Python 套件、npm test 与 VM 套件实测，内网现场未验收）：默认每个工作区在本机和远端各有独立的 10 GiB 空间上限。计量口径 `used = 状态目录扫描 + 已登记临时资源 + 未消费预留`：状态扫描覆盖状态根下状态、日志、辅助程序、锁等本服务数据（排除账本自身目录，避免计量工具自引用抖动）；目标目录旁的编辑/下载/续传临时文件经资源登记计入；正式工程文件与提交后的目标文件不计入（提交注销登记即移出）。登记引用预留时按同量扣减，预留与已写占用不双重计数；预留与登记都在账本互斥锁内完成"检查额度-入账"，跨进程并发预留不超额。
 
 - 远端落盘：`<状态根>/ledger/{ledger.json, ledger.lock}`，额度覆盖文件 `<状态根>/ledger/policy.json`（`{"spaceLimitBytes": N}`，每次操作重新加载）。
-- 本机落盘：`<localStateDir>/<sha256(identity)[:24]>/ledger/{ledger.json, ledger.lock}`，额度来自 profile 统一 policy 节 `limits.localWorkspaceBytes`（#18 schema，缺省 10 GiB；#16 起每次额度检查经 loadPolicy 重读，保存的变更下一操作生效，无需重启）；远端 policy.json 下发接入统一 policy 属后续票据。
-- 本机账本锁为独占创建文件记录持有 pid，仅当持有进程确认死亡才夺回，不因超时回收活动预留（活动预留的核实回收属 #16）。
+- 本机落盘：`<localStateDir>/<sha256(identity)[:24]>/ledger/ledger.json`，额度来自 profile 统一 policy 节 `limits.localWorkspaceBytes`（#18 schema，缺省 10 GiB；#16 起每次额度检查经 loadPolicy 重读，保存的变更下一操作生效，无需重启）；远端 policy.json 下发接入统一 policy 属后续票据。
+- **本机状态锁**：Windows 以状态目录在文件系统中的卷与目录标识确定锁名，分别取得维护和账本命名管道，由操作系统在持有进程退出时释放，不再根据旧 `maintenance.lock`、`ledger.lock` 的 PID 判定锁归属。维护遇忙跳过，账本遇忙仍有限等待。升级前须退出共用该状态目录的所有旧 MCP、CLI 和后台传输驱动；新旧版本不能同时写入。非 Windows 继续使用原锁文件。登记资源的持有者核实不使用这些锁的 PID 来判断。
+- 本机额度检查及用量查询仍在账本锁内统计状态目录。状态扫描至多同时发出 16 个文件或目录元数据请求，跳过账本自身目录及枚举到的符号链接，不缓存用量。
 - 失败码：额度不足 `WORKSPACE_QUOTA_EXCEEDED`（拒绝新占用并说明 used/limit/requesting）；物理写满 `STORAGE_FULL`（ENOSPC 映射，含账本自身持久化失败）；本机账本被持续占用 `LEDGER_BUSY`（可重试）；`RESOURCE_NOT_FOUND`、`INVALID_POLICY`、`LEDGER_UNAVAILABLE`。
 - 远端 helper 公共动作（非 MCP 工具）：`resource_reserve / resource_release / resource_register / resource_forget / resource_inspect / resource_usage`，供 #10 提交前预留、#13 传输预留、#17 回收核实与 #19 用量汇总复用；#19 起统计另经 `file_workspace` 的 `includeStorage=true` 分支输出（同口径复用 `ledger.usage` 与维护计数，见「文件接口」节）。
 

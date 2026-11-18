@@ -622,6 +622,19 @@ def bounded_number(request, name, default, minimum, maximum):
     return value
 
 
+def scan_budget_seconds(request):
+    milliseconds = request.get('scanBudgetMs')
+    if milliseconds is None:
+        return bounded_number(request, 'scanBudgetSeconds', DEFAULT_SCAN_BUDGET_SECONDS, 1, 60)
+    if request.get('scanBudgetSeconds') is not None:
+        raise AgentError('INVALID_LIMIT', 'Use either scanBudgetMs or scanBudgetSeconds')
+    milliseconds = bounded_number(request, 'scanBudgetMs', None, 1000, 60000)
+    # Keep integral seconds as integers: older cursors bound the JSON integer
+    # (e.g. 10, not 10.0). Subsecond differences still bind distinct queries.
+    seconds, remainder = divmod(milliseconds, 1000)
+    return milliseconds / 1000.0 if remainder else seconds
+
+
 def file_version(path):
     try:
         return hashlib.sha256(json.dumps(metadata(path.stat())).encode('utf8')).hexdigest()
@@ -696,7 +709,7 @@ def file_search(service, root, request):
     respect_gitignore = optional_bool(request, 'respectGitignore', False)
     budget_bytes = bounded_number(request, 'scanBudgetBytes', DEFAULT_SCAN_BUDGET_BYTES,
                                   64 * 1024, 2 * 1024 * 1024 * 1024)
-    budget_seconds = bounded_number(request, 'scanBudgetSeconds', DEFAULT_SCAN_BUDGET_SECONDS, 1, 60)
+    budget_seconds = scan_budget_seconds(request)
     if any(part == '.git' for part in root.parts):
         raise AgentError('PATH_NOT_ALLOWED', 'The .git directory is always excluded from search')
 
@@ -1015,7 +1028,7 @@ def file_find(service, root, request):
     respect_gitignore = optional_bool(request, 'respectGitignore', False)
     budget_bytes = bounded_number(request, 'scanBudgetBytes', DEFAULT_SCAN_BUDGET_BYTES,
                                   64 * 1024, 2 * 1024 * 1024 * 1024)
-    budget_seconds = bounded_number(request, 'scanBudgetSeconds', DEFAULT_SCAN_BUDGET_SECONDS, 1, 60)
+    budget_seconds = scan_budget_seconds(request)
     if any(part == '.git' for part in root.parts):
         raise AgentError('PATH_NOT_ALLOWED', 'The .git directory is always excluded from search')
 

@@ -88,7 +88,11 @@ policy 组与默认值（未写的字段按默认生效）：
 | search | scanBudgetBytes / timeBudgetMs / pageSizeBytes | 536870912 / 10000 / 65536 |
 | maintenance | intervalMs / maxItemsPerRun / timeBudgetMs | 3600000 / 100 / 2000 |
 
-生效时点：策略保存后由消费方在下一次操作或维护周期读取新值，无需重启；运行中的操作沿用启动时快照。保留期限变更只影响新生成记录，已有记录的到期时间不变。`directoryScope` 与 `pythonPath` 在工作区 MCP 服务下次启动时生效。额度预留（本机 SpaceLedger 自 #16 起每次额度检查经 loadPolicy 重读 `limits.localWorkspaceBytes`）与到期清理（见「到期回收与在线维护」）已接入强制执行；搜索预算的强制执行仍属后续票据，当前仅完成存储、校验与按次重读。
+生效时点：策略保存后由消费方在下一次操作或维护周期读取新值，无需重启；运行中的操作沿用启动时快照。保留期限变更只影响新生成记录，已有记录的到期时间不变。`directoryScope` 与 `pythonPath` 在工作区 MCP 服务下次启动时生效。额度预留（本机 SpaceLedger 自 #16 起每次额度检查经 loadPolicy 重读 `limits.localWorkspaceBytes`）与到期清理（见「到期回收与在线维护」）已接入强制执行。
+
+调整搜索时，在 `policy.search` 中设置 `scanBudgetBytes`（64 KiB–2 GiB）和 `timeBudgetMs`（1000–60000），下一次 `remote_find` 或 `remote_search` 调用即使用新值。预算参与游标绑定，改完从第一页重新查询。例如要使用 128 MiB 扫描预算和 15.5 秒时限，可更新 `policy: { search: { scanBudgetBytes: 134217728, timeBudgetMs: 15500 } }`。setup 拒绝超出范围的新设置；若搜索提示旧设置越界，用 inspect 查看，再以 update 修正对应字段。
+
+查找时限约束候选枚举，内容搜索时限从候选文件列表建成、游标核对完成后开始。长预算会延长默认 SSH 交换时限，但显式 `commandTimeoutMs` 和客户端自己的等待上限仍适用。结果页仍限制为 64 KiB；`pageSizeBytes`、`respectGitignore`、`includeHidden` 尚未从 profile 接入工具执行。
 
 手工编辑 profile 中的 policy 节同样受 schema 校验：未知字段、非正整数或布尔类型错误会让配置加载失败并明确报出字段位置。
 
