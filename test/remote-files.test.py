@@ -110,6 +110,46 @@ class RemoteFilesTest(unittest.TestCase):
         self.assertEqual(corrupt['error']['code'], 'READ_REQUIRED')
         self.assertEqual(path.read_text(), 'alpha\n')
 
+    def test_damaged_read_credentials_require_rereading_instead_of_allowing_edits(self):
+        for i, damaged in enumerate(['{', '[]', '{}', {'expiresAt': None},
+                                     {'expiresAt': float('nan')}, {'ranges': [[0, '12']]}]):
+            with self.subTest(record=damaged):
+                path = self.work / ('damaged-{}.txt'.format(i))
+                path.write_text('alpha\nbeta\n')
+                key = self.call('file_read', {'path': path.name})['result']['readToken']
+                token = self.root / 'state' / 'reads' / (key + '.json')
+                if isinstance(damaged, dict):
+                    content = json.loads(token.read_text())
+                    content.update(damaged)
+                    token.write_text(json.dumps(content))
+                else:
+                    token.write_text(damaged)
+                request = {'path': path.name, 'edits': [{'oldText': 'alpha', 'newText': 'lost'}]}
+                for credential in ({}, {'readToken': key}):
+                    result = self.call('file_edit', dict(request, **credential))
+                    self.assertEqual(result.get('error', {}).get('code'), 'READ_REQUIRED', result)
+                    self.assertEqual(path.read_text(), 'alpha\nbeta\n')
+
+    def test_reread_after_a_damaged_record_grants_only_the_new_window(self):
+        path = self.work / 'refresh-damaged.txt'
+        path.write_text('alpha\nbeta\n')
+        old = self.call('file_read', {'path': path.name, 'fromLine': 1, 'toLine': 1})['result']['readToken']
+        (self.root / 'state' / 'reads' / (old + '.json')).write_text('[]')
+        reread = self.call('file_read', {'path': path.name, 'fromLine': 2, 'toLine': 2})
+        self.assertTrue(reread['ok'], reread)
+        self.assertNotEqual(reread['result']['readToken'], old)
+        self.assertFalse(reread['result']['complete'])
+        rejected = self.call('file_edit', {'path': path.name, 'readToken': old,
+                                            'edits': [{'oldText': 'beta', 'newText': 'BOGUS'}]})
+        self.assertEqual(rejected['error']['code'], 'READ_REQUIRED')
+        rejected = self.call('file_edit', {'path': path.name,
+                                            'edits': [{'oldText': 'alpha', 'newText': 'BOGUS'}]})
+        self.assertEqual(rejected['error']['code'], 'READ_REQUIRED')
+        edited = self.call('file_edit', {'path': path.name,
+                                          'edits': [{'oldText': 'beta', 'newText': 'BETA'}]})
+        self.assertTrue(edited['ok'], edited)
+        self.assertEqual(path.read_text(), 'alpha\nBETA\n')
+
     def test_read_tokens_are_short_reused_and_renewed_after_edit(self):
         path = self.work / 'short-token.txt'
         path.write_text('alpha\nbeta\n')
