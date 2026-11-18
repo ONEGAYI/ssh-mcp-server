@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, toNamespacedPath } from 'node:path';
 
 const windows = process.platform === 'win32';
 const maintenanceURL = new URL('../build/services/maintenance.js', import.meta.url).href;
@@ -80,7 +80,7 @@ it('Windows maintenance excludes aliases and elects one holder after a crash eve
     await writeFile(profilePath, '{}');
     const alias = join(root, 'state-alias');
     await symlink(localStateDir, alias, 'junction');
-    const aliased = { ...config, localStateDir: alias.toUpperCase() };
+    const aliased = { ...config, localStateDir: toNamespacedPath(alias.toUpperCase()) };
     const holder = startWorker(maintenanceWorker, { config, hold: true, offset: 0 });
     workers.push(holder);
     assert.equal(await holder.first, 'held');
@@ -104,6 +104,34 @@ it('Windows maintenance excludes aliases and elects one holder after a crash eve
     winner.child.send('finish');
     assert.equal((await winner.closed)[0], 0);
     assert.equal(await readFile(legacyFile, 'utf8'), legacy);
+  } finally {
+    await Promise.all(workers.map(worker => worker.stop()));
+    await rm(root, { recursive: true });
+  }
+});
+
+it('Windows distinct NTFS directory identities do not contend even when their names fold alike', {
+  skip: !windows, timeout: 10000,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-win-lock-identities-'));
+  const profilePath = join(root, 'profile.json');
+  const workers = [];
+  try {
+    await writeFile(profilePath, '{}');
+    // JavaScript lowercases both names to the same string. NTFS does not
+    // treat the composed U+0130 and the U+0069 U+0307 pair as one entry.
+    const first = join(root, '\u0130');
+    const second = join(root, 'i\u0307');
+    await mkdir(first);
+    await mkdir(second);
+    for (const localStateDir of [first, second]) {
+      const config = { localStateDir, identity: 'shared-binding', profilePath };
+      const worker = startWorker(maintenanceWorker, { config, hold: true, offset: 0 });
+      workers.push(worker);
+      assert.equal(await worker.first, 'held');
+    }
+    for (const worker of workers) worker.child.send('finish');
+    assert.deepEqual((await Promise.all(workers.map(worker => worker.closed))).map(([code]) => code), [0, 0]);
   } finally {
     await Promise.all(workers.map(worker => worker.stop()));
     await rm(root, { recursive: true });

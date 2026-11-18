@@ -6,6 +6,7 @@ import fs, { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink,
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const MODULE_URL = new URL('../build/services/space-ledger.js', import.meta.url).href;
 
@@ -103,6 +104,50 @@ it('quota scan uses bounded concurrent metadata reads without changing which byt
     syncBuiltinESMExports();
     await rm(root, { recursive: true });
   }
+});
+
+it('failed quota scan drains its current metadata batch before releasing the lock', async () => {
+  const root = await fixture();
+  const ledger = new SpaceLedger(join(root, 'ledger'));
+  const files = Array.from({ length: 18 }, (_, index) => join(root, String(index)));
+  const originalStat = fs.stat;
+  const error = Object.assign(new Error('injected metadata failure'), { code: 'EACCES' });
+  let metadataCalls = 0;
+  let slowFinished = false;
+  let slowRequest;
+  let signalSlow;
+  const slowStarted = new Promise(resolve => { signalSlow = resolve; });
+  try {
+    await Promise.all(files.map(file => writeFile(file, 'x')));
+    try {
+      fs.stat = async (path, ...options) => {
+        if (!files.includes(path)) return originalStat(path, ...options);
+        if (++metadataCalls === 1) {
+          await Promise.race([slowStarted, delay(100)]);
+          throw error;
+        }
+        if (metadataCalls === 2) {
+          signalSlow();
+          slowRequest = delay(150).then(async () => {
+            const measured = await originalStat(path, ...options);
+            slowFinished = true;
+            return measured;
+          });
+          return slowRequest;
+        }
+        return originalStat(path, ...options);
+      };
+      syncBuiltinESMExports();
+      await assert.rejects(ledger.reserve(1), cause => cause === error);
+      assert.ok(slowFinished, 'an in-flight stat survived lock release');
+      assert.equal(metadataCalls, 16, 'the next batch must not start after a real error');
+    } finally {
+      await slowRequest;
+      fs.stat = originalStat;
+      syncBuiltinESMExports();
+    }
+    assert.equal((await ledger.usage()).stateBytes, files.length);
+  } finally { await rm(root, { recursive: true }); }
 });
 
 it('registering a resource consumes the reservation it cites without double counting', async () => {

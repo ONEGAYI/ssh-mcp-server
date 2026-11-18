@@ -276,7 +276,7 @@ MCP 提供查询、列举、读日志、短时等待和取消能力。若另行�
 
 - 远端落盘：`<状态根>/ledger/{ledger.json, ledger.lock}`，额度覆盖文件 `<状态根>/ledger/policy.json`（`{"spaceLimitBytes": N}`，每次操作重新加载）。
 - 本机落盘：`<localStateDir>/<sha256(identity)[:24]>/ledger/ledger.json`，额度来自 profile 统一 policy 节 `limits.localWorkspaceBytes`（#18 schema，缺省 10 GiB；#16 起每次额度检查经 loadPolicy 重读，保存的变更下一操作生效，无需重启）；远端 policy.json 下发接入统一 policy 属后续票据。
-- **本机状态锁**：Windows 按解析后的本机状态路径分别取得维护和账本命名管道，由操作系统在持有进程退出时释放，不再根据旧 `maintenance.lock`、`ledger.lock` 的 PID 判定锁归属。维护遇忙跳过，账本遇忙仍有限等待。升级前须退出共用该状态目录的所有旧 MCP、CLI 和后台传输驱动；新旧版本不能同时写入。非 Windows 继续使用原锁文件。登记资源的持有者核实不使用这些锁的 PID 来判断。
+- **本机状态锁**：Windows 以状态目录在文件系统中的卷与目录标识确定锁名，分别取得维护和账本命名管道，由操作系统在持有进程退出时释放，不再根据旧 `maintenance.lock`、`ledger.lock` 的 PID 判定锁归属。维护遇忙跳过，账本遇忙仍有限等待。升级前须退出共用该状态目录的所有旧 MCP、CLI 和后台传输驱动；新旧版本不能同时写入。非 Windows 继续使用原锁文件。登记资源的持有者核实不使用这些锁的 PID 来判断。
 - 本机额度检查及用量查询仍在账本锁内统计状态目录。状态扫描至多同时发出 16 个文件或目录元数据请求，跳过账本自身目录及枚举到的符号链接，不缓存用量。
 - 失败码：额度不足 `WORKSPACE_QUOTA_EXCEEDED`（拒绝新占用并说明 used/limit/requesting）；物理写满 `STORAGE_FULL`（ENOSPC 映射，含账本自身持久化失败）；本机账本被持续占用 `LEDGER_BUSY`（可重试）；`RESOURCE_NOT_FOUND`、`INVALID_POLICY`、`LEDGER_UNAVAILABLE`。
 - 远端 helper 公共动作（非 MCP 工具）：`resource_reserve / resource_release / resource_register / resource_forget / resource_inspect / resource_usage`，供 #10 提交前预留、#13 传输预留、#17 回收核实与 #19 用量汇总复用；#19 起统计另经 `file_workspace` 的 `includeStorage=true` 分支输出（同口径复用 `ledger.usage` 与维护计数，见「文件接口」节）。

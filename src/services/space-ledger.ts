@@ -105,7 +105,9 @@ async function measureStateBytes(identityDirectory: string): Promise<number> {
   let total = 0;
   while (pending.length > 0) {
     const batch = pending.splice(-metadataBatchSize);
-    await Promise.all(batch.map(async item => {
+    // Drain the batch before propagating an error so no scan I/O outlives
+    // the lock. A failed batch must not start any queued work.
+    const results = await Promise.allSettled(batch.map(async item => {
       try {
         if (!item.directory) {
           const { size } = await stat(item.path);
@@ -122,6 +124,9 @@ async function measureStateBytes(identityDirectory: string): Promise<number> {
         if (!isMissing(error)) throw error;
       }
     }));
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
   }
   return total;
 }
