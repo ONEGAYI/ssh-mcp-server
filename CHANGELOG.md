@@ -2,6 +2,22 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.6.0] - 2026-11-18
+
+一次确认同一会话的多项远端任务结果，减少 Agent 逐条发起的工具调用。原有单条确认方式不变。
+
+### 新功能
+
+**批量确认远端任务结果**（PR [#53](https://github.com/ONEGAYI/ssh-mcp-server/pull/53)）
+
+- 处理完终态结果后，调用 `remote_ack` 并传入同一会话的 `jobIds`（1–50 项）。回执区分已确认、失败和未尝试的任务。
+- 整批共用 45 秒预算（含前置维护）。超时或收到 MCP 取消后，不再启动后续确认；已经发出的确认仍可能完成，可用 `remote_pending` 核对。
+- 单条 `jobId` 和 CLI `ack` 继续可用，任务归属、恢复和清理规则不变。
+
+> **升级注意**：离线安装请使用完整新包并重启 MCP 进程；ZCode 插件用户刷新市场、更新插件后，在新任务中运行 setup 技能。
+
+> **验收范围**：新增 MCP 契约测试覆盖批次超时、取消和单条兼容；真实客户端与 CentOS 7 的批量确认待人工验收。
+
 ## [2.5.3] - 2026-10-17
 
 本仓库可直接作为 ZCode 插件安装：仓库根即插件根，git 市场安装即得完整源码，安装后由插件 setup 技能引导完成 npm 依赖安装与构建；并新增本机默认 SSH 配置持久化，保存一次连接库路径后每个新项目接入不再重复提供。
@@ -250,6 +266,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.6.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.3...v2.6.0
 [2.5.3]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.2...v2.5.3
 [2.5.2]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.0...v2.5.1
