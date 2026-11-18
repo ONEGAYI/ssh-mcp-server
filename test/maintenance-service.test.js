@@ -255,6 +255,27 @@ it('retains a legacy upload mirror from terminal acknowledgement, not its interr
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+it('preserves a legacy upload with a truncated acknowledgement without stopping maintenance', async () => {
+  const fixture = await buildFixture();
+  const remote = recordingRemote();
+  try {
+    const damagedId = 'a'.repeat(32);
+    const expiredId = 'b'.repeat(32);
+    const mirror = { schemaVersion: 1, workspaceId: 'maint-test', sessionId: 's',
+      direction: 'upload', expiresAt: Date.now() - DAY };
+    const damaged = await writeTransfer(fixture.identityDir, damagedId, { ...mirror, transferId: damagedId });
+    const ackPath = join(damaged, 'ack.json');
+    await writeFile(ackPath, '{"state":');
+    const expired = await writeTransfer(fixture.identityDir, expiredId, { ...mirror, transferId: expiredId });
+
+    const result = await new MaintenanceService(fixture.config, remote).maybeMaintain();
+    assert.deepEqual(result.local.removedTransfers, [expiredId]);
+    assert.equal(await readFile(ackPath, 'utf8'), '{"state":');
+    await assert.rejects(stat(expired), { code: 'ENOENT' });
+    assert.deepEqual(remote.calls.map(({ action }) => action), ['maintenance']);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 it('unknown download records are non-terminal: they expire by their TTL, not the terminal retention (review R2)', async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();

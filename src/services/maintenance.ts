@@ -213,6 +213,9 @@ export class MaintenanceService {
       try {
         ack = JSON.parse(await readFile(join(directory, "ack.json"), "utf8"));
       } catch (error) {
+        // A damaged legacy ack cannot tell us whether the interruption TTL
+        // still applies. Keep this record without stalling unrelated cleanup.
+        if (legacyUpload && error instanceof SyntaxError) return false;
         if (!isMissing(error)) throw error;
       }
       // Legacy synchronous uploads store their terminal state only in the ack.
