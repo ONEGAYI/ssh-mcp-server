@@ -452,6 +452,69 @@ it('directoryScope updates in place without rekeying the binding identity', asyn
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+it('setup search budget bounds reject invalid writes and allow repair of old profiles', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-setup-search-budget-'));
+  const client = new Client({ name: 'search-budget-setup-contract', version: '1' });
+  try {
+    const auth = join(root, 'ssh.json');
+    await writeFile(auth, JSON.stringify({ eda: { host: '127.0.0.1', port: 22, username: 'fixture', password: 'fixture-only' } }));
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [fileURLToPath(new URL('../build/index.js', import.meta.url)), '--setup'], stderr: 'pipe',
+      env: noSavedDefault(root) }));
+    const call = args => client.callTool({ name: 'remote_setup', arguments: args });
+    const read = reply => {
+      assert.equal(reply.isError, undefined, reply.content[0].text);
+      return JSON.parse(reply.content[0].text);
+    };
+    const configure = localRoot => ({ localRoot, sshConfigFile: auth, connectionName: 'eda',
+      remoteRoot: '/main', remoteStateDir: '/state' });
+    const bad = [
+      { scanBudgetBytes: 65535 }, { scanBudgetBytes: 2147483649 },
+      { timeBudgetMs: 500 }, { timeBudgetMs: 60001 },
+    ];
+    const expectInvalidBudget = async (args, search) => {
+      const reply = await call({ ...args, policy: { search } });
+      assert.equal(reply.isError, true, reply.content[0].text);
+      const error = JSON.parse(reply.content[0].text);
+      assert.equal(error.code, 'SETUP_INVALID_POLICY');
+      assert.ok(error.message.includes(`search.${Object.keys(search)[0]}`), error.message);
+    };
+
+    await t.test('configure rejects all out-of-range budgets before writing', async () => {
+      const localRoot = join(root, 'configure');
+      await mkdir(localRoot);
+      for (const search of bad) await expectInvalidBudget(configure(localRoot), search);
+      assert.deepEqual(await readdir(localRoot), []);
+    });
+
+    await t.test('update rejects out-of-range writes and can repair old leaves one by one', async () => {
+      const localRoot = join(root, 'update');
+      await mkdir(localRoot);
+      const minimum = { scanBudgetBytes: 65536, timeBudgetMs: 1000 };
+      const configured = read(await call({ ...configure(localRoot), policy: { search: minimum } }));
+      const original = await readFile(configured.profilePath, 'utf8');
+      const inspect = async () => read(await call({ action: 'inspect', localRoot }));
+      const update = ({ revision }) => ({ action: 'update', localRoot, revision });
+      const current = await inspect();
+      for (const search of bad) await expectInvalidBudget(update(current), search);
+      assert.equal(await readFile(configured.profilePath, 'utf8'), original);
+
+      const legacy = JSON.parse(original);
+      legacy.policy.search = { scanBudgetBytes: 65535, timeBudgetMs: 500, includeHidden: false };
+      await writeFile(configured.profilePath, JSON.stringify(legacy));
+      const inspected = await inspect();
+      assert.equal(inspected.config.policy.search.timeBudgetMs, 500);
+      const fixedTime = read(await call({ ...update(inspected), policy: { search: { timeBudgetMs: 60000 } } }));
+      assert.deepEqual(fixedTime.changed, ['policy.search.timeBudgetMs']);
+      assert.equal(fixedTime.policy.search.scanBudgetBytes, 65535);
+      const fixedBytes = read(await call({ ...update(await inspect()), policy: { search: { scanBudgetBytes: 2147483648 } } }));
+      assert.deepEqual(fixedBytes.changed, ['policy.search.scanBudgetBytes']);
+      const stored = JSON.parse(await readFile(configured.profilePath, 'utf8'));
+      assert.deepEqual(stored.policy.search, { scanBudgetBytes: 2147483648, timeBudgetMs: 60000, includeHidden: false });
+    });
+  } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 it('update validates its inputs and reports missing bindings and revisions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ssh-mcp-update-invalid-'));
   try {

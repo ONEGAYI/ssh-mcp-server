@@ -290,6 +290,32 @@ class RemoteDiscoveryTest(unittest.TestCase):
             cursor = result.get('nextCursor')
         self.assertEqual(collected, [('large.log', 3), ('large.log', 30000)])
 
+    def test_scan_budget_milliseconds_bind_search_and_find_cursors(self):
+        self.write('a.txt', NEEDLE + '\n')
+        self.write('b.txt', NEEDLE + '\n')
+        for action, pattern in (('file_search', NEEDLE), ('file_find', '*.txt')):
+            with self.subTest(action=action):
+                params = {'pattern': pattern, 'limit': 1}
+                legacy = self.call(action, params, backends='none')['result']
+                cursor = legacy['nextCursor']
+                self.assertIsNotNone(cursor)
+                # Integral milliseconds keep the query identity of a legacy cursor.
+                equivalent = self.call(action, dict(params, cursor=cursor, scanBudgetMs=10000),
+                                       backends='none')
+                self.assertTrue(equivalent['ok'], equivalent)
+
+                first = self.call(action, dict(params, scanBudgetMs=1234), backends='none')['result']
+                next_cursor = first['nextCursor']
+                self.assertIsNotNone(next_cursor)
+                same = self.call(action, dict(params, cursor=next_cursor, scanBudgetMs=1234),
+                                 backends='none')
+                self.assertTrue(same['ok'], same)
+                changed = self.call(action, dict(params, cursor=next_cursor, scanBudgetMs=1235),
+                                    backends='none')
+                self.assertEqual(changed.get('error', {}).get('code'), 'STALE_CURSOR')
+                invalid = self.call(action, dict(params, scanBudgetMs=60001), backends='none')
+                self.assertEqual(invalid.get('error', {}).get('code'), 'INVALID_LIMIT')
+
     def test_cursor_rejects_changed_query_directory_and_changed_file(self):
         self.write('a.txt', 'x {} x\n'.format(NEEDLE))
         self.write('b.txt', 'y {} y\n'.format(NEEDLE))

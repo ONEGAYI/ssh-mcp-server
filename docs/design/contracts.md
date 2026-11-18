@@ -50,7 +50,9 @@ action='update' 必须携带 inspect 返回的 revision（乐观并发）：缺 
 
 policy 配置节 schema 与规格默认值：limits（本机/远端每工作区各 10737418240 字节）、retention（确认任务日志 3 天；确认结果、未确认结果、unknown 记录各 30 天；中断传输临时数据 3 天；readToken 3 天）、search（respectGitignore=false、includeHidden=true、扫描预算 536870912 字节、时间预算 10000 ms、每页 65536 字节）、maintenance（间隔 3600000 ms、每轮 100 项、时间预算 2000 ms）。profile 中未写的叶子按默认值生效，不物化进文件。
 
-生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留已由票据 #8 接入本机下载链路（读 `limits.localWorkspaceBytes`），#16 起本机 SpaceLedger 每次额度检查经 loadPolicy 重读该值（保存的 policy 变更下一操作生效）；远端额度经 `<状态根>/ledger/policy.json` 每次操作重读；远端维护期限由本机维护轮次随请求传入（见「生命周期与回收」），远端 policy.json 的 retentionMs/maintenance 节可作本地缺省覆盖。搜索预算执行方仍属后续票据，接入前相应叶子仅完成存储、校验与重读，不得表述为已强制执行。
+生效时点：普通策略由消费方在每次操作或维护周期经 loadPolicy(profilePath) 重读最新值，无需重启；运行中的操作沿用其启动时快照。保留期限变更不追溯：已有记录保持原定到期时间，仅新生成记录采用新期限。directoryScope 与 pythonPath 在该绑定的工作区 MCP 服务下次启动时生效。额度预留已由票据 #8 接入本机下载链路（读 `limits.localWorkspaceBytes`），#16 起本机 SpaceLedger 每次额度检查经 loadPolicy 重读该值（保存的 policy 变更下一操作生效）；远端额度经 `<状态根>/ledger/policy.json` 每次操作重读；远端维护期限由本机维护轮次随请求传入（见「生命周期与回收」），远端 policy.json 的 retentionMs/maintenance 节可作本地缺省覆盖。
+
+搜索和查找每页读取本机 profile 的 `policy.search.scanBudgetBytes`、`timeBudgetMs`，分别接受 64 KiB–2 GiB、1000–60000 ms。setup 的 configure/update 对显式提供的值使用同一范围，超出时返回 `SETUP_INVALID_POLICY`，不写入。旧 profile 的越界值仍可 inspect、逐项 update 修正；修正前搜索和查找返回 `INVALID_CONFIG`，不影响绑定加载与其他工具。不新增 MCP 参数；其他 search 策略字段仍只有存储，不改变工具默认行为。未设显式 `commandTimeoutMs` 时，SSH 交换时限取默认 30 秒与「时间预算加 15 秒余量」中的较大值。
 
 其余边界沿用 [ADR 0011](../adr/0011-binding-reconfiguration.md)：更换服务器或状态目录通过新建绑定处理，不做自动迁移。
 
@@ -132,14 +134,14 @@ policy 配置节 schema 与规格默认值：limits（本机/远端每工作区�
 - **结果不依赖后端**：rg 只提供文件条目；目录、符号链接等条目由 Python 骨架遍历（同一筛选规则、跳过普通文件）补齐，两路归并为一条全局按路径排序的流并去重。rg 崩溃或无法启动时本页回退纯 Python 遍历（不能冒充空树），`engine` 如实报本页实际使用的 `ripgrep-files` 或 `python-walk`。骨架遍历惰性产出（每目录排序的 k 路归并），预算中断留下的必然是真排序前缀。
 - **glob 契约保持**：模式继续按 basename 或相对路径 `fnmatch` 匹配，条目仍为 `{path, type, size}`，顺序仍为全局路径排序；`file_list` 既有行为不变（非递归、摘要游标、无 engine 字段）。
 - **过滤对齐 search**：`includeHidden` 默认 true、`respectGitignore` 默认 false，语义与 `remote_search` 完全同一（层级 .gitignore、被忽略父目录不能复活子文件、嵌套否定）；`.git` 内部始终排除，显式指定 `.git` 内路径拒绝 `PATH_NOT_ALLOWED`。
-- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），`scanBudgetSeconds` 约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举阶段（含 rg `--files` 读取）耗尽同样返回 partial 与重启游标，不冒充 HELPER_ERROR；**续页在"跳过已返回候选"阶段就耗尽时间预算（游标零推进，重试必在同一位置再超时）时返回明确的 `SCAN_TIME_LIMIT` 错误**，指引缩小目录而非同游标 partial；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
+- **分页与预算**：复用 #11 机制——`limit` 与每页 64 KiB 结果预算（`RESULT_LIMIT`）；`scanBudgetBytes` 按本页新考虑候选的路径字节记账（已返回条目续页跳过不计费，保证小预算也能推进），时间预算约束枚举（rg 读取与遍历共用时限）；预算耗尽返回 `truncated`、`reason`（`SCAN_BYTE_LIMIT`/`SCAN_TIME_LIMIT`）与可续游标，从最后考虑的候选之后继续，不重扫已返回条目；枚举阶段（含 rg `--files` 读取）耗尽同样返回 partial 与重启游标，不冒充 HELPER_ERROR；**续页在"跳过已返回候选"阶段就耗尽时间预算（游标零推进，重试必在同一位置再超时）时返回明确的 `SCAN_TIME_LIMIT` 错误**，指引缩小目录而非同游标 partial；枚举自然完成才报告 `totalEntries`（partial 页为 null，不冒充完整计数）。50000 候选硬顶（`SCAN_LIMIT`）保留。
 - **游标**：绑定工作区、会话、根路径、模式、隐藏/忽略开关与预算参数；查询变化返回 `STALE_CURSOR`。目录枚举是尽力快照（规格 5.2），翻页期间目录增删不触发检测，需要新查询。
 
 **未实测边界**：上述行为已在 WSL（假 rg 枚举后端 + 真实 Python 遍历）自动化验证；CentOS 7 VM 无 rg，仅实测 `python-walk` 路径。真实 ripgrep 二进制的 `--files` 输出顺序与旗标行为未经自动化覆盖（实现按路径排序后消费，不依赖其输出顺序）；内网离线现场已随 v2.0.0 于 2026-09-14 通过用户验收。
 
 ### 搜索分页与预算（2026-09-13 已实施，票据 #11）
 
-- 每页序列化结果上限 64 KiB（`limit` 条数与字节预算任一满即停，`reason=RESULT_LIMIT`）；默认扫描预算 512 MiB / 10 秒（`reason=SCAN_BYTE_LIMIT` / `SCAN_TIME_LIMIT`；请求可用 `scanBudgetBytes`（64 KiB–2 GiB）、`scanBudgetSeconds`（1–60）钳制内覆盖，该两参数参与游标绑定；#18 policy 合入后改由配置提供）。预算按读取字节记账，单页最多超出一个读取块，小预算也能逐页推进。**无单文件大小排除，200 MiB 网表可搜索**。
+- 每页序列化结果上限 64 KiB（`limit` 条数与字节预算任一满即停，`reason=RESULT_LIMIT`）；默认扫描预算 512 MiB / 10 秒（`reason=SCAN_BYTE_LIMIT` / `SCAN_TIME_LIMIT`）。MCP 从工作区配置传送 `scanBudgetBytes` 和 `scanBudgetMs` 给远端 helper；helper 继续接受整秒字段 `scanBudgetSeconds`，等值毫秒保持既有游标身份，改变预算则返回 `STALE_CURSOR`。时间预算从候选文件列表建成并核对游标后起算，扫描字节按读取数据记账，单页最多超出一个读取块。**无单文件大小排除，200 MiB 网表可搜索**。
 - 预算或页满耗尽返回 `truncated=true`、`reason` 与 `nextCursor`，不冒充"没有匹配"；无匹配且扫完返回 `truncated=false, matches=[]`。
 - 游标（base64 JSON）绑定查询串、文件名过滤、隐藏/ignore 开关、预算参数与**候选文件列表摘要**：列表变化（目录增删文件）→ `STALE_CURSOR`，需新查询；续扫文件版本（stat 元数据哈希）变化 → `CURSOR_CONFLICT`。已扫完的文件不再重扫（按候选列表位置跳过）；当前文件按字节/行位置续扫，回退锚点保证不丢已见未留的命中，行号过滤保证不重复。跨文件目录是尽力枚举，不承诺快照。
 - 喂给扫描进程的输入流带背压（selectors 事件驱动读写，单行输出缓冲有界）；超时后强杀子进程时游标回退到最后一个已喂块，不越过被丢弃的输出。
