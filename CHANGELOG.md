@@ -2,6 +2,35 @@
 
 本仓库 [ONEGAYI/ssh-mcp-server](https://github.com/ONEGAYI/ssh-mcp-server) 是 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的自维护 fork。上游 v1.9.2 及之前的变更见上游仓库。
 
+## [2.6.1] - 2026-11-18
+
+修复状态回收、Windows 本机锁和搜索预算。远端连接失败时，本机不再随每次工具调用重复扫描；工作区已配置的搜索预算也会生效。变更见 PR [#56](https://github.com/ONEGAYI/ssh-mcp-server/pull/56)。
+
+### Bug 修复
+
+**维护节流、进度与保留期**（[#24](https://github.com/ONEGAYI/ssh-mcp-server/issues/24)、[#25](https://github.com/ONEGAYI/ssh-mcp-server/issues/25)）
+
+- 本机扫描和远端重试独立节流；本机维护时间与计数来自同一轮扫描。
+- 远端懒清理保留本轮游标和统计；损坏的持久化预算不阻断清理，损坏的读取凭据会提示重读。
+- 旧式上传确认后按确认期限保留本机记录；单条损坏的确认记录不再阻断其余回收。
+
+**Windows 状态锁**（[#23](https://github.com/ONEGAYI/ssh-mcp-server/issues/23)）
+
+- 本机维护与账本锁由操作系统管理，持有进程退出后自动释放，不再依赖遗留锁文件中的 PID。非 Windows 继续使用原锁。
+
+**工作区搜索预算**（[#26](https://github.com/ONEGAYI/ssh-mcp-server/issues/26)）
+
+- `remote_search` 和 `remote_find` 读取工作区扫描字节及时长设置，未配置时沿用原默认值。
+- setup 在写入前拒绝新的越界预算；旧配置仍可查看和修正。
+
+### 其他改进
+
+- 远端维护按批保存游标，减少落盘次数；本机额度扫描采用有界并行，保持精确计量。
+
+> **Windows 升级与回退**：先退出所有共用同一状态目录的 MCP、CLI 和后台传输驱动，再启动目标版本。新旧版本不能同时写入该目录。
+
+> **验收范围**：覆盖本机多进程争锁、崩溃恢复、维护与搜索预算回归；真实客户端和 CentOS 7 现场仍待人工验收。
+
 ## [2.6.0] - 2026-11-18
 
 一次确认同一会话的多项远端任务结果，减少 Agent 逐条发起的工具调用。原有单条确认方式不变。
@@ -266,6 +295,7 @@
 - 建立三档测试体系：npm 全量（289 项）、WSL Python 远端套件（七套件）、CentOS 7.9 / Python 3.6.8 真实 VM SSH 门控；远端测试时钟可注入，无需真实等待期限。
 
 <!-- 变更链接 -->
+[2.6.1]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.3...v2.6.0
 [2.5.3]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.2...v2.5.3
 [2.5.2]: https://github.com/ONEGAYI/ssh-mcp-server/compare/v2.5.1...v2.5.2
