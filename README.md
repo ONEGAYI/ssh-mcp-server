@@ -196,7 +196,7 @@ setup 服务负责绑定的创建与维护；日常文件和任务操作使用�
 
 Agent 使用恢复钩子提供的 job CLI，并设置 ZCode 原生 Shell 的 `run_in_background: true`。仅在命令后加 `&` 不等同于这条完成回传链路。
 
-任务完成后，Agent 核对 `task-result`，必要时读取日志，再调用 `remote_ack`。只有处理确认后，任务才从 `remote_pending` 列表移除。
+任务完成后，Agent 核对 `task-result`，必要时读取日志，再调用 `remote_ack`。一次处理了多项结果时，用 `jobIds` 批量确认。确认成功的任务会从 `remote_pending` 列表移除。
 
 ### 重启后继续原任务
 

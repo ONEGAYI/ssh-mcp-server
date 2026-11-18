@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import { access, mkdtemp, readdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { loadWorkspaceConfig } from '../build/config/workspace.js';
+import { TaskService } from '../build/services/task-service.js';
 
 it('workspace MCP advertises guarded file tools without the legacy unguarded upload', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-tools-'));
@@ -23,6 +26,7 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     assert.deepEqual(fields('remote_list'), ['cursor', 'limit', 'path', 'pattern', 'sessionId']);
     assert.deepEqual(fields('remote_find'), ['cursor', 'includeHidden', 'limit', 'path', 'pattern', 'respectGitignore', 'sessionId']);
     assert.deepEqual(fields('remote_search'), ['cursor', 'filePattern', 'includeHidden', 'limit', 'path', 'pattern', 'respectGitignore', 'sessionId']);
+    assert.deepEqual(fields('remote_ack'), ['jobId', 'jobIds', 'sessionId']);
     for (const name of ['remote_read', 'remote_edit', 'remote_write', 'remote_upload', 'remote_download', 'remote_pending', 'remote_wait']) {
       assert.ok(tools.tools.some(tool => tool.name === name), name);
     }
@@ -60,6 +64,164 @@ it('workspace MCP advertises guarded file tools without the legacy unguarded upl
     assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+async function ackFixture(t, jobs, { foreign = [], preloadSetup = '', beforeExchange = '' } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-ack-'));
+  const client = new Client({ name: 'contract-test', version: '1' });
+  t.after(async () => {
+    await client.close();
+    const child = relative(tmpdir(), directory);
+    assert.ok(child && !isAbsolute(child) && !child.startsWith('..'));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const profile = join(directory, 'workspace.json');
+  await writeFile(join(directory, 'ssh.json'), JSON.stringify({ offline: { host: '127.0.0.1', port: 1, username: 'test', password: 'fixture-only' } }));
+  await writeFile(profile, JSON.stringify({ workspaceId: 'ack-contract', connectionName: 'offline',
+    sshConfigFile: './ssh.json', remoteRoot: '/work', remoteStateDir: '/state', localStateDir: './state' }));
+  const config = await loadWorkspaceConfig(profile);
+  const tasks = new TaskService({
+    async call(action, request) {
+      if (action === 'task_register') return { jobId: request.command };
+      assert.equal(action, 'task_start');
+    },
+  }, config.localStateDir, config.identity);
+  for (const id of jobs) await tasks.start({ sessionId: 'owner', command: id, cwd: '/work' });
+  for (const id of foreign) await tasks.start({ sessionId: 'other', command: id, cwd: '/work' });
+
+  const preload = join(directory, 'preload.mjs');
+  const remoteUrl = new URL('../build/services/remote-agent-client.js', import.meta.url).href;
+  await writeFile(preload, `import { RemoteAgentClient } from ${JSON.stringify(remoteUrl)};
+const directory = ${JSON.stringify(directory)};
+${preloadSetup}
+RemoteAgentClient.prototype.call = async function (action, { jobId }) {
+  ${beforeExchange}
+  if (action === 'maintenance') return {};
+  if (action === 'status') return { jobId, state: jobId === 'running' ? 'running' : 'exited', completedAt: Date.now() / 1000 };
+  if (action === 'ack') return { jobId, acknowledged: true };
+  throw new Error('Unexpected SSH action: ' + action);
+};`);
+  await client.connect(new StdioClientTransport({ command: process.execPath,
+    args: ['--import', pathToFileURL(preload).href, fileURLToPath(new URL('../build/index.js', import.meta.url)), '--workspace', profile], stderr: 'pipe' }));
+
+  const call = (name, args, sessionId = 'owner', options) =>
+    client.callTool({ name, arguments: { sessionId, ...args } }, undefined, options);
+  const read = result => JSON.parse(result.content[0].text);
+  const pending = async (sessionId) =>
+    read(await call('remote_pending', {}, sessionId)).tasks.map(task => task.jobId).sort();
+  return { directory, client, call, read, pending };
+}
+
+it('remote_ack confirms a batch independently without changing the single-task contract', async t => {
+  const { call, read, pending } = await ackFixture(t, ['done-a', 'running', 'done-b', 'single'], { foreign: ['foreign'] });
+  const acknowledgement = await call('remote_ack', { jobIds: ['done-a', 'running', 'foreign', 'done-b', 'done-a'] });
+  assert.equal(acknowledgement.isError, undefined, acknowledgement.content[0].text);
+  const { acknowledged, failed, unattempted } = read(acknowledgement);
+  assert.deepEqual(acknowledged, ['done-a', 'done-b']);
+  assert.deepEqual(failed.map(({ jobId, code }) => [jobId, code]),
+    [['running', 'TASK_NOT_FINISHED'], ['foreign', 'TASK_SCOPE_MISMATCH']]);
+  assert.deepEqual(unattempted, []);
+
+  for (const args of [{}, { jobId: 'single', jobIds: ['single'] }, { jobIds: [] }, { jobIds: Array(51).fill('single') }]) {
+    const invalid = await call('remote_ack', args);
+    assert.equal(invalid.isError, true, invalid.content[0].text);
+    assert.match(invalid.content[0].text, /Input validation error/);
+  }
+  assert.deepEqual(await pending(), ['running', 'single']);
+  assert.deepEqual(await pending('other'), ['foreign']);
+  assert.deepEqual(read(await call('remote_ack', { jobId: 'single' })), { acknowledged: true, jobId: 'single' });
+  assert.deepEqual(await pending(), ['running']);
+});
+
+// Trigger the production deadline signal at a known exchange, without waiting 45 seconds.
+const ackDeadlineSetup = `
+const deadline = new AbortController();
+const realTimeout = AbortSignal.timeout;
+AbortSignal.timeout = ms => ms === 45_000 ? deadline.signal : realTimeout(ms);
+`;
+
+it('remote_ack batch deadline returns known results and separates the in-flight job from unattempted jobs', async t => {
+  const { call, read, pending } = await ackFixture(t, ['done', 'running', 'slow', 'later'], {
+    preloadSetup: ackDeadlineSetup,
+    beforeExchange: `
+if (action === 'ack' && jobId === 'slow') {
+  deadline.abort(new DOMException('Batch deadline reached', 'TimeoutError'));
+  await new Promise(() => {});
+}
+`,
+  });
+  const response = await call('remote_ack', { jobIds: ['done', 'running', 'slow', 'later'] }, 'owner', { timeout: 2000 });
+  assert.equal(response.isError, undefined, response.content[0].text);
+  const { acknowledged, failed, unattempted } = read(response);
+  assert.deepEqual(acknowledged, ['done']);
+  assert.deepEqual(failed.map(({ jobId, code }) => [jobId, code]), [
+    ['running', 'TASK_NOT_FINISHED'], ['slow', 'ACK_OUTCOME_UNKNOWN'],
+  ]);
+  assert.deepEqual(unattempted, ['later']);
+  assert.deepEqual(await pending(), ['later', 'running', 'slow']);
+});
+
+it('remote_ack batch deadline also covers maintenance before the first job', async t => {
+  const { call, read, pending } = await ackFixture(t, ['later'], {
+    preloadSetup: ackDeadlineSetup,
+    beforeExchange: `
+if (action === 'maintenance') {
+  deadline.abort(new DOMException('Batch deadline reached', 'TimeoutError'));
+  await new Promise(() => {});
+}
+`,
+  });
+  const response = await call('remote_ack', { jobIds: ['later'] }, 'owner', { timeout: 2000 });
+  assert.equal(response.isError, undefined, response.content[0].text);
+  assert.deepEqual(read(response), { acknowledged: [], failed: [], unattempted: ['later'] });
+  assert.deepEqual(await pending(), ['later']);
+});
+
+async function waitForAckTest(check) {
+  for (let i = 0; i < 200; ++i) {
+    if (await check()) return;
+    await delay(10);
+  }
+  assert.fail('Timed out waiting for the acknowledgement fixture');
+}
+
+it('remote_ack batch stops before the next task when the MCP request is cancelled', async t => {
+  const mcpUrl = import.meta.resolve('@modelcontextprotocol/sdk/server/mcp.js');
+  const { directory, client, call, pending } = await ackFixture(t, ['slow', 'later'], {
+    preloadSetup: `
+import { access, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { McpServer } from ${JSON.stringify(mcpUrl)};
+const registerTool = McpServer.prototype.registerTool;
+McpServer.prototype.registerTool = function (name, config, handler) {
+  return registerTool.call(this, name, config, name !== 'remote_ack' ? handler : async (...args) => {
+    try { return await handler(...args); }
+    finally { await writeFile(join(directory, 'handler-finished'), ''); }
+  });
+};
+`,
+    beforeExchange: `
+if (action === 'ack' && jobId === 'slow') {
+  await writeFile(join(directory, 'ack-started'), '');
+  while (!await access(join(directory, 'release')).then(() => true, () => false)) await delay(5);
+}
+if (action === 'status' && jobId === 'later') await writeFile(join(directory, 'next-started'), '');
+`,
+  });
+  const exists = name => access(join(directory, name)).then(() => true, () => false);
+  const controller = new AbortController();
+  const cancelled = assert.rejects(call('remote_ack', { jobIds: ['slow', 'later'] },
+    'owner', { signal: controller.signal, timeout: 5000 }), /cancel batch on purpose/);
+  await waitForAckTest(() => exists('ack-started'));
+  controller.abort(new Error('cancel batch on purpose'));
+  await cancelled;
+  await client.ping(); // The server has received the preceding cancellation notification.
+  await writeFile(join(directory, 'release'), '');
+  await waitForAckTest(() => exists('handler-finished'));
+  await waitForAckTest(async () => !(await pending()).includes('slow'));
+  assert.equal(await exists('next-started'), false);
+  assert.deepEqual(await pending(), ['later']);
 });
 
 it('workspace MCP storage report keeps the local end and marks an unreachable remote unknown (issue #19)', async () => {
@@ -120,7 +282,7 @@ it('workspace MCP serves the full usage guide through remote_help with zero remo
       assert.match(tools.tools.find(tool => tool.name === name).description, /Codex/, `${name} describes the current-host waiting workflow`);
     }
     assert.ok(data.guide.length > 200, 'the full guide is served, not a stub');
-    for (const keyword of ['remote_workspace', 'remote_read', 'sessionId', '后台', 'wait', 'remote_ack']) {
+    for (const keyword of ['remote_workspace', 'remote_read', 'sessionId', '后台', 'wait', 'remote_ack', 'jobIds']) {
       assert.ok(data.guide.includes(keyword), `guide covers ${keyword}`);
     }
     assert.ok(data.guide.includes('你正在通过 SSH 远端绑定'), 'the guide addresses the agent directly');

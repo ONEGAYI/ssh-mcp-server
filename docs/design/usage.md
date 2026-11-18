@@ -292,7 +292,13 @@ node <安装目录>/build/cli/job.js run --workspace <配置文件> --session <�
 
 任务具有明确 cwd/env，不在不同任务间继承 `cd` 或 `export`。默认 stdin 关闭、无 PTY，未设置执行上限时不自动套用旧同步工具的 30 秒限制。
 
-任务结束后，本机等待程序返回 `task-result`，ZCode 原生后台通知触发后续处理。`eventId` 是稳定的完成事件标识；处理后调用 `remote_ack` 或 CLI `ack`。仅打印日志不算已处理。
+任务结束后，本机等待程序返回 `task-result`，ZCode 原生后台通知触发后续处理。按稳定的完成事件标识 `eventId` 去重，处理结果后再确认；仅打印日志不算已处理。
+
+一次处理了多项结果时，调用 `remote_ack`，传入同一会话的 `sessionId` 和 `jobIds`（1–50 个编号）。单条仍可用 `jobId` 或 CLI `ack`；`jobId` 和 `jobIds` 只能传其中一个。
+
+批量调用共用 45 秒预算。`acknowledged` 列出已确认的编号，`failed` 逐项列出错误，`unattempted` 列出尚未开始处理的编号。单项错误不会中断整批；超时或客户端取消后，不再开始后续确认。
+
+已发出的远端确认仍可能完成。若失败项标为 `ACK_OUTCOME_UNKNOWN`，或客户端取消后没有收到回执，先用 `remote_pending` 核对哪些任务仍待确认，再决定是否重试。
 
 ## 断线、重启与恢复
 
