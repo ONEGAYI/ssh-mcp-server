@@ -218,12 +218,16 @@ export class TaskService {
     return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  async acknowledge(jobId: string, sessionId: string): Promise<void> {
+  async acknowledge(jobId: string, sessionId: string, signal?: AbortSignal): Promise<void> {
     const record = await this.record(jobId);
     if (record.sessionId !== sessionId) throw new RemoteAgentError("TASK_SCOPE_MISMATCH", "Task belongs to another session");
+    signal?.throwIfAborted();
     const task = await this.status(jobId);
     if (!TERMINAL.has(task.state)) throw new RemoteAgentError("TASK_NOT_FINISHED", "Only a finished task result can be acknowledged");
-    if (!await this.rejection(jobId)) await this.remote.call("ack", { jobId });
+    const rejected = await this.rejection(jobId);
+    signal?.throwIfAborted();
+    if (!rejected) await this.remote.call("ack", { jobId });
+    // Once the remote ack is sent, persist its receipt even if the caller stops waiting.
     await atomicJson(join(this.taskPath(jobId), "ack.json"), { jobId, eventId: task.eventId, completedAt: task.completedAt, acknowledgedAt: new Date().toISOString() });
   }
 
