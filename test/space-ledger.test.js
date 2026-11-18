@@ -2,7 +2,8 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import fs, { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -67,6 +68,43 @@ it('concurrent reservations across separate processes never exceed the workspace
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+it('quota scan uses bounded concurrent metadata reads without changing which bytes count', async () => {
+  const root = await fixture();
+  const identity = join(root, 'state');
+  const directory = join(identity, 'ledger');
+  const outside = join(root, 'other');
+  const original = { stat: fs.stat, readdir: fs.readdir };
+  try {
+    await mkdir(join(identity, 'nested', 'ledger'), { recursive: true });
+    await mkdir(outside);
+    await mkdir(directory);
+    await writeFile(join(outside, 'unowned'), Buffer.alloc(8192));
+    await writeFile(join(directory, 'excluded'), Buffer.alloc(8192));
+    await writeFile(join(identity, 'nested', 'ledger', 'counted'), Buffer.alloc(7));
+    await symlink(outside, join(identity, 'skip-link'), process.platform === 'win32' ? 'junction' : 'dir');
+    for (let index = 1; index <= 25; index++) {
+      await writeFile(join(identity, 'nested', String(index)), Buffer.alloc(index));
+    }
+    let active = 0;
+    let peak = 0;
+    for (const method of ['stat', 'readdir']) {
+      fs[method] = async (...args) => {
+        peak = Math.max(peak, ++active);
+        try { return await original[method](...args); }
+        finally { --active; }
+      };
+    }
+    syncBuiltinESMExports();
+    const result = await new SpaceLedger(directory).reserve(1);
+    assert.equal(result.usedBytes, 333);
+    assert.ok(peak > 1 && peak <= 16, `expected bounded metadata concurrency, got ${peak}`);
+  } finally {
+    Object.assign(fs, original);
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true });
+  }
+});
+
 it('registering a resource consumes the reservation it cites without double counting', async () => {
   assert.ok(SpaceLedger);
   const root = await fixture();
@@ -127,7 +165,9 @@ it('rejects invalid ledger input with explicit codes', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-it('a stale lock left by a dead holder is reclaimed, never while the holder lives', async () => {
+it('legacy ledger reclaims a stale file lock left by a dead holder', {
+  skip: process.platform === 'win32',
+}, async () => {
   assert.ok(SpaceLedger);
   const root = await fixture();
   const directory = join(root, 'ledger');
@@ -144,7 +184,9 @@ it('a stale lock left by a dead holder is reclaimed, never while the holder live
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-it('a lock held by a live process times out to LEDGER_BUSY without being stolen', async () => {
+it('legacy ledger lock held by a live process times out to LEDGER_BUSY without being stolen', {
+  skip: process.platform === 'win32',
+}, async () => {
   assert.ok(SpaceLedger);
   const root = await fixture();
   const directory = join(root, 'ledger');

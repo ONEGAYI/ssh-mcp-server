@@ -312,7 +312,9 @@ it('throttles by the persisted maintenance interval', async () => {
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-it('skips while another live process holds the maintenance lock', async () => {
+it('legacy file lock skips while another live process holds the maintenance lock', {
+  skip: process.platform === 'win32',
+}, async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();
   try {
@@ -400,7 +402,7 @@ it('passes the remote call a timeout that covers the configured time budget (rev
   } finally { await rm(smallBudget.root, { recursive: true, force: true }); }
 });
 
-it('a half-written lock file is cleaned up so the next attempt is not permanently busy (review R8)', async () => {
+it('a failed state or lock write releases the maintenance lock for the next attempt (review R8)', async () => {
   const fixture = await buildFixture();
   const remote = recordingRemote();
   const scratch = await open(join(fixture.root, 'probe'), 'w');
@@ -408,8 +410,8 @@ it('a half-written lock file is cleaned up so the next attempt is not permanentl
   await scratch.close();
   const original = handlePrototype.writeFile;
   try {
-    // ENOSPC/EIO shape: the exclusive lock file opens fine but its content
-    // write fails, leaving a zero-byte lock behind unless cleaned up.
+    // ENOSPC/EIO after acquisition: on Windows the state write fails; on
+    // other hosts the first write initializes the exclusive lock file.
     let injected = false;
     handlePrototype.writeFile = async function (buffer, ...rest) {
       if (!injected) {
@@ -421,11 +423,10 @@ it('a half-written lock file is cleaned up so the next attempt is not permanentl
     await assert.rejects(new MaintenanceService(fixture.config, remote).maybeMaintain(),
       error => error.code === 'ENOSPC');
     handlePrototype.writeFile = original;
-    // The failed writer removed its own half-written lock...
+    // On legacy hosts the failed writer removed its own half-written lock.
     await assert.rejects(stat(join(fixture.identityDir, 'maintenance.lock')),
       error => error.code === 'ENOENT', 'the half-written lock must be cleaned up');
-    // ...so the next trigger acquires the lock instead of reading a corrupt
-    // holder forever and skipping as busy.
+    // Either way the next trigger must acquire the lock and run maintenance.
     const recovered = await new MaintenanceService(fixture.config, remote).maybeMaintain();
     assert.equal(recovered.skipped, undefined, JSON.stringify(recovered));
     assert.equal(remote.calls.length, 1, 'the remote round ran once the lock healed');

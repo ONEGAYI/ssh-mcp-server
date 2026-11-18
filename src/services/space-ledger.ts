@@ -5,11 +5,8 @@
  * Layout under the per-workspace state directory
  * (<localStateDir>/<sha256(identity)[:24]>/ledger/):
  *   ledger.json - registered temp resources + reservations (atomic writes)
- *   ledger.lock - cross-process mutex; exclusive-create file recording the
- *                 holder pid. Stolen only when the holder process is
- *                 confirmed dead (process.kill(pid, 0) -> ESRCH); never on
- *                 timeout alone, matching "active reservations must not be
- *                 reclaimed without verifying occupancy".
+ * Windows serializes mutations with a named pipe owned by the OS. Other
+ * hosts retain ledger.lock, an exclusive-create file naming its holder PID.
  *
  * Accounting mirrors the remote end: usedBytes = stateBytes + tempBytes +
  * reservedBytes; the state scan covers the workspace identity directory
@@ -28,6 +25,7 @@ import { mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/pr
 import { dirname, isAbsolute, join } from "node:path";
 import { identityStateDirectory } from "../config/workspace.js";
 import { RemoteAgentError } from "./remote-agent-client.js";
+import { tryAcquireWindowsStateLock } from "./windows-state-lock.js";
 
 export const DEFAULT_SPACE_LIMIT_BYTES = 10 * 1024 ** 3;
 const LEDGER_LOCK_TIMEOUT_MS = 5000;
@@ -102,24 +100,29 @@ function requireId(value: unknown, label: string): string {
 /** Sum of regular file sizes under the workspace identity directory,
  * excluding the ledger directory (self-referential measurement churn). */
 async function measureStateBytes(identityDirectory: string): Promise<number> {
-  const ledgerName = "ledger";
+  const metadataBatchSize = 16;
+  const pending = [{ path: identityDirectory, directory: true }];
   let total = 0;
-  async function walk(directory: string, isRoot: boolean): Promise<void> {
-    let entries;
-    try { entries = await readdir(directory, { withFileTypes: true }); }
-    catch (error) { if (isMissing(error)) return; throw error; }
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (entry.isDirectory()) {
-        if (isRoot && entry.name === ledgerName) continue;
-        if (entry.isSymbolicLink()) continue;
-        await walk(join(directory, entry.name), false);
-      } else if (entry.isFile()) {
-        try { total += (await stat(join(directory, entry.name))).size; }
-        catch (error) { if (!isMissing(error)) throw error; }
+  while (pending.length > 0) {
+    const batch = pending.splice(-metadataBatchSize);
+    await Promise.all(batch.map(async item => {
+      try {
+        if (!item.directory) {
+          const { size } = await stat(item.path);
+          total += size;
+          return;
+        }
+        for (const entry of await readdir(item.path, { withFileTypes: true })) {
+          if (item.path === identityDirectory && entry.name === "ledger") continue;
+          if (entry.isDirectory() || entry.isFile()) {
+            pending.push({ path: join(item.path, entry.name), directory: entry.isDirectory() });
+          }
+        }
+      } catch (error) {
+        if (!isMissing(error)) throw error;
       }
-    }
+    }));
   }
-  await walk(identityDirectory, true);
   return total;
 }
 
@@ -165,11 +168,8 @@ export class SpaceLedger {
     // TOCTOU narrowing: between the death verdict above and the unlink below,
     // another process may have reclaimed the lock already and written its own
     // pid; unlinking then would delete the new holder's lock file and let two
-    // processes hold the ledger at once. Re-read and unlink only while the
-    // file still names the pid we just judged dead. A millisecond-scale
-    // window remains (this read and the unlink are separate steps); the
-    // complete fix is a unique lock name per attempt plus an atomic rename,
-    // deliberately deferred.
+    // processes hold the ledger at once. The final check narrows but cannot
+    // eliminate this race in the legacy non-Windows lock protocol.
     try {
       if (JSON.parse(await readFile(this.lockPath(), "utf8"))?.pid !== holderPid) return;
     } catch {
@@ -178,38 +178,53 @@ export class SpaceLedger {
     await unlink(this.lockPath()).catch(error => { if (!isMissing(error)) throw error; });
   }
 
+  private async acquireFileLock(): Promise<(() => Promise<void>) | undefined> {
+    const lockPath = this.lockPath();
+    let handle;
+    try { handle = await open(lockPath, "wx"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await this.reclaimDeadHolder();
+      return undefined;
+    }
+    const release = async () => {
+      await handle.close();
+      await unlink(lockPath).catch(error => { if (!isMissing(error)) throw error; });
+    };
+    try { await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() })); }
+    catch (error) {
+      await release();
+      throw error;
+    }
+    return release;
+  }
+
   /** Run one mutation while holding the cross-process ledger lock. */
   private async withLedger<T>(mutate: (state: LedgerState) => Promise<T> | T): Promise<T> {
     await mkdir(this.directory, { recursive: true });
-    const lockPath = this.lockPath();
     const startedAt = Date.now();
-    for (;;) {
-      let handle;
-      try { handle = await open(lockPath, "wx"); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        await this.reclaimDeadHolder();
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      for (;;) {
+        releaseLock = process.platform === "win32"
+          ? await tryAcquireWindowsStateLock(this.directory, "ledger") : await this.acquireFileLock();
+        if (releaseLock) break;
         if (Date.now() - startedAt > LEDGER_LOCK_TIMEOUT_MS) {
           throw new RemoteAgentError("LEDGER_BUSY", "Another process still holds the workspace ledger; retry later");
         }
         await sleep(LEDGER_LOCK_POLL_MS);
-        continue;
       }
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
-        const state = await this.readState();
-        const result = await mutate(state);
-        await this.persist(state);
-        return result;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
-          throw new RemoteAgentError("STORAGE_FULL", "Workspace ledger could not be persisted: the filesystem is full");
-        }
-        throw error;
-      } finally {
-        await handle.close();
-        await unlink(lockPath).catch(error => { if (!isMissing(error)) throw error; });
+      const state = await this.readState();
+      const result = await mutate(state);
+      await this.persist(state);
+      return result;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
+        throw new RemoteAgentError("STORAGE_FULL", "Workspace ledger could not be persisted: the filesystem is full");
       }
+      throw error;
+    } finally {
+      await releaseLock?.();
     }
   }
 

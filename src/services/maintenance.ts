@@ -7,8 +7,8 @@
  * (MCP closed, SSH down) is simply caught up by the first trigger after
  * reconnecting -- no daemon, no remote cron.
  *
- * One round is bounded (items and wall clock), serialized by a lock file
- * whose holder pid is only reclaimed when proven dead, and consists of:
+ * One round is bounded (items and wall clock), serialized across processes,
+ * and consists of:
  *   1. reclaiming expired LOCAL records (task registrations and transfer
  *      registrations under the workspace identity directory), mirroring the
  *      remote retention rules; a stalled download's receiver temp is
@@ -33,6 +33,7 @@ import { loadPolicy } from "../config/policy.js";
 import { WorkspaceConfig, identityStateDirectory } from "../config/workspace.js";
 import { SpaceLedger } from "./space-ledger.js";
 import { transferDriverRunning } from "./transfer-driver.js";
+import { tryAcquireWindowsStateLock } from "./windows-state-lock.js";
 
 const TASK_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const TRANSFER_ID = /^[0-9a-f]{32}$/;
@@ -133,11 +134,10 @@ export class MaintenanceService {
     }
   }
 
-  /** Try to hold the cross-process maintenance lock. Steals it only from a
-   * holder proven dead; a live holder means another process is maintaining
-   * and this trigger simply skips. */
-  private async acquireLock(): Promise<{ handle: import("node:fs/promises").FileHandle } | { busy: true }> {
+  /** An active holder means another process is maintaining; skip this trigger. */
+  private async acquireLock(): Promise<(() => Promise<void>) | undefined> {
     await mkdir(this.identityDirectory, { recursive: true, mode: 0o700 });
+    if (process.platform === "win32") return tryAcquireWindowsStateLock(this.identityDirectory, "maintenance");
     for (;;) {
       let handle;
       try { handle = await open(this.lockPath, "wx", 0o600); }
@@ -145,18 +145,21 @@ export class MaintenanceService {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         let holderPid: unknown;
         try { holderPid = JSON.parse(await readFile(this.lockPath, "utf8"))?.pid; }
-        catch { return { busy: true }; }
-        if (typeof holderPid === "number" && processAlive(holderPid)) return { busy: true };
+        catch { return undefined; }
+        if (typeof holderPid === "number" && processAlive(holderPid)) return undefined;
         // TOCTOU narrowing: unlink only while the file still names the dead pid.
         try {
-          if (JSON.parse(await readFile(this.lockPath, "utf8"))?.pid !== holderPid) return { busy: true };
-        } catch { return { busy: true }; }
+          if (JSON.parse(await readFile(this.lockPath, "utf8"))?.pid !== holderPid) return undefined;
+        } catch { return undefined; }
         await unlink(this.lockPath).catch(() => undefined);
         continue;
       }
       try {
         await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
-        return { handle };
+        return async () => {
+          await unlink(this.lockPath).catch(() => undefined);
+          await handle.close();
+        };
       } catch (error) {
         // The file was exclusively created by this attempt: a failed content
         // write (ENOSPC/EIO) must remove it again. Leaving a zero-byte lock
@@ -367,8 +370,8 @@ export class MaintenanceService {
     if (!plan.local && plan.remote !== "run") {
       return plan.remote === "backoff" ? { skipped: "interval", remoteSkipped: "backoff" } : { skipped: "interval" };
     }
-    const lock = await this.acquireLock();
-    if ("busy" in lock) return { skipped: "busy" };
+    const releaseLock = await this.acquireLock();
+    if (!releaseLock) return { skipped: "busy" };
     try {
       // Double-check under the lock: a concurrent round may have completed.
       const fresh = await this.readState();
@@ -416,8 +419,7 @@ export class MaintenanceService {
       outcome.lastCompletedAt = fresh.lastCompletedAt;
       return outcome;
     } finally {
-      await unlink(this.lockPath).catch(() => undefined);
-      await lock.handle.close();
+      await releaseLock();
     }
   }
 }
